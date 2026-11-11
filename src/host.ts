@@ -21,6 +21,11 @@ import {
   resolveCapabilities,
 } from './capabilities.js'
 import { installSettingsOverlay, projectModel } from './settings-overlay.js'
+import {
+  installCodexCompatibility,
+  type CodexCompatibilityConfig,
+  type CodexCompatibilityRuntime,
+} from './codex.js'
 import type {
   GptProtocol,
   ModelCapabilities,
@@ -36,13 +41,19 @@ type RouteOptions = {
   capabilityCatalogUrl?: string
   overridesJSON: string
 }
-export type PluginConfig = { routes: Record<string, RouteOptions> }
+export type PluginConfig = {
+  routes: Record<string, RouteOptions>
+  codexCompatibility?: Partial<CodexCompatibilityConfig>
+}
 
 export const name = 'gpt-adapter'
 export const inject = ['settings', 'credentials', 'llm']
 export const Config: z<
   PluginConfig,
-  { routes: { get(): PluginConfig['routes'] } }
+  {
+    routes: { get(): PluginConfig['routes'] }
+    codexCompatibility: CodexCompatibilityConfig
+  }
 > = z.object({
   routes: z
     .dict(
@@ -59,6 +70,19 @@ export const Config: z<
     )
     .default({})
     .volatile(),
+  codexCompatibility: z
+    .object({
+      enabled: z.boolean().default(true),
+      codexHome: z.string(),
+      importInstructions: z.boolean().default(true),
+      importSkills: z.boolean().default(true),
+      importMcpServers: z.boolean().default(true),
+      importPluginResources: z.boolean().default(true),
+      watch: z.boolean().default(true),
+      pollIntervalMs: z.number().min(250).max(60000).default(2000),
+      mcpAllowlist: z.array(String).default([]),
+    })
+    .default({}),
 })
 
 type BaseModelInfo = {
@@ -86,6 +110,7 @@ declare module '@deepseek-ai/cordis' {
 
 /** Source-mode Remote markers are consumed by the existing authenticated Gateway. */
 export class GptModels extends Service {
+  codex?: CodexCompatibilityRuntime
   readonly typertRemote: ReturnType<typeof bindTypertRemote>
   private readonly runners = new Map<string, ModelSynchronizer>()
   private readonly snapshots = new Map<string, SyncSnapshot>()
@@ -300,6 +325,18 @@ export class GptModels extends Service {
     if (this.closed) return
     this.snapshots.set(provider, snapshot)
     this.ctx.emit('llm/models-updated', provider)
+  }
+
+  @Remote
+  codexStatus() {
+    return (
+      this.codex?.status() ?? { enabled: false, refreshing: false, items: [] }
+    )
+  }
+
+  @Remote
+  async refreshCodex(): Promise<void> {
+    await this.codex?.refresh()
   }
 
   @Remote
@@ -619,6 +656,7 @@ export async function apply(
     },
     ctx.fiber.entry?.options.id ?? name,
   )
+  service.codex = installCodexCompatibility(ctx, config.codexCompatibility)
   ctx.effect(() =>
     installNativeAdapterBridge(
       PiAiAdapter.prototype as unknown as Parameters<

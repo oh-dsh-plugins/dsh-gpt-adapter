@@ -4,3 +4,5 @@
       name: dsh-gpt-adapter
       config:
         routes: {}
+        codexCompatibility:
+          enabled: true

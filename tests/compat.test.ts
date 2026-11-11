@@ -134,6 +134,7 @@ describe('built plugin and official transport integration', () => {
         ],
       }
       const options = {
+        codexCompatibility: { enabled: false },
         routes: {
           fixture: {
             enabled: true,

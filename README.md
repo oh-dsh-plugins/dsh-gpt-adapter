@@ -1,53 +1,30 @@
 # DSH GPT Adapter
 
 [![DSH plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-2563eb)](https://github.com/deepseek-ai/deepseek-harness)
-[![DSH compatibility](https://img.shields.io/badge/DSH-0.2.2--rc.1-0f766e)](https://github.com/deepseek-ai/deepseek-harness)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-Public source repository for a DeepSeek Harness (DSH) plugin that adapts GPT
-models, reasoning levels, service tiers, and upstream model discovery.
+English | [Simplified Chinese](README.zh-CN.md)
 
-面向 DeepSeek Harness（DSH）的第三方 GPT 适配插件：复用原生模型设置页和对话菜单，
-同步上游模型列表，提供六档思考等级及独立的 Standard / Fast 速度选择。
-Ultrafast 按上游声明或用户覆盖提供。
+A third-party DeepSeek Harness (DSH) plugin for GPT models and existing Codex environments.
+Install one plugin to reuse local Codex instructions, skills, enabled plugin resources, and MCP server configurations without moving or rewriting Codex files.
 
-This repository is a DSH plugin project. The `dsh` manifest in `package.json`
-declares the Host bundle patch and Web client injection points used by DSH.
-It is installed into a DSH profile as a locally built tarball. The package has
-not been published to npm. It does not implement ChatGPT subscription login.
+## Features
 
-The project intentionally keeps the existing DSH/`llm-pi-ai` request, tool-call,
-streaming, and replay pipeline. Its first layer owns the GPT-specific facts that
-the generic adapter does not know:
+- Discover upstream models with `GET /models` and retain stale entries until explicit cleanup.
+- Provide the GPT reasoning preset `low / medium / high / xhigh / max / ultra` through the native Models page and conversation menu.
+- Offer independent Standard and Fast speed choices. Fast sends `service_tier: "priority"`; Ultrafast requires an explicit upstream declaration or override.
+- Preserve optional function arguments on GPT Responses requests by setting missing `strict` values to `false`.
+- Read Codex instruction files and refresh them at the next model step without repeating unchanged baselines.
+- Register Codex local skills and enabled plugin skills with their original resource paths.
+- Mount enabled Codex MCP servers through the official DSH MCP client and reconcile changed connections automatically.
 
-- upstream model discovery through `GET /models`;
-- dynamic reasoning labels, including independent `max` and `ultra` choices;
-- independent Standard/Fast/Ultrafast service tiers;
-- user override precedence and bounded cache refresh behavior;
-- non-secret cache identity isolation for endpoint/account changes.
+Reasoning and speed presets are requests to the configured gateway, not guarantees of upstream support. User overrides, explicit upstream capability metadata, and external catalogs take precedence over presets.
 
-The plugin supplies a six-level GPT preset: `low`, `medium`, `high`, `xhigh`,
-`max`, and `ultra`, each sent unchanged by default. This is the configured gateway
-policy, not a claim that every upstream API/model implements every level.
-Explicit user overrides, upstream capabilities, and an external catalog take
-precedence. Ordinary model-list responses can omit capability metadata; the
-preset fills that gap.
+## Compatibility and installation
 
-## Current status
+The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The package has not been published to npm.
 
-The package contains Host/client entries, a disposable synchronizer, persistence,
-protocol-specific request controls, and contributions to the existing Models
-page and conversation menu. Tests include actual official-adapter request
-serialization with synthetic credentials and simulated upstream streams.
-They do not prove real-account capability, latency, or reasoning quality.
-
-## Compatibility and local installation
-
-The generated integration targets DSH packages `0.2.2-rc.1`, Cordis `4.1.0`, and
-Pi AI `1.3.0`. Source hashes are recorded in `lib/compatibility.json`.
-Installed upstream package files are never modified.
-
-Build from this repository, then install into the intended profile:
+Requires Node.js `>=24.9.0` and pnpm.
 
 ```sh
 git clone https://github.com/lxjmaster/dsh-gpt-adapter.git
@@ -55,92 +32,89 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.0.tgz
 ```
 
-`pnpm pack` runs the production build through `prepack`. Install the generated
-tarball (replace the path with your clone's location):
+`pnpm pack` runs the production build. Restart the DSH host after upgrading the installed package.
+Configure GPT connections as usual under **Settings → Models**. The plugin extends the existing native settings and conversation controls.
 
-```sh
-dsh plugin --profile web add /absolute/path/to/dsh-gpt-adapter-0.1.6.tgz
+## Codex environment reuse
+
+Codex compatibility is enabled by default. The root is the plugin's `codexHome` override, then `CODEX_HOME`, then `~/.codex`.
+
+| Resource                       | Behavior                                                                                                                   |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `config.toml`                  | Read in place; connection secrets stay in memory                                                                           |
+| Global instructions            | First nonempty `AGENTS.override.md`, otherwise `AGENTS.md`                                                                 |
+| Project instructions           | Repository root to current DSH working directory; first nonempty override, base file, or configured fallback per directory |
+| DSH/shared global instructions | Retained from `~/.dsh/AGENTS.md` and `~/.agents/AGENTS.md` (or their configured environment roots)                         |
+| Local overlays                 | Existing `AGENTS.local.md` and `CLAUDE.local.md` remain applicable                                                         |
+| Codex skills                   | Discover `skills/` and `skills/.system/`; bodies load on demand                                                            |
+| Shared/project skills          | Continue through DSH's native `.agents/skills` discovery                                                                   |
+| Skill enablement               | Honor ordered `skills.config` name/path selectors and `skills.bundled.enabled`                                             |
+| Enabled plugins                | Read declared skill roots and inline or file-referenced `mcpServers`; disabled plugins stay disabled                       |
+
+The compatibility layer selects project instruction candidates using Codex precedence and replaces duplicate native instruction messages for those steps. It does not import Codex's built-in system prompt. Configured fallback filenames such as `CLAUDE.md` are used only when supplied in Codex configuration. Instructions are recorded as ordinary user context with a bounded byte budget; they do not override system, developer, or direct user instructions. Existing conversation history is retained when the plugin is removed.
+
+Plugin resources are resolved from the configured local marketplace, or the newest locally cached version in the matching marketplace. Nothing is downloaded automatically. Plugin skills use `<plugin>-<skill>` names to fit DSH's skill-name format and avoid cross-plugin collisions. Original skill paths and relative resources remain intact.
+
+## MCP compatibility
+
+Installing the plugin automatically starts enabled MCP commands and connects configured HTTP endpoints. It imports `mcp_servers` and the MCP resources declared by enabled plugins.
+
+Supported configuration includes:
+
+- stdio `command`, `args`, `cwd`, `env`, and `env_vars`;
+- Streamable HTTP `url`, `http_headers`, `env_http_headers`, and `bearer_token_env_var`;
+- `enabled`, startup/tool timeouts, `enabled_tools`, and `disabled_tools`;
+- plugin-root substitutions in plugin server declarations.
+
+Global server names are retained where DSH permits them. Plugin servers use a plugin prefix. Unchanged connections are preserved. Changed or removed connections are disposed before replacement. Invalid configuration retains the last working snapshot. The default two-second refresh detects configuration and plugin-resource changes; native skill watchers detect skill file changes.
+
+Credentials are not copied into DSH settings, plugin caches, or this repository. Status responses contain only resource names, states, and sanitized reason codes. Missing environment variables must exist in the DSH host environment to be inherited.
+
+This is environment compatibility, not a replacement Codex runtime. Codex OAuth/keychain sessions, Codex App IPC services, hooks, app components, permission policies, and proprietary commands are not automatically reproduced. Standard MCPs using configured headers/environment can be reused; servers requiring unavailable runtime authentication or services report a connection failure. Plugin hooks/apps/commands are reported as unsupported rather than executed. DSH retains its own approval and sandbox behavior.
+
+Inspect status through the authenticated host method `gptModels/codexStatus`; use `gptModels/refreshCodex` to request a configuration refresh. Resource states are `loading`, `loaded`, `disabled`, `unsupported`, or `failed`. A loaded MCP entry means its initial connection and tool discovery completed; subsequent reconnection is managed by DSH.
+
+## Optional controls
+
+No per-server reconfiguration is needed. The existing `gpt-adapter` plugin settings also expose:
+
+```yaml
+codexCompatibility:
+  enabled: true
+  # codexHome: /path/to/existing/codex-home
+  importInstructions: true
+  importSkills: true
+  importMcpServers: true
+  importPluginResources: true
+  watch: true
+  pollIntervalMs: 2000
+  mcpAllowlist: []
 ```
 
-Version `0.1.6` is a single additive plugin. It extends the pinned native Pi AI
-adapter at runtime, restores its methods on disposal, and keeps the official
-base/Web bundles and native model menu active. The existing Models page supplies
-its controls and styles; speed selection uses the existing composer control slot.
-The plugin projects the same effective reasoning into the native Models page,
-its reasoning-level schema, and the conversation model menu. Recognized GPT/Codex
-routes are adapted automatically; an explicit provider switch can disable this.
-Existing and newly discovered models receive the preset, including configured
-models absent from the latest upstream list.
+An empty `mcpAllowlist` imports all enabled declared servers. A nonempty list filters by the original server key. Disabling or removing the plugin withdraws its runtime registrations and leaves Codex files untouched. Native DSH model configuration and other plugins remain in place.
 
-Open **Settings → Models** and configure the endpoint, key, and protocol as
-usual. **GPT 自动适配** on the original provider card controls the overlay, model
-refresh, and optional catalog/JSON overrides. Preset fields belong to the plugin;
-use its capability overrides to customize them, or turn adaptation off to edit
-native reasoning directly. Other native model fields remain editable.
+## GPT model controls and storage
 
-Preset reasoning fields are never written into the native profile. Saving other
-model fields preserves the original native reasoning data. Disabling/unloading
-the plugin restores the native schema and values while retaining other saved
-edits. The native model menu shows the same levels; a native menu beside it
-supplies independent speed choices. Per-session speed selections are persisted.
+Capability precedence is user override, explicit upstream metadata, external catalog, then preset. Catalog requests never receive the provider API key. Model-list responses may omit capability metadata. Reasoning is sent as `reasoning.effort` for Responses and `reasoning_effort` for Chat Completions; the selected protocol is preserved.
 
-Responses uses `reasoning.effort`; Chat Completions uses `reasoning_effort`.
-The selected protocol is preserved. GPT/Codex models offer Standard and Fast by
-default even when `/models` omits speed metadata. Standard stays selected until
-changed; preset Fast sends `service_tier: "priority"`. Explicit upstream/catalog
-tier declarations and user overrides take precedence and preserve their wire
-values. A default tier or a partial capability flag does not declare the complete
-supported-tier list. Ultrafast remains an independent declared/overridden tier.
-Reasoning and speed stay independent; the selected menu value requests a tier,
-and the returned `service_tier` records what the upstream actually used.
+Preset reasoning fields are projected into the native UI rather than persisted into native model configuration. Disabling GPT adaptation restores the native model values and schema. Speed selections are persisted per session. Synchronization failures retain the previous snapshot; absent models remain stale until explicit cleanup.
 
-On adapted GPT Responses requests, function tools with omitted `strict` receive
-`strict: false` so the upstream does not implicitly require optional arguments.
-Explicit strictness, parameter schemas, and non-function tools are preserved.
-Chat Completions and routes with adaptation disabled keep their native behavior.
-
-## Capability catalogs and retention
-
-Capability precedence is user override, explicit upstream metadata, external
-catalog, then the bundled baseline. Catalog requests never receive the provider
-API key. A catalog has a nonempty `version` and a `models` object whose values use
-optional gateway extensions such as `reasoning_supported_efforts`,
-`reasoning_default_effort`, and `service_tiers`. These fields extend the standard
-model-list schema; the official `/models` response need not contain them.
-
-For example, a hypothetical `gpt-example` entry may declare
-`{"reasoning_supported_efforts":["max","ultra"],"service_tiers":["default","priority","ultrafast"]}`.
-This illustrates the schema rather than a real model's capabilities. An explicit
-map such as `reasoning_efforts: {"off":"none","high":"high"}` preserves its wire
-values. `can_disable_thinking` alone never invents a disabling request. Off with
-an omitted parameter is rejected; `null` reasoning selection follows upstream
-defaults, while omitted selection uses the configured default.
-
-Refresh failures retain the last working snapshot. Absent models stay `stale`
-until explicit cleanup; no automatic deletion TTL is imposed. Route runners
-coalesce refreshes, bound network I/O, reject results from changed connections,
-and cancel on disposal. Endpoint, protocol, and credential changes invalidate
-conditional model-list caches. Plugin state is stored under
-`$DSH_HOME/storages/gpt-adapter`; API keys and conversation contents are not stored
-there. Remove the plugin through DSH to restore the original runtime behavior; credentials, model configuration, and session logs remain in the native host.
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for reused source licensing.
-This plugin is released under the [MIT License](LICENSE) and is maintained
-independently of DeepSeek and OpenAI.
+GPT model snapshots and speed selections are stored under `$DSH_HOME/storages/gpt-adapter`. Codex source files and imported MCP credentials are not copied there. The DSH host owns normal session transcripts and logs.
 
 ## Development
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm check
 pnpm test
 pnpm build
-pnpm pack --pack-destination artifacts
 ```
 
-The package does not implement ChatGPT subscription authentication. It expects an
-API key resolved by the host credential service. Callers must also provide a
-stable, non-secret `cacheIdentity` for the endpoint/account credential context so
-an ETag from one account cannot be reused for another.
+Tests use temporary directories, synthetic credentials, simulated upstream streams, and a real local fixture MCP process. They do not establish real-account support, upstream reasoning quality, external MCP authentication, or Codex App runtime availability.
+
+## License
+
+[MIT](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md) for reused DeepSeek Harness assets. This project is independently maintained and is not affiliated with DeepSeek or OpenAI.

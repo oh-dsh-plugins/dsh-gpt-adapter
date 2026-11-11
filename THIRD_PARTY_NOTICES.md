@@ -3,12 +3,12 @@
 The plugin uses the native adapter, model menu, and Models settings components
 from the pinned `@deepseek-ai/dsh-llm-pi-ai`,
 `@deepseek-ai/dsh-client-ui-model-selection`, and
-`@deepseek-ai/dsh-client-ui-settings-models` version `0.2.2-rc.1` packages.
+`@deepseek-ai/dsh-client-ui-settings-models`, and `@deepseek-ai/dsh-mcp-client` version `0.2.2-rc.1` packages.
 Original project: https://github.com/deepseek-ai/deepseek-harness
 
 The build records native source hashes and reads native Models CSS class names.
 The runtime extends the native adapter and injects controls into existing UI
-slots. Installed third-party package files are never modified.
+slots. MCP tool filtering uses the pinned client’s public tool-name encoding. Installed third-party package files are never modified.
 
 ## DeepSeek Harness — MIT License
 
