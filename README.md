@@ -7,12 +7,14 @@
 Public source repository for a DeepSeek Harness (DSH) plugin that adapts GPT
 models, reasoning levels, service tiers, and upstream model discovery.
 
-DeepSeek Harness extension for GPT-focused model and capability synchronization.
+面向 DeepSeek Harness（DSH）的第三方 GPT 适配插件：复用原生模型设置页和对话菜单，
+同步上游模型列表，提供六档思考等级及独立的 Standard / Fast 速度选择。
+Ultrafast 按上游声明或用户覆盖提供。
 
 This repository is a DSH plugin project. The `dsh` manifest in `package.json`
 declares the Host bundle patch and Web client injection points used by DSH.
-It is installed into a DSH profile as a local tarball; it is not an npm package
-or a ChatGPT subscription authenticator.
+It is installed into a DSH profile as a locally built tarball. The package has
+not been published to npm. It does not implement ChatGPT subscription login.
 
 The project intentionally keeps the existing DSH/`llm-pi-ai` request, tool-call,
 streaming, and replay pipeline. Its first layer owns the GPT-specific facts that
@@ -45,7 +47,18 @@ The generated integration targets DSH packages `0.2.2-rc.1`, Cordis `4.1.0`, and
 Pi AI `1.3.0`. Source hashes are recorded in `lib/compatibility.json`.
 Installed upstream package files are never modified.
 
-Install the local tarball into the intended profile:
+Build from this repository, then install into the intended profile:
+
+```sh
+git clone https://github.com/lxjmaster/dsh-gpt-adapter.git
+cd dsh-gpt-adapter
+pnpm install --frozen-lockfile
+mkdir -p artifacts
+pnpm pack --pack-destination artifacts
+```
+
+`pnpm pack` runs the production build through `prepack`. Install the generated
+tarball (replace the path with your clone's location):
 
 ```sh
 dsh plugin --profile web add /absolute/path/to/dsh-gpt-adapter-0.1.6.tgz
@@ -114,6 +127,8 @@ conditional model-list caches. Plugin state is stored under
 there. Remove the plugin through DSH to restore the original runtime behavior; credentials, model configuration, and session logs remain in the native host.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for reused source licensing.
+This plugin is released under the [MIT License](LICENSE) and is maintained
+independently of DeepSeek and OpenAI.
 
 ## Development
 

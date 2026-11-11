@@ -2,9 +2,11 @@
   "name": "dsh-gpt-adapter",
   "version": "0.1.6",
   "private": true,
+  "license": "MIT",
   "description": "GPT model and capability synchronization bridge for DeepSeek Harness.",
   "keywords": [
     "deepseek-harness",
+    "deepseek-harness-plugin",
     "dsh",
     "dsh-plugin",
     "gpt",
@@ -45,6 +47,7 @@
     "cordis.patch.yml",
     "scripts",
     "README.md",
+    "LICENSE",
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
