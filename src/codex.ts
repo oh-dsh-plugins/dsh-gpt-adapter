@@ -2,9 +2,12 @@ import { symbols } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
 import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import {
   discoverCodexSnapshot,
   resolveCodexHome,
+  readCodexConfig,
+  projectDirectories,
   skillEnabled,
   type CompatibilityItem,
   type CodexSnapshot,
@@ -50,6 +53,7 @@ function publicToolName(server: string, name: string) {
 function installSkillPolicy(
   ctx: any,
   snapshot: () => CodexSnapshot | undefined,
+  home: string,
 ) {
   const service = ctx.skills[symbols.original] ?? ctx.skills
   const original = {
@@ -57,17 +61,29 @@ function installSkillPolicy(
     snapshot: service.snapshot,
     get: service.get,
   }
-  const allowed = (s: any) => skillEnabled(snapshot()?.config ?? {}, s)
+  const policy = async (options: any) =>
+    options?.cwd
+      ? readCodexConfig(home, options.cwd, ctx.get('fs'), options.signal)
+      : (snapshot()?.config ?? {})
   async function list(this: any, ...args: any[]) {
-    return (await original.list.apply(this, args)).filter(allowed)
+    const config = await policy(args[0])
+    return (await original.list.apply(this, args)).filter((s: any) =>
+      skillEnabled(config, s),
+    )
   }
   async function catalog(this: any, ...args: any[]) {
     const result = await original.snapshot.apply(this, args)
-    return { ...result, skills: result.skills.filter(allowed) }
+    const config = await policy(args[0])
+    return {
+      ...result,
+      skills: result.skills.filter((s: any) => skillEnabled(config, s)),
+    }
   }
   async function get(this: any, ...args: any[]) {
     const result = await original.get.apply(this, args)
-    return result && allowed(result) ? result : undefined
+    return result && skillEnabled(await policy(args[1]), result)
+      ? result
+      : undefined
   }
   service.list = list
   service.snapshot = catalog
@@ -88,13 +104,27 @@ export function installCodexCompatibility(
   let latest: CodexSnapshot | undefined
   let items: CompatibilityItem[] = []
   let tail: Promise<void> = Promise.resolve()
-  const clients = new Map<
-    string,
-    { key: string; fiber: any; state: CompatibilityItem }
-  >()
+  type Client = {
+    key: string
+    fiber: any
+    state: CompatibilityItem
+    attempts: number
+    retryAt: number
+  }
+  type AgentState = {
+    agent: any
+    clients: Map<string, Client>
+    snapshot?: CodexSnapshot
+    cwd?: string
+    items: CompatibilityItem[]
+    tail: Promise<void>
+    disposed: boolean
+  }
+  const agents = new Map<any, AgentState>()
   let skillDispose: (() => void) | undefined
   let skills: FileSystemSkillProvider[] = []
   let skillContext: any
+  let mcpContext: any
   let skillsKey = ''
   const home = resolveCodexHome(config.codexHome)
   if (!config.enabled)
@@ -130,20 +160,52 @@ export function installCodexCompatibility(
         async list(options: any) {
           const candidates: any[] = []
           let complete = true
+          const activeConfig = options.cwd
+            ? await readCodexConfig(
+                home,
+                options.cwd,
+                owner.get('fs'),
+                options.signal,
+              )
+            : (latest?.config ?? snapshot.config)
+          if (options.cwd) {
+            const roots = await projectDirectories(
+              options.cwd,
+              owner.get('fs'),
+              options.signal,
+            )
+            const project = new FileSystemSkillProvider(owner, control, {
+              includeDefaultRoots: false,
+              customSkillDirs: roots
+                .reverse()
+                .map((path) => join(path, '.agents', 'skills')),
+              watch: false,
+            })
+            try {
+              const result = await project.list(options)
+              const entries = Array.isArray(result) ? result : result.candidates
+              if (!Array.isArray(result) && !result.complete) complete = false
+              for (const [index, candidate] of entries.entries()) {
+                if (!skillEnabled(activeConfig, candidate)) continue
+                candidates.push({
+                  ...candidate,
+                  provider: 'codex-filesystem',
+                  source: 'project-agents',
+                  rank: 199 + index / (entries.length + 1),
+                  locator: { index: 0, candidate },
+                })
+              }
+            } finally {
+              await project.dispose()
+            }
+          }
           for (const [index, provider] of sources.entries()) {
             const result = await provider.list(options)
             const entries = Array.isArray(result) ? result : result.candidates
             if (!Array.isArray(result) && !result.complete) complete = false
             for (const candidate of entries) {
               const plugin = snapshot.skillRoots[index]?.plugin
-              if (
-                !skillEnabled(
-                  latest?.config ?? snapshot.config,
-                  candidate,
-                  plugin,
-                )
-              )
-                continue
+              if (!skillEnabled(activeConfig, candidate, plugin)) continue
               candidates.push({
                 ...candidate,
                 name: plugin ? `${plugin}-${candidate.name}` : candidate.name,
@@ -165,7 +227,14 @@ export function installCodexCompatibility(
           if (
             !result ||
             !skillEnabled(
-              latest?.config ?? snapshot.config,
+              options.cwd
+                ? await readCodexConfig(
+                    home,
+                    options.cwd,
+                    owner.get('fs'),
+                    options.signal,
+                  )
+                : (latest?.config ?? snapshot.config),
               result,
               snapshot.skillRoots[locator.index]?.plugin,
             )
@@ -175,6 +244,7 @@ export function installCodexCompatibility(
             ...result,
             name: candidate.name,
             provider: 'codex-filesystem',
+            source: candidate.source,
           }
         },
       }
@@ -182,7 +252,11 @@ export function installCodexCompatibility(
     skillsKey = nextKey
   }
 
-  const mountMcp = async (entry: CodexMcpConfig) => {
+  const mountMcp = async (
+    owner: AgentState,
+    entry: CodexMcpConfig,
+    attempts = 1,
+  ) => {
     const { startupTimeoutMs } = entry
     const enabledTools = entry.enabledTools?.map((name) =>
       publicToolName(entry.serverName, name),
@@ -241,8 +315,15 @@ export function installCodexCompatibility(
         )
       },
     }
-    const fiber = ctx.plugin(plugin)
-    clients.set(entry.serverName, { key: fingerprint(entry), fiber, state })
+    const fiber = owner.agent.ctx.plugin(plugin)
+    const client = {
+      key: fingerprint(entry),
+      fiber,
+      state,
+      attempts,
+      retryAt: 0,
+    }
+    owner.clients.set(entry.serverName, client)
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
@@ -262,16 +343,116 @@ export function installCodexCompatibility(
           ? 'startup-timeout'
           : 'connection-failed'
       await fiber.dispose()
+      client.retryAt = Date.now() + Math.min(30000, 500 * 2 ** (attempts - 1))
     } finally {
       if (timer) clearTimeout(timer)
     }
+  }
+
+  const refreshAgent = (owner: AgentState, signal?: AbortSignal) => {
+    owner.tail = owner.tail
+      .catch(() => {})
+      .then(async () => {
+        if (closed || owner.disposed) return
+        try {
+          signal?.throwIfAborted()
+          const cwd = await mcpContext.workingDirectory.ensure(
+            owner.agent,
+            signal,
+          )
+          if (owner.cwd !== undefined && owner.cwd !== cwd) {
+            await Promise.all(
+              [...owner.clients.values()].map((client) =>
+                client.fiber.dispose(),
+              ),
+            )
+            owner.clients.clear()
+            delete owner.snapshot
+          }
+          owner.cwd = cwd
+          const fs = owner.agent.ctx.get('fs')
+          const snapshot = await discoverCodexSnapshot(home, config, {
+            cwd,
+            ...(fs ? { fs } : {}),
+            ...(signal ? { signal } : {}),
+            ...(owner.snapshot ? { previous: owner.snapshot } : {}),
+          })
+          signal?.throwIfAborted()
+          if (closed || owner.disposed) return
+          owner.snapshot = snapshot
+          owner.items = snapshot.items
+          const next = new Map(
+            snapshot.mcp.map((entry) => [entry.serverName, entry]),
+          )
+          for (const [name, client] of owner.clients) {
+            if (!next.has(name) || fingerprint(next.get(name)) !== client.key) {
+              await client.fiber.dispose()
+              owner.clients.delete(name)
+            }
+          }
+          await Promise.all(
+            [...next].map(async ([name, entry]) => {
+              const client = owner.clients.get(name)
+              if (
+                client &&
+                (client.state.state !== 'failed' ||
+                  client.attempts >= 10 ||
+                  Date.now() < client.retryAt)
+              )
+                return
+              if (client) await client.fiber.dispose()
+              await mountMcp(owner, entry, (client?.attempts ?? 0) + 1)
+            }),
+          )
+        } catch {
+          signal?.throwIfAborted()
+          owner.items = [
+            {
+              name: 'config.toml',
+              kind: 'config',
+              state: 'failed',
+              reason:
+                'unreadable-or-invalid-config; previous snapshot retained',
+            },
+          ]
+        }
+      })
+    return owner.tail
+  }
+  const ensureAgent = (agent: any, signal?: AbortSignal) => {
+    let owner = agents.get(agent)
+    if (!owner) {
+      owner = {
+        agent,
+        clients: new Map(),
+        items: [],
+        tail: Promise.resolve(),
+        disposed: false,
+      }
+      agents.set(agent, owner)
+    }
+    return refreshAgent(owner, signal)
+  }
+  const disposeAgent = async (agent: any) => {
+    const owner = agents.get(agent)
+    if (!owner) return
+    owner.disposed = true
+    agents.delete(agent)
+    await owner.tail.catch(() => {})
+    await Promise.all(
+      [...owner.clients.values()].map((client) => client.fiber.dispose()),
+    )
   }
 
   const reconcile = async () => {
     if (closed) return
     refreshing = true
     try {
-      const snapshot = await discoverCodexSnapshot(home, config)
+      const snapshot = await discoverCodexSnapshot(
+        home,
+        config,
+        latest ? { previous: latest } : {},
+      )
       if (closed) return
       latest = snapshot
       items = snapshot.items
@@ -282,20 +463,10 @@ export function installCodexCompatibility(
           { name: 'codex-filesystem', kind: 'skills', state: 'loaded' },
         ]
       }
-      if (config.importMcpServers && ctx.get('tools')) {
-        const next = new Map(snapshot.mcp.map((s) => [s.serverName, s]))
-        for (const [name, client] of clients) {
-          if (!next.has(name) || fingerprint(next.get(name)) !== client.key) {
-            await client.fiber.dispose()
-            clients.delete(name)
-          }
-        }
+      if (config.importMcpServers)
         await Promise.all(
-          [...next]
-            .filter(([name]) => !clients.has(name))
-            .map(([, entry]) => mountMcp(entry)),
+          [...agents.values()].map((owner) => refreshAgent(owner)),
         )
-      }
     } catch {
       items = [
         {
@@ -332,17 +503,29 @@ export function installCodexCompatibility(
             skillsKey = ''
           }
         })
-        installSkillPolicy(child, () => latest)
+        installSkillPolicy(child, () => latest, home)
         void refresh()
       }
     }),
-    ctx.inject(['agents', 'workingDirectory'], (child: any) => {
+    ctx.inject(['agents', 'workingDirectory', 'fs'], (child: any) => {
       if (closed) return
       if (config.importInstructions) installCodexInstructions(child, home)
     }),
-    ctx.inject(['tools'], () => {
+    ctx.inject(['agents', 'workingDirectory', 'tools', 'fs'], (child: any) => {
       if (closed) return
-      if (config.importMcpServers) void refresh()
+      if (!config.importMcpServers) return
+      mcpContext = child
+      child.on('agent/created', async ({ agent, signal }: any) => {
+        await ensureAgent(agent, signal)
+      })
+      child.on('agent/pre-step', async ({ agent, signal }: any, next: any) => {
+        await ensureAgent(agent, signal)
+        return next()
+      })
+      child.on('agent/disposed', ({ agent }: any) => {
+        void disposeAgent(agent)
+      })
+      for (const agent of child.agents.list()) void ensureAgent(agent)
     }),
   ]
   void refresh()
@@ -352,26 +535,33 @@ export function installCodexCompatibility(
       closed = true
       if (timer) clearInterval(timer)
       await Promise.all(injections.map((fiber) => fiber.dispose()))
-      await Promise.all([...clients.values()].map((c) => c.fiber.dispose()))
       await tail
+      await Promise.all([...agents.keys()].map(disposeAgent))
       skillDispose?.()
       await Promise.all(skills.map((s) => s.dispose()))
-      clients.clear()
     })())
   ctx.effect(() => dispose, 'codex-compatibility')
   return {
     status: () => ({
       enabled: !closed,
       refreshing,
-      items: [...items, ...[...clients.values()].map((c) => ({ ...c.state }))],
+      items: [
+        ...items,
+        ...[...agents.values()].flatMap((owner) => [
+          ...owner.items,
+          ...[...owner.clients.values()].map((c) => ({ ...c.state })),
+        ]),
+      ],
     }),
     refresh: async () => {
       await tail
-      for (const [name, client] of clients) {
-        if (client.state.state === 'failed') {
-          await client.fiber.dispose()
-          clients.delete(name)
-        }
+      for (const owner of agents.values()) {
+        await owner.tail
+        for (const client of owner.clients.values())
+          if (client.state.state === 'failed') {
+            client.attempts = 0
+            client.retryAt = 0
+          }
       }
       await refresh()
     },

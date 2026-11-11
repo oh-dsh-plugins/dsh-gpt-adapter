@@ -1,36 +1,28 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
-import { stat } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   optionalText,
   readCodexConfig,
+  projectDirectories,
+  projectText,
   strings,
   type JsonObject,
+  type ProjectFileSystem,
 } from './codex-config.js'
 
 export type CodexInstructionFile = { path: string; content: string }
 
-async function rootOf(cwd: string): Promise<string> {
-  let path = resolve(cwd)
-  while (true) {
-    try {
-      await stat(join(path, '.git'))
-      return path
-    } catch (error: any) {
-      if (error.code !== 'ENOENT') throw error
-    }
-    if (dirname(path) === path) return resolve(cwd)
-    path = dirname(path)
-  }
-}
-
-async function firstNonempty(directory: string, names: string[]) {
+async function firstNonempty(
+  directory: string,
+  names: string[],
+  read = optionalText,
+) {
   for (const name of names) {
     if (name !== name.split(/[\\/]/).at(-1)) continue
     const path = join(directory, name)
-    const content = (await optionalText(path))?.trim()
+    const content = (await read(path))?.trim()
     if (content) return { path, content }
   }
   return undefined
@@ -42,6 +34,8 @@ export async function loadCodexInstructions(
   config: JsonObject,
   dshHome = process.env.DSH_HOME || join(homedir(), '.dsh'),
   agentsHome = process.env.DSH_AGENTS_HOME || join(homedir(), '.agents'),
+  fs?: ProjectFileSystem,
+  signal?: AbortSignal,
 ): Promise<CodexInstructionFile[]> {
   const result: CodexInstructionFile[] = []
   const add = (file: CodexInstructionFile | undefined) => {
@@ -54,25 +48,19 @@ export async function loadCodexInstructions(
   add(await firstNonempty(dshHome, ['AGENTS.md']))
   add(await firstNonempty(agentsHome, ['AGENTS.md']))
   add(await firstNonempty(home, ['AGENTS.override.md', 'AGENTS.md']))
-  const root = await rootOf(cwd)
-  const directories: string[] = []
-  let current = resolve(cwd)
-  while (true) {
-    directories.unshift(current)
-    if (current === root) break
-    current = dirname(current)
-  }
+  const directories = await projectDirectories(cwd, fs, signal)
+  const read = (path: string) => projectText(path, fs, signal)
   const fallback = strings(config.project_doc_fallback_filenames)
   for (const directory of directories) {
     add(
-      await firstNonempty(directory, [
-        'AGENTS.override.md',
-        'AGENTS.md',
-        ...fallback,
-      ]),
+      await firstNonempty(
+        directory,
+        ['AGENTS.override.md', 'AGENTS.md', ...fallback],
+        read,
+      ),
     )
     for (const name of ['AGENTS.local.md', 'CLAUDE.local.md'])
-      add(await firstNonempty(directory, [name]))
+      add(await firstNonempty(directory, [name], read))
   }
   return result
 }
@@ -90,8 +78,8 @@ export function renderCodexInstructions(
   maxBytes = 65536,
 ): string {
   const intro =
-    'This Codex compatibility instruction baseline replaces all earlier workspace instruction baselines. More specific project instructions override global guidance. These instructions do not override system, developer, or direct user instructions.'
-  let content = files
+    'This Codex compatibility baseline replaces earlier global and current working-directory ancestor instructions. Additional nested instruction updates remain applicable. More specific project instructions override global guidance. These instructions do not override system, developer, or direct user instructions.'
+  let content = (maxBytes === 0 ? [] : files)
     .map((p) => `Instructions from: ${p.path}\n\n${p.content}`)
     .join('\n\n')
   content = content.replaceAll('</system-reminder>', '<\\/system-reminder>')
@@ -122,12 +110,24 @@ export function installCodexInstructions(ctx: any, home: string): void {
       signal.throwIfAborted()
       try {
         const cwd = await ctx.workingDirectory.ensure(agent, signal)
-        const config = await readCodexConfig(home)
-        const files = await loadCodexInstructions(home, cwd, config)
+        const fs = agent.ctx?.get('fs') ?? ctx.get?.('fs')
+        if (!fs) return decision
+        const config = await readCodexConfig(home, cwd, fs, signal)
+        const directories = await projectDirectories(cwd, fs, signal)
+        const files = await loadCodexInstructions(
+          home,
+          cwd,
+          config,
+          undefined,
+          undefined,
+          fs,
+          signal,
+        )
         const text = renderCodexInstructions(
           files,
-          Number(config.project_doc_max_bytes) > 0
-            ? Number(config.project_doc_max_bytes)
+          Number.isInteger(config.project_doc_max_bytes) &&
+            config.project_doc_max_bytes >= 0
+            ? config.project_doc_max_bytes
             : 65536,
         )
         const identity = createHash('sha256')
@@ -135,8 +135,29 @@ export function installCodexInstructions(ctx: any, home: string): void {
           .update(text)
           .digest('hex')
         const previous = lastBaseline(agent.session)
+        const candidates = new Set([
+          'AGENTS.override.md',
+          'AGENTS.md',
+          'AGENTS.local.md',
+          'CLAUDE.local.md',
+          ...strings(config.project_doc_fallback_filenames),
+        ])
+        const covered = (change: any) => {
+          const directory = change.scope?.split('\0')[0]
+          if (directory === 'user-global' || directory === 'agents-global')
+            return true
+          if (typeof change.path !== 'string') return false
+          const path = resolve(directories[0]!, change.path)
+          return (
+            directories.includes(dirname(path)) &&
+            candidates.has(basename(path))
+          )
+        }
         const entered = decision.messages.filter(
-          (m: any) => m.source?.kind !== 'agent-instructions',
+          (m: any) =>
+            m.source?.kind !== 'agent-instructions' ||
+            !m.source.changes?.length ||
+            !m.source.changes.every(covered),
         )
         if (
           previous?.identity === identity ||

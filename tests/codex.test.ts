@@ -1,10 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  rm,
+  readFile,
+  stat,
+  symlink,
+  realpath,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createServer } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
+import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
+import ToolsService from '@deepseek-ai/dsh-tools'
+import { createScope } from '@deepseek-ai/dsh-scope'
 import {
   discoverCodexSnapshot,
   normalizeCodexMcp,
@@ -34,6 +46,74 @@ async function directory() {
 async function put(p: string, content: string) {
   await mkdir(dirname(p), { recursive: true })
   await writeFile(p, content)
+}
+const fixtureFs = {
+  resolve: async (path: string) => path,
+  stat: async (path: string) =>
+    stat(path).catch((error) => {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error
+      return undefined
+    }),
+  readText: (path: string) => readFile(path, 'utf8'),
+}
+function mcpHost(ctx: Context) {
+  ctx.provide('fs', fixtureFs as any)
+  ctx.provide('workingDirectory', {
+    ensure: async (agent: any) => agent.cwd,
+  } as any)
+  ctx.provide('agents', { list: () => [] } as any)
+}
+async function attachAgent(ctx: Context, cwd: string) {
+  // Cordis starts injected plugins asynchronously, as the Host does before session creation.
+  await new Promise<void>((done) => setImmediate(done))
+  const agent: any = { cwd }
+  const scope = createScope(ctx, agent)
+  agent.ctx = scope.ctx
+  await ctx.serial('agent/created', { agent, source: 'create' } as any)
+  return agent
+}
+async function httpMcp() {
+  const fixture = { healthy: true, calls: [] as number[] }
+  const server = createServer(async (request, response) => {
+    fixture.calls.push(Date.now())
+    if (!fixture.healthy) {
+      response.writeHead(503).end()
+      return
+    }
+    if (request.method !== 'POST') {
+      response.writeHead(405).end()
+      return
+    }
+    let body = ''
+    for await (const chunk of request) body += chunk
+    const message = JSON.parse(body)
+    if (message.id === undefined) {
+      response.writeHead(202).end()
+      return
+    }
+    const result =
+      message.method === 'initialize'
+        ? {
+            protocolVersion: message.params.protocolVersion,
+            capabilities: { tools: {} },
+            serverInfo: { name: 'fixture', version: '1' },
+          }
+        : { tools: [{ name: 'read', inputSchema: { type: 'object' } }] }
+    response
+      .writeHead(200, { 'Content-Type': 'application/json' })
+      .end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }))
+  })
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done))
+  cleanup.push(
+    () =>
+      new Promise<void>((done) => {
+        server.closeAllConnections()
+        server.close(() => done())
+      }),
+  )
+  return Object.assign(fixture, {
+    url: `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`,
+  })
 }
 const options: CodexCompatibilityConfig = {
   enabled: true,
@@ -146,6 +226,7 @@ describe('Codex config and plugin resources', () => {
     expect(snapshot.skillRoots).toContainEqual({
       path: join(plugin, 'skills'),
       plugin: 'active',
+      pluginId: 'active@sample',
     })
     expect(snapshot.items).toContainEqual({
       name: 'off@sample',
@@ -158,6 +239,18 @@ describe('Codex config and plugin resources', () => {
       state: 'unsupported',
       reason: 'codex-runtime-required',
     })
+    await put(join(plugin, '.mcp.json'), 'invalid-json')
+    const invalid = await discoverCodexSnapshot(home, options, {
+      previous: snapshot,
+    })
+    expect(invalid.mcp).toEqual(snapshot.mcp)
+    expect(invalid.skillRoots).toEqual(snapshot.skillRoots)
+    expect(invalid.items).toContainEqual({
+      name: 'active@sample',
+      kind: 'plugin',
+      state: 'failed',
+      reason: 'invalid-plugin-resources',
+    })
     await put(join(home, 'config.toml'), '')
     expect((await discoverCodexSnapshot(home, options)).mcp).toEqual([])
   })
@@ -167,6 +260,51 @@ describe('Codex config and plugin resources', () => {
     expect(await readCodexConfig(home)).toEqual({})
     await put(join(home, 'config.toml'), 'broken = [')
     await expect(readCodexConfig(home)).rejects.toThrow()
+  })
+
+  it('merges trusted project layers in order and skips untrusted layers', async () => {
+    const home = await directory(),
+      project = join(home, 'project'),
+      cwd = join(project, 'child')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await mkdir(cwd)
+    const config = `[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n[mcp_servers.fixture]\ncommand="fixture"\n`
+    await put(join(home, 'config.toml'), config)
+    await put(
+      join(project, '.codex/config.toml'),
+      '[mcp_servers.fixture]\nenabled=false\nproject_doc_max_bytes=12\n',
+    )
+    await put(join(cwd, '.codex/config.toml'), 'project_doc_max_bytes=0\n')
+    const result = await discoverCodexSnapshot(home, options, {
+      cwd,
+      fs: fixtureFs,
+    })
+    expect(result.mcp).toEqual([])
+    expect(result.config.project_doc_max_bytes).toBe(0)
+    expect(result.config.mcp_servers.fixture.command).toBe('fixture')
+    await put(join(home, 'config.toml'), config.replace('trusted', 'untrusted'))
+    expect(
+      (await discoverCodexSnapshot(home, options, { cwd, fs: fixtureFs })).mcp,
+    ).toHaveLength(1)
+  })
+
+  it('matches disabled skill selectors through symlink aliases', async () => {
+    const home = await realpath(await directory()),
+      target = join(home, 'target/SKILL.md'),
+      alias = join(home, 'skills/alias')
+    await put(target, 'fixture')
+    await mkdir(dirname(alias), { recursive: true })
+    await symlink(dirname(target), alias)
+    expect(
+      skillEnabled(
+        {
+          skills: {
+            config: [{ path: join(alias, 'SKILL.md'), enabled: false }],
+          },
+        },
+        { name: 'alias', path: target },
+      ),
+    ).toBe(false)
   })
 
   it('honors ordered disabled skill selectors and bundled policy', () => {
@@ -221,6 +359,7 @@ describe('Codex instruction context', () => {
           gate = fn
         },
         workingDirectory: { ensure: async () => project },
+        get: () => fixtureFs,
         logger: { warn() {} },
       },
       home,
@@ -335,12 +474,20 @@ describe('Codex instruction context', () => {
         handler = fn
       },
       workingDirectory: { ensure: async () => project },
+      get: () => fixtureFs,
       logger: { warn() {} },
     }
     installCodexInstructions(context, home)
     const events: any[] = [],
       user = { source: { kind: 'human' }, content: [] },
-      native = { source: { kind: 'agent-instructions' } }
+      native = {
+        source: {
+          kind: 'agent-instructions',
+          changes: [
+            { action: 'set', scope: '.\0AGENTS.md', path: 'AGENTS.md' },
+          ],
+        },
+      }
     const session = {
       surface: {
         get nodes() {
@@ -360,16 +507,213 @@ describe('Codex instruction context', () => {
     expect(first.messages).toHaveLength(2)
     events.push({ type: 'user/message', data: first.messages[1] })
     expect((await handler(payload, next)).messages).toEqual([user])
+    for (const action of ['set', 'replace', 'remove']) {
+      const nested = {
+        source: {
+          kind: 'agent-instructions',
+          changes: [
+            { action, scope: 'nested\0AGENTS.md', path: 'nested/AGENTS.md' },
+          ],
+        },
+        content: [{ type: 'text', text: 'NESTED_ONLY' }],
+      }
+      const result = await handler(payload, async () => ({
+        kind: 'accept',
+        messages: [user, native, nested],
+      }))
+      expect(result.messages).toEqual([user, nested])
+      const mixed = {
+        ...nested,
+        source: {
+          ...nested.source,
+          changes: [...native.source.changes, ...nested.source.changes],
+        },
+      }
+      expect(
+        (
+          await handler(payload, async () => ({
+            kind: 'accept',
+            messages: [user, mixed],
+          }))
+        ).messages,
+      ).toEqual([user, mixed])
+    }
     await put(join(home, 'AGENTS.md'), 'global version 2')
     const updated = await handler(payload, next)
     expect(updated.messages[1].content[0].text).toContain('global version 2')
     expect(updated.messages[1].content[0].text).not.toContain(
       'global version 1',
     )
+    await put(join(home, 'config.toml'), 'project_doc_max_bytes=0\n')
+    await put(join(project, 'AGENTS.md'), 'PROJECT_BUDGET_FIXTURE')
+    const zero = await handler(payload, next)
+    expect(JSON.stringify(zero.messages)).not.toContain(
+      'PROJECT_BUDGET_FIXTURE',
+    )
+  })
+
+  it('uses the DSH filesystem and cancellation for project instruction reads without a host fallback', async () => {
+    const home = await directory(),
+      project = join(home, 'project'),
+      outside = join(home, 'outside.txt')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await put(outside, 'PRIVATE_FIXTURE')
+    await symlink(outside, join(project, 'AGENTS.override.md'))
+    const readText = vi.fn(async () => {
+      throw new Error('denied-by-filesystem')
+    })
+    const signal = new AbortController().signal
+    let gate: any
+    installCodexInstructions(
+      {
+        on: (_: string, fn: any) => {
+          gate = fn
+        },
+        workingDirectory: { ensure: async () => project },
+        get: () => ({ ...fixtureFs, readText }),
+        logger: { warn() {} },
+      },
+      home,
+    )
+    const native = { source: { kind: 'agent-instructions' } },
+      decision = { kind: 'accept', messages: [native] }
+    const result = await gate(
+      { agent: { session: { surface: { nodes: [] } } }, messages: [], signal },
+      async () => decision,
+    )
+    expect(result).toBe(decision)
+    expect(readText).toHaveBeenCalledWith(
+      join(project, 'AGENTS.override.md'),
+      signal,
+    )
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_FIXTURE')
   })
 })
 
 describe('Codex runtime integration', () => {
+  it('applies trusted project MCP overrides in separate Agent scopes and cleans up on unload', async () => {
+    const home = await directory(),
+      first = join(home, 'first'),
+      second = join(home, 'second'),
+      server = await httpMcp()
+    for (const path of [first, second])
+      await mkdir(join(path, '.git'), { recursive: true })
+    await put(
+      join(home, 'config.toml'),
+      `[mcp_servers.fixture]\nurl=${JSON.stringify(server.url)}\n[projects.${JSON.stringify(first)}]\ntrust_level="trusted"\n[projects.${JSON.stringify(second)}]\ntrust_level="trusted"\n`,
+    )
+    await put(
+      join(first, '.codex/config.toml'),
+      `[mcp_servers.fixture]\nenabled=false\n[mcp_servers.only_a]\nurl=${JSON.stringify(server.url)}\n`,
+    )
+    await put(
+      join(second, '.codex/config.toml'),
+      `[mcp_servers.only_b]\nurl=${JSON.stringify(server.url)}\n`,
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    mcpHost(ctx)
+    ctx.provide('systemPrompt', {
+      tools() {},
+      section() {},
+      getSectionOrder() {
+        return 1
+      },
+    } as any)
+    await ctx.plugin(ToolsService)
+    const tools = ctx.get('tools') as ToolsService
+    let runtime!: ReturnType<typeof installCodexCompatibility>
+    await ctx.plugin({
+      name: 'fixture-owner',
+      apply(owner: Context) {
+        runtime = installCodexCompatibility(owner, {
+          ...options,
+          codexHome: home,
+          importSkills: false,
+          importInstructions: false,
+        })
+      },
+    })
+    const a = await attachAgent(ctx, first),
+      b = await attachAgent(ctx, second)
+    expect(tools.definitions()).toEqual([])
+    expect(tools.definitions(a).map((tool) => tool.name)).toEqual([
+      'mcp__only_a__read',
+    ])
+    expect(
+      tools
+        .definitions(b)
+        .map((tool) => tool.name)
+        .sort(),
+    ).toEqual(['mcp__fixture__read', 'mcp__only_b__read'])
+    a.cwd = second
+    await runtime.refresh()
+    expect(
+      tools
+        .definitions(a)
+        .map((tool) => tool.name)
+        .sort(),
+    ).toEqual(['mcp__fixture__read', 'mcp__only_b__read'])
+    await put(join(first, '.codex/config.toml'), 'broken = [')
+    a.cwd = first
+    await runtime.refresh()
+    expect(tools.definitions(a)).toEqual([])
+    expect(
+      tools
+        .definitions(b)
+        .map((tool) => tool.name)
+        .sort(),
+    ).toEqual(['mcp__fixture__read', 'mcp__only_b__read'])
+    await runtime.dispose()
+    expect(tools.definitions(a)).toEqual([])
+    expect(tools.definitions(b)).toEqual([])
+  })
+
+  it('automatically retries a transient initial MCP failure with backoff', async () => {
+    const home = await directory(),
+      server = await httpMcp()
+    server.healthy = false
+    await put(
+      join(home, 'config.toml'),
+      `[mcp_servers.fixture]\nurl=${JSON.stringify(server.url)}\n`,
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    mcpHost(ctx)
+    const tools = new Map<string, any>()
+    ctx.provide('tools', {
+      register(tool: any) {
+        tools.set(tool.name, tool)
+        return () => tools.delete(tool.name)
+      },
+    } as any)
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      watch: true,
+      importInstructions: false,
+      importSkills: false,
+    })
+    await attachAgent(ctx, home)
+    expect(
+      runtime.status().items.some((entry) => entry.state === 'failed'),
+    ).toBe(true)
+    const failedCalls = server.calls.length,
+      recoveredAt = Date.now()
+    server.healthy = true
+    await vi.waitFor(() => expect(tools.size).toBe(1), {
+      timeout: 3000,
+      interval: 50,
+    })
+    expect(server.calls.length).toBeGreaterThan(failedCalls)
+    expect(server.calls[failedCalls]! - recoveredAt).toBeGreaterThanOrEqual(400)
+    expect(runtime.status().items).toContainEqual({
+      name: 'fixture',
+      kind: 'mcp',
+      state: 'loaded',
+    })
+  })
+
   it('automatically detects configuration changes and stops polling on disposal', async () => {
     const home = await directory()
     const ctx = new Context()
@@ -446,6 +790,53 @@ describe('Codex runtime integration', () => {
     expect((await registry.list()).map((s) => s.name)).not.toContain('example')
   })
 
+  it('discovers nested project skills with nearer-directory precedence through the official registry', async () => {
+    const home = await directory(),
+      project = join(home, 'project'),
+      cwd = join(project, 'child')
+    await mkdir(join(project, '.git'), { recursive: true })
+    for (const [base, body] of [
+      [project, 'ROOT'],
+      [cwd, 'CHILD'],
+    ])
+      await put(
+        join(base!, '.agents/skills/shared/SKILL.md'),
+        `---\nname: shared\ndescription: Fixture\n---\n${body}`,
+      )
+    await put(
+      join(cwd, '.agents/skills/child-only/SKILL.md'),
+      '---\nname: child-only\ndescription: Child\n---\nChild body',
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    await ctx.plugin(SkillRegistry)
+    const registry = ctx.get('skills') as SkillRegistry
+    let native!: FileSystemSkillProvider
+    registry.registerProvider(
+      (control) =>
+        (native = new FileSystemSkillProvider(ctx, control, {
+          watch: false,
+          dshHome: join(home, 'dsh'),
+          agentsHome: join(home, 'agents'),
+        })),
+    )
+    cleanup.push(() => native.dispose())
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importMcpServers: false,
+    })
+    await runtime.refresh()
+    expect((await registry.list({ cwd })).map((s) => s.name)).toContain(
+      'child-only',
+    )
+    expect((await registry.get('shared', { cwd }))?.content).toContain('CHILD')
+    expect(
+      (await registry.list({ cwd: project })).map((s) => s.name),
+    ).not.toContain('child-only')
+  })
+
   it('connects a real stdio MCP, filters tools, preserves unchanged connections and removes deleted servers', async () => {
     const home = await directory(),
       server = join(home, 'mcp.mjs')
@@ -460,6 +851,7 @@ describe('Codex runtime integration', () => {
     const ctx = new Context()
     cleanup.push(() => ctx.fiber.dispose())
     const tools = new Map<string, any>()
+    mcpHost(ctx)
     ctx.provide('tools', {
       register: (tool: any) => {
         tools.set(tool.name, tool)
@@ -472,6 +864,7 @@ describe('Codex runtime integration', () => {
       importSkills: false,
       importInstructions: false,
     })
+    await attachAgent(ctx, home)
     await runtime.refresh()
     expect(runtime.status().items).toContainEqual({
       name: 'fixture',
@@ -487,6 +880,18 @@ describe('Codex runtime integration', () => {
     expect(JSON.stringify(response)).toContain('OK')
     await runtime.refresh()
     expect(tools.get('mcp__fixture__echo')).toBe(original)
+    await put(
+      join(home, 'config.toml'),
+      '[mcp_servers.fixture]\nurl="invalid-url"\n',
+    )
+    await runtime.refresh()
+    expect(tools.get('mcp__fixture__echo')).toBe(original)
+    expect(runtime.status().items).toContainEqual({
+      name: 'fixture',
+      kind: 'mcp',
+      state: 'unsupported',
+      reason: 'invalid-mcp-config',
+    })
     await put(join(home, 'config.toml'), 'broken = [')
     await runtime.refresh()
     expect(tools.get('mcp__fixture__echo')).toBe(original)
@@ -541,6 +946,7 @@ describe('Codex runtime integration', () => {
     const ctx = new Context()
     cleanup.push(() => ctx.fiber.dispose())
     const tools = new Map<string, any>()
+    mcpHost(ctx)
     ctx.provide('tools', {
       register: (tool: any) => {
         tools.set(tool.name, tool)
@@ -553,6 +959,7 @@ describe('Codex runtime integration', () => {
       importSkills: false,
       importInstructions: false,
     })
+    await attachAgent(ctx, home)
     await runtime.refresh()
     expect([...tools.keys()]).toEqual(['mcp__web__read'])
     expect(seen.every((value) => value === 'Bearer fixture-token')).toBe(true)
@@ -576,6 +983,7 @@ describe('Codex runtime integration', () => {
     )
     const ctx = new Context()
     cleanup.push(() => ctx.fiber.dispose())
+    mcpHost(ctx)
     ctx.provide('tools', { register: () => () => {} })
     const runtime = installCodexCompatibility(ctx, {
       ...options,
@@ -583,6 +991,7 @@ describe('Codex runtime integration', () => {
       importSkills: false,
       importInstructions: false,
     })
+    await attachAgent(ctx, home)
     await runtime.refresh()
     expect(runtime.status().items).toContainEqual({
       name: 'bad',

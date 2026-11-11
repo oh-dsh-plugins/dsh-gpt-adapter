@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
-import { readFile, readdir } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { readFile, readdir, stat } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
 import { parse } from 'smol-toml'
 
 export type JsonObject = Record<string, any>
@@ -26,7 +27,7 @@ export type CodexMcpConfig = {
   enabledTools?: string[]
   disabledTools: string[]
 }
-export type SkillRoot = { path: string; plugin?: string }
+export type SkillRoot = { path: string; plugin?: string; pluginId?: string }
 export type CodexSnapshot = {
   config: JsonObject
   mcp: CodexMcpConfig[]
@@ -58,9 +59,90 @@ export async function optionalText(path: string): Promise<string | undefined> {
   }
 }
 
-export async function readCodexConfig(home: string): Promise<JsonObject> {
+/** Minimal execution-world filesystem used by project readers. */
+export type ProjectFileSystem = {
+  resolve(path: string, options?: { signal?: AbortSignal }): Promise<any>
+  stat(target: any, signal?: AbortSignal): Promise<unknown>
+  readText(target: any, signal?: AbortSignal): Promise<string>
+}
+
+export async function projectText(
+  path: string,
+  fs?: ProjectFileSystem,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted()
+  if (!fs) return optionalText(path)
+  const target = await fs.resolve(path, signal ? { signal } : {})
+  if (!(await fs.stat(target, signal))) return undefined
+  return fs.readText(target, signal)
+}
+
+/** Repository root to cwd; without a repository only cwd participates. */
+export async function projectDirectories(
+  cwd: string,
+  fs?: ProjectFileSystem,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const directories: string[] = []
+  let current = resolve(cwd)
+  while (true) {
+    signal?.throwIfAborted()
+    directories.unshift(current)
+    const marker = join(current, '.git')
+    const exists = fs
+      ? await fs.stat(
+          await fs.resolve(marker, signal ? { signal } : {}),
+          signal,
+        )
+      : await stat(marker).catch((error) => {
+          if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error
+          return undefined
+        })
+    if (exists) return directories
+    if (dirname(current) === current) return [resolve(cwd)]
+    current = dirname(current)
+  }
+}
+
+function mergeConfig(base: JsonObject, layer: JsonObject): JsonObject {
+  const result = { ...base }
+  for (const [key, value] of Object.entries(layer))
+    result[key] =
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? mergeConfig(object(base[key]), value)
+        : value
+  return result
+}
+
+export async function readCodexConfig(
+  home: string,
+  cwd?: string,
+  fs?: ProjectFileSystem,
+  signal?: AbortSignal,
+): Promise<JsonObject> {
   const text = await optionalText(join(home, 'config.toml'))
-  return text === undefined ? {} : object(parse(text))
+  let config = text === undefined ? {} : object(parse(text))
+  if (!cwd) return config
+  const trust = Object.entries(object(config.projects))
+    .filter(([path]) => {
+      const child = relative(resolve(path), resolve(cwd))
+      return (
+        child === '' ||
+        (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child))
+      )
+    })
+    .sort(([a], [b]) => b.length - a.length)[0]
+  if (object(trust?.[1]).trust_level !== 'trusted') return config
+  for (const directory of await projectDirectories(cwd, fs, signal)) {
+    const layer = await projectText(
+      join(directory, '.codex', 'config.toml'),
+      fs,
+      signal,
+    )
+    if (layer !== undefined) config = mergeConfig(config, object(parse(layer)))
+  }
+  return config
 }
 
 function serverName(name: string): string {
@@ -205,8 +287,19 @@ function expandPlugin(value: unknown, root: string, home: string): any {
 export async function discoverCodexSnapshot(
   home: string,
   options: { importPluginResources: boolean; mcpAllowlist: string[] },
+  context: {
+    cwd?: string
+    fs?: ProjectFileSystem
+    signal?: AbortSignal
+    previous?: CodexSnapshot
+  } = {},
 ): Promise<CodexSnapshot> {
-  const config = await readCodexConfig(home)
+  const config = await readCodexConfig(
+    home,
+    context.cwd,
+    context.fs,
+    context.signal,
+  )
   const result: CodexSnapshot = {
     config,
     mcp: [],
@@ -239,6 +332,10 @@ export async function discoverCodexSnapshot(
         names.add(value.serverName)
         result.mcp.push(value)
       } catch (error: any) {
+        const previous = context.previous?.mcp.find(
+          (entry) => entry.serverName === serverName(publicName),
+        )
+        if (previous) result.mcp.push(previous)
         const reason = [
           'missing-environment',
           'unsupported-transport',
@@ -277,9 +374,14 @@ export async function discoverCodexSnapshot(
         const { root, manifest } = plugin
         const name = String(manifest.name ?? id.split('@')[0])
         const declared = manifest.skills ?? './skills'
+        const skillRoots: SkillRoot[] = []
         for (const entry of Array.isArray(declared) ? declared : [declared]) {
           if (typeof entry === 'string')
-            result.skillRoots.push({ path: resolve(root, entry), plugin: name })
+            skillRoots.push({
+              path: resolve(root, entry),
+              plugin: name,
+              pluginId: id,
+            })
         }
         let servers = manifest.mcpServers
         if (typeof servers === 'string') {
@@ -295,6 +397,7 @@ export async function discoverCodexSnapshot(
           root,
           home,
         )
+        result.skillRoots.push(...skillRoots)
         addServers(object(expanded), `plugin:${id}`, root, name)
         result.items.push({ name: id, kind: 'plugin', state: 'loaded' })
         for (const field of ['hooks', 'apps', 'commands']) {
@@ -307,6 +410,16 @@ export async function discoverCodexSnapshot(
             })
         }
       } catch {
+        result.mcp.push(
+          ...(context.previous?.mcp.filter(
+            (entry) => entry.source === `plugin:${id}`,
+          ) ?? []),
+        )
+        result.skillRoots.push(
+          ...(context.previous?.skillRoots.filter(
+            (entry) => entry.pluginId === id,
+          ) ?? []),
+        )
         result.items.push({
           name: id,
           kind: 'plugin',
@@ -331,7 +444,7 @@ export function skillEnabled(
     if (
       (typeof selector.path === 'string' &&
         skill.path &&
-        resolve(selector.path) === resolve(skill.path)) ||
+        canonicalPath(selector.path) === canonicalPath(skill.path)) ||
       selector.name === skill.name ||
       (plugin !== undefined && selector.name === `${plugin}:${skill.name}`)
     )
@@ -343,4 +456,12 @@ export function skillEnabled(
   )
     return false
   return enabled
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync.native(path)
+  } catch {
+    return resolve(path)
+  }
 }

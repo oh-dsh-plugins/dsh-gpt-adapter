@@ -32,7 +32,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.0.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.1.tgz
 ```
 
 `pnpm pack` runs the production build. Restart the DSH host after upgrading the installed package.
@@ -42,25 +42,25 @@ Configure GPT connections as usual under **Settings → Models**. The plugin ext
 
 Codex compatibility is enabled by default. The root is the plugin's `codexHome` override, then `CODEX_HOME`, then `~/.codex`.
 
-| Resource                       | Behavior                                                                                                                   |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `config.toml`                  | Read in place; connection secrets stay in memory                                                                           |
-| Global instructions            | First nonempty `AGENTS.override.md`, otherwise `AGENTS.md`                                                                 |
-| Project instructions           | Repository root to current DSH working directory; first nonempty override, base file, or configured fallback per directory |
-| DSH/shared global instructions | Retained from `~/.dsh/AGENTS.md` and `~/.agents/AGENTS.md` (or their configured environment roots)                         |
-| Local overlays                 | Existing `AGENTS.local.md` and `CLAUDE.local.md` remain applicable                                                         |
-| Codex skills                   | Discover `skills/` and `skills/.system/`; bodies load on demand                                                            |
-| Shared/project skills          | Continue through DSH's native `.agents/skills` discovery                                                                   |
-| Skill enablement               | Honor ordered `skills.config` name/path selectors and `skills.bundled.enabled`                                             |
-| Enabled plugins                | Read declared skill roots and inline or file-referenced `mcpServers`; disabled plugins stay disabled                       |
+| Resource                       | Behavior                                                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.toml`                  | Read user configuration in place, then trusted project `.codex/config.toml` layers from repository root to cwd; connection secrets stay in memory |
+| Global instructions            | First nonempty `AGENTS.override.md`, otherwise `AGENTS.md`                                                                                        |
+| Project instructions           | Repository root to current DSH working directory; first nonempty override, base file, or configured fallback per directory                        |
+| DSH/shared global instructions | Retained from `~/.dsh/AGENTS.md` and `~/.agents/AGENTS.md` (or their configured environment roots)                                                |
+| Local overlays                 | Existing `AGENTS.local.md` and `CLAUDE.local.md` remain applicable                                                                                |
+| Codex skills                   | Discover `skills/` and `skills/.system/`; bodies load on demand                                                                                   |
+| Shared/project skills          | Retain native discovery and include `.agents/skills` at every directory from cwd to repository root; nearer project skills take precedence        |
+| Skill enablement               | Honor ordered `skills.config` name/path selectors and `skills.bundled.enabled`                                                                    |
+| Enabled plugins                | Read declared skill roots and inline or file-referenced `mcpServers`; disabled plugins stay disabled                                              |
 
-The compatibility layer selects project instruction candidates using Codex precedence and replaces duplicate native instruction messages for those steps. It does not import Codex's built-in system prompt. Configured fallback filenames such as `CLAUDE.md` are used only when supplied in Codex configuration. Instructions are recorded as ordinary user context with a bounded byte budget; they do not override system, developer, or direct user instructions. Existing conversation history is retained when the plugin is removed.
+The compatibility layer reads project instructions through DSH's filesystem, selects candidates using Codex precedence, and replaces native messages only for covered scopes. Additional nested instruction updates remain applicable. It does not import Codex's built-in system prompt. Configured fallback filenames such as `CLAUDE.md` are used only when supplied in Codex configuration. Instructions are recorded as ordinary user context with a bounded byte budget, including an explicit zero budget; they do not override system, developer, or direct user instructions. Existing conversation history is retained when the plugin is removed.
 
 Plugin resources are resolved from the configured local marketplace, or the newest locally cached version in the matching marketplace. Nothing is downloaded automatically. Plugin skills use `<plugin>-<skill>` names to fit DSH's skill-name format and avoid cross-plugin collisions. Original skill paths and relative resources remain intact.
 
 ## MCP compatibility
 
-Installing the plugin automatically starts enabled MCP commands and connects configured HTTP endpoints. It imports `mcp_servers` and the MCP resources declared by enabled plugins.
+The plugin automatically starts enabled MCP commands and connects configured HTTP endpoints for each Agent session. It imports `mcp_servers` and the MCP resources declared by enabled plugins. Trusted project overrides apply within that Agent's scope; concurrent sessions do not share imported tool registrations. Untrusted project configuration is skipped.
 
 Supported configuration includes:
 
@@ -69,7 +69,7 @@ Supported configuration includes:
 - `enabled`, startup/tool timeouts, `enabled_tools`, and `disabled_tools`;
 - plugin-root substitutions in plugin server declarations.
 
-Global server names are retained where DSH permits them. Plugin servers use a plugin prefix. Unchanged connections are preserved. Changed or removed connections are disposed before replacement. Invalid configuration retains the last working snapshot. The default two-second refresh detects configuration and plugin-resource changes; native skill watchers detect skill file changes.
+Global server names are retained where DSH permits them. Plugin servers use a plugin prefix. Unchanged connections are preserved. Changed or removed connections are disposed before replacement. Invalid configuration retains the last working snapshot, including individually invalid server entries. With automatic refresh enabled, failed startup retries with exponential backoff for up to ten attempts; a manual refresh resets that budget. The default two-second refresh detects configuration and plugin-resource changes; native skill watchers detect skill file changes.
 
 Credentials are not copied into DSH settings, plugin caches, or this repository. Status responses contain only resource names, states, and sanitized reason codes. Missing environment variables must exist in the DSH host environment to be inherited.
 
