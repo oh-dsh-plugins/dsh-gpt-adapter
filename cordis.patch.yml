@@ -1,0 +1,6 @@
+# Extend the existing native adapter and UI; preserve official profile entries.
+- insert:
+    - id: gpt-adapter
+      name: dsh-gpt-adapter
+      config:
+        routes: {}

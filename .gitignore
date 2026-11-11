@@ -1,0 +1,12 @@
+node_modules/
+dist/
+lib/
+.generated/
+artifacts/
+.DS_Store
+coverage/
+.issues/
+issues/
+.env
+.env.*
+!.env.example
