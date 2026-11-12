@@ -22,14 +22,14 @@
 
 ## 兼容性与安装
 
-原生集成面向 DSH `0.2.2-rc.1`、Cordis `4.1.0`，并校验适配器源码指纹。开发依赖固定 Pi AI `1.3.0`。插件不会修改已安装的第三方包文件。当前 npm 发布版本为 `dsh-gpt-adapter@0.2.2`。
+原生集成面向 DSH `0.2.2-rc.1`、Cordis `4.1.0`，并校验适配器源码指纹。开发依赖固定 Pi AI `1.3.0`。插件不会修改已安装的第三方包文件。当前 npm 发布版本为 `dsh-gpt-adapter@0.2.3`。
 
 需要 Node.js `>=24.9.0` 和 DSH。源码构建另外需要 pnpm。
 
 在 `web` 配置档（profile）中安装已发布的 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.2
+dsh plugin --profile web add dsh-gpt-adapter@0.2.3
 ```
 
 安装或升级后重启 DSH 宿主。在「设置 → 模型」中配置 GPT 连接；Codex 环境复用默认开启。插件扩展现有原生设置与对话控件。
@@ -42,7 +42,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.3.tgz
 ```
 
 `pnpm pack` 会自动执行生产构建。
@@ -67,11 +67,13 @@ dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
 | Codex 技能         | 发现 `skills/` 和 `skills/.system/`，正文按需加载                                                   |
 | 共享与项目技能     | 保留原生发现机制，并补齐当前目录到仓库根每一级 `.agents/skills`；更近的项目技能优先                 |
 | 技能开关           | 遵循有序的 `skills.config` 名称/路径选择器，以及 `skills.bundled.enabled`                           |
-| 已启用插件         | 读取声明的技能目录和内联或文件引用形式的 `mcpServers`；禁用插件不加载                               |
+| 已启用插件         | 支持新版根目录 `plugin.json`、`mcp.json` 和旧版声明；禁用插件不加载                                 |
 
 兼容层通过 DSH 文件系统读取项目指令，按 Codex 优先级选择候选文件，只替换已覆盖作用域内的原生指令消息；额外发现的子目录指令更新仍然保留。它不会导入 Codex 内置系统提示词。`CLAUDE.md` 等后备文件仅在 Codex 配置明确声明时使用。指令以有字节预算的普通用户上下文写入会话，明确配置的零预算也会生效；指令不覆盖系统、开发者或用户直接指令。移除插件不会删除已有会话历史。
 
 插件资源优先来自已配置的本地市场目录，否则使用匹配市场中最新的本地缓存版本，不会自动下载。插件技能使用 `<插件名>-<技能名>`，以符合 DSH 命名格式并避免跨插件冲突。技能原始路径和相对资源引用保持不变。
+
+新版 Agent Plugins 使用固定的 `skills/` 与 `mcp.json`，不受旧版 `skills`、`mcpServers` 声明改写。OpenAI 扩展优先使用根清单的 `extensions.com.openai` 对象（包括空对象），缺省时才使用 `.codex-plugin/plugin.json`；插件名称仍取自根清单。
 
 ## MCP 兼容
 
@@ -85,6 +87,14 @@ dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
 - 插件服务器声明中的插件根目录变量替换。
 
 全局服务器名称在 DSH 允许时原样保留，插件服务器增加插件名前缀。未变化的连接继续复用；变更或删除的连接先卸载再替换。配置损坏时保留上一份有效快照，单个服务器配置无效时也会保留其可用连接。开启自动刷新时，启动失败会按指数退避间隔重试，最多尝试十次；手动刷新会重置次数。默认每两秒检查配置与插件资源变化，技能文件变化由原生监视器处理。
+
+插件级 `plugins.<插件>.mcp_servers.<服务器>` 的 `enabled`、`enabled_tools`、`disabled_tools` 和单工具禁用设置会覆盖声明中的策略，但不能改写插件的命令、传输或凭证。插件文件损坏时，保留的旧连接仍应用最新禁用和过滤限制；有效声明恢复前，不会放宽旧快照已有的限制。
+
+stdio 服务器默认从所属 Agent 的项目工作目录启动，切换项目时重建连接；显式 `cwd` 配置优先。未显式配置 `cwd` 时，相对可执行文件路径仍按配置或插件根目录解析，避免与运行目录混淆。插件根目录替换同时支持 `${PLUGIN_ROOT}`、`${CODEX_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_ROOT}`。
+
+导入的 MCP 工具会在 `tools/call` 的 `_meta["x-codex-turn-metadata"]` 中携带当前 DSH 会话和轮次信息。`session_id` 使用 Agent 的会话 ID，`turn_id` 使用 `<会话 ID>:<turn/start 事件序号>`；同一轮的调用保持一致，新轮次重新读取，异步并发会话相互隔离。没有活动轮次的诊断调用不生成虚假标识。这些字段不进入工具参数，也不要求模型填写。
+
+调用链为：DSH Agent → 导入工具的异步调用上下文 → MCP `tools/call` 元数据 → `node_repl` → 浏览器服务。此桥接修复浏览器服务因缺少 `session_id`、`turn_id` 抛出的 `Missing required Codex turn metadata`；浏览器扩展、认证和 App 专属服务仍需在宿主可用。插件卸载时撤销桥接，普通 DSH MCP 调用不注入这些字段。
 
 凭证不会复制到 DSH 设置、插件缓存或本仓库。状态接口只返回资源名、状态和经过脱敏的原因代码。需要继承的环境变量必须存在于 DSH 宿主环境中。
 

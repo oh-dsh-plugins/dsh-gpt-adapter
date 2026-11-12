@@ -14,6 +14,7 @@ export type CompatibilityItem = {
 export type CodexMcpConfig = {
   serverName: string
   source: string
+  originalName?: string
   transport: 'stdio' | 'streamable-http'
   command?: string
   args?: string[]
@@ -156,6 +157,7 @@ export function normalizeCodexMcp(
   source: string,
   base: string,
   environment: NodeJS.ProcessEnv = process.env,
+  defaultCwd = base,
 ): CodexMcpConfig | undefined {
   const raw = object(value)
   if (raw.enabled === false) return undefined
@@ -209,10 +211,10 @@ export function normalizeCodexMcp(
     if (environment[variable] !== undefined && env[variable] === undefined)
       env[variable] = environment[variable]!
   }
-  const cwd = typeof raw.cwd === 'string' ? resolve(base, raw.cwd) : base
+  const cwd = typeof raw.cwd === 'string' ? resolve(base, raw.cwd) : defaultCwd
   const command =
     raw.command.includes('/') && !isAbsolute(raw.command)
-      ? resolve(cwd, raw.command)
+      ? resolve(typeof raw.cwd === 'string' ? cwd : base, raw.command)
       : raw.command
   return {
     ...common,
@@ -237,10 +239,38 @@ async function directories(path: string): Promise<string[]> {
 
 async function manifestAt(
   root: string,
-): Promise<{ root: string; manifest: JsonObject } | undefined> {
+): Promise<
+  { root: string; manifest: JsonObject; portable: boolean } | undefined
+> {
+  const text = await optionalText(join(root, 'plugin.json'))
+  if (text !== undefined) {
+    const manifest = object(JSON.parse(text))
+    if (
+      manifest.$schema ===
+      'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'
+    ) {
+      const inline = manifest.extensions?.['com.openai']
+      const overlay =
+        inline !== null && typeof inline === 'object' && !Array.isArray(inline)
+          ? inline
+          : object(
+              JSON.parse(
+                (await optionalText(
+                  join(root, '.codex-plugin', 'plugin.json'),
+                )) ?? '{}',
+              ),
+            )
+      return {
+        root,
+        manifest: { ...manifest, ...overlay, name: manifest.name },
+        portable: true,
+      }
+    }
+  }
   for (const name of ['.codex-plugin', '.claude-plugin']) {
     const text = await optionalText(join(root, name, 'plugin.json'))
-    if (text !== undefined) return { root, manifest: object(JSON.parse(text)) }
+    if (text !== undefined)
+      return { root, manifest: object(JSON.parse(text)), portable: false }
   }
   return undefined
 }
@@ -272,6 +302,7 @@ async function resolvePlugin(home: string, id: string, config: JsonObject) {
 function expandPlugin(value: unknown, root: string, home: string): any {
   if (typeof value === 'string')
     return value
+      .replaceAll('${PLUGIN_ROOT}', root)
       .replaceAll('${CLAUDE_PLUGIN_ROOT}', root)
       .replaceAll('${CODEX_PLUGIN_ROOT}', root)
       .replaceAll('${CODEX_HOME}', home)
@@ -281,6 +312,31 @@ function expandPlugin(value: unknown, root: string, home: string): any {
       Object.entries(value).map(([k, v]) => [k, expandPlugin(v, root, home)]),
     )
   return value
+}
+
+/** Retained connections may only gain restrictions until their declaration is readable again. */
+function restrictMcpFallback(entry: CodexMcpConfig, policy: JsonObject) {
+  if (policy.enabled === false) return undefined
+  const requested = Array.isArray(policy.enabled_tools)
+    ? strings(policy.enabled_tools)
+    : undefined
+  const enabledTools =
+    requested && entry.enabledTools
+      ? entry.enabledTools.filter((name) => requested.includes(name))
+      : (requested ?? entry.enabledTools)
+  return {
+    ...entry,
+    ...(enabledTools ? { enabledTools } : {}),
+    disabledTools: [
+      ...new Set([
+        ...entry.disabledTools,
+        ...strings(policy.disabled_tools),
+        ...Object.entries(object(policy.tools))
+          .filter(([, tool]) => object(tool).enabled === false)
+          .map(([name]) => name),
+      ]),
+    ],
+  }
 }
 
 export async function discoverCodexSnapshot(
@@ -314,8 +370,16 @@ export async function discoverCodexSnapshot(
     source: string,
     base: string,
     plugin = '',
+    policies: JsonObject = {},
   ) => {
-    for (const [name, raw] of Object.entries(servers)) {
+    for (const [name, declaration] of Object.entries(servers)) {
+      // Plugin policy cannot replace its transport, executable or credentials.
+      const policy = Object.fromEntries(
+        Object.entries(object(policies[name])).filter(([key]) =>
+          ['enabled', 'enabled_tools', 'disabled_tools', 'tools'].includes(key),
+        ),
+      )
+      const raw = mergeConfig(object(declaration), policy)
       const publicName = plugin ? `${plugin}-${name}` : name
       if (
         object(raw).enabled === false ||
@@ -325,16 +389,24 @@ export async function discoverCodexSnapshot(
         continue
       }
       try {
-        const value = normalizeCodexMcp(publicName, raw, source, base)
+        const value = normalizeCodexMcp(
+          publicName,
+          raw,
+          source,
+          base,
+          process.env,
+          context.cwd ?? base,
+        )
         if (!value) continue
         if (names.has(value.serverName)) throw new Error('namespace-conflict')
         names.add(value.serverName)
-        result.mcp.push(value)
+        result.mcp.push({ ...value, originalName: name })
       } catch (error: any) {
         const previous = context.previous?.mcp.find(
           (entry) => entry.serverName === serverName(publicName),
         )
-        if (previous) result.mcp.push(previous)
+        const retained = previous && restrictMcpFallback(previous, raw)
+        if (retained) result.mcp.push(retained)
         const reason = [
           'missing-environment',
           'unsupported-transport',
@@ -370,9 +442,9 @@ export async function discoverCodexSnapshot(
           })
           continue
         }
-        const { root, manifest } = plugin
+        const { root, manifest, portable } = plugin
         const name = String(manifest.name ?? id.split('@')[0])
-        const declared = manifest.skills ?? './skills'
+        const declared = portable ? './skills' : (manifest.skills ?? './skills')
         const skillRoots: SkillRoot[] = []
         for (const entry of Array.isArray(declared) ? declared : [declared]) {
           if (typeof entry === 'string')
@@ -383,7 +455,10 @@ export async function discoverCodexSnapshot(
             })
         }
         let servers = manifest.mcpServers
-        if (typeof servers === 'string') {
+        if (portable) {
+          const text = await optionalText(join(root, 'mcp.json'))
+          servers = text === undefined ? undefined : JSON.parse(text)
+        } else if (typeof servers === 'string') {
           const text = await optionalText(resolve(root, servers))
           if (text === undefined) throw new Error('missing-plugin-mcp-file')
           servers = JSON.parse(text)
@@ -397,7 +472,13 @@ export async function discoverCodexSnapshot(
           home,
         )
         result.skillRoots.push(...skillRoots)
-        addServers(object(expanded), `plugin:${id}`, root, name)
+        addServers(
+          object(expanded),
+          `plugin:${id}`,
+          root,
+          name,
+          object(object(setting).mcp_servers),
+        )
         result.items.push({ name: id, kind: 'plugin', state: 'loaded' })
         for (const field of ['hooks', 'apps', 'commands']) {
           if (manifest[field])
@@ -409,11 +490,16 @@ export async function discoverCodexSnapshot(
             })
         }
       } catch {
-        result.mcp.push(
-          ...(context.previous?.mcp.filter(
-            (entry) => entry.source === `plugin:${id}`,
-          ) ?? []),
-        )
+        const policies = object(object(setting).mcp_servers)
+        for (const entry of context.previous?.mcp ?? []) {
+          if (entry.source !== `plugin:${id}`) continue
+          if (!entry.originalName && Object.keys(policies).length) continue
+          const retained = restrictMcpFallback(
+            entry,
+            object(policies[entry.originalName ?? '']),
+          )
+          if (retained) result.mcp.push(retained)
+        }
         result.skillRoots.push(
           ...(context.previous?.skillRoots.filter(
             (entry) => entry.pluginId === id,

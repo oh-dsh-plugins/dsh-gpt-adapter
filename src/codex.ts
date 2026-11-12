@@ -15,6 +15,7 @@ import {
   type CodexMcpConfig,
 } from './codex-config.js'
 import { installCodexInstructions } from './codex-instructions.js'
+import { installCodexMcpMetadata } from './codex-mcp-metadata.js'
 
 export type CodexCompatibilityConfig = {
   enabled: boolean
@@ -160,6 +161,10 @@ export function installCodexCompatibility(
       dispose: async () => {},
     }
 
+  const metadata = config.importMcpServers
+    ? installCodexMcpMetadata()
+    : undefined
+
   const scopedSnapshot = async (
     cwd: string,
     signal: AbortSignal | undefined,
@@ -253,7 +258,8 @@ export function installCodexCompatibility(
                   source: 'project-agents',
                   rank: 199 + candidates.length / (entries.length + 1),
                   locator: {
-                    rootPath: (candidate.locator as any)?.directory ?? options.cwd,
+                    rootPath:
+                      (candidate.locator as any)?.directory ?? options.cwd,
                     candidate,
                   },
                 })
@@ -410,7 +416,26 @@ export function installCodexCompatibility(
                   disabledTools.includes(definition.name)
                 )
                   return () => {}
-                return target.register(definition)
+                return target.register({
+                  ...definition,
+                  execute(args: any, execution: any) {
+                    const agent = execution.agent ?? owner.agent
+                    const boundary = agent.session
+                      ? child.agents.turnBoundaryOf?.(agent.session)
+                      : undefined
+                    const turn = boundary?.openTurnStartSeq
+                    const turnMetadata =
+                      typeof agent.id === 'string' && agent.id && turn != null
+                        ? {
+                            session_id: agent.id,
+                            turn_id: `${agent.id}:${turn}`,
+                          }
+                        : undefined
+                    return metadata!.run(turnMetadata, () =>
+                      definition.execute(args, execution),
+                    )
+                  },
+                })
               }
             const value = Reflect.get(target, key)
             return typeof value === 'function' ? value.bind(target) : value
@@ -566,9 +591,15 @@ export function installCodexCompatibility(
     owner.disposed = true
     agents.delete(agent)
     await owner.tail.catch(() => {})
-    await Promise.all(
-      [...owner.clients.values()].map((client) => client.fiber.dispose()),
+    const results = await Promise.allSettled(
+      [...owner.clients.values()].map(async (client) => client.fiber.dispose()),
     )
+    const errors = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    )
+    if (errors.length === 1) throw errors[0]
+    if (errors.length > 1)
+      throw new AggregateError(errors, 'Codex MCP client cleanup failed')
   }
 
   const reconcile = async () => {
@@ -667,11 +698,25 @@ export function installCodexCompatibility(
     (stopping ??= (async () => {
       closed = true
       if (timer) clearInterval(timer)
-      await Promise.all(injections.map((fiber) => fiber.dispose()))
-      await tail
-      await Promise.all([...agents.keys()].map(disposeAgent))
-      skillDispose?.()
-      await Promise.all(skills.map((s) => s.dispose()))
+      const errors: unknown[] = []
+      const settle = async (actions: Array<() => unknown>) => {
+        const results = await Promise.allSettled(
+          actions.map(async (action) => action()),
+        )
+        for (const result of results)
+          if (result.status === 'rejected') errors.push(result.reason)
+      }
+      await settle(injections.map((fiber) => () => fiber.dispose()))
+      await settle([() => tail])
+      await settle([...agents.keys()].map((agent) => () => disposeAgent(agent)))
+      await settle([
+        () => metadata?.dispose(),
+        () => skillDispose?.(),
+        ...skills.map((provider) => () => provider.dispose()),
+      ])
+      if (errors.length === 1) throw errors[0]
+      if (errors.length > 1)
+        throw new AggregateError(errors, 'Codex compatibility cleanup failed')
     })())
   ctx.effect(() => dispose, 'codex-compatibility')
   return {

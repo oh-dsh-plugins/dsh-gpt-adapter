@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createServer } from 'node:http'
+import { Client } from '@modelcontextprotocol/client'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
@@ -107,7 +108,11 @@ async function attachAgent(ctx: Context, cwd: string) {
   return agent
 }
 async function httpMcp() {
-  const fixture = { healthy: true, calls: [] as number[] }
+  const fixture = {
+    healthy: true,
+    calls: [] as number[],
+    messages: [] as any[],
+  }
   const server = createServer(async (request, response) => {
     fixture.calls.push(Date.now())
     if (!fixture.healthy) {
@@ -121,6 +126,7 @@ async function httpMcp() {
     let body = ''
     for await (const chunk of request) body += chunk
     const message = JSON.parse(body)
+    fixture.messages.push(message)
     if (message.id === undefined) {
       response.writeHead(202).end()
       return
@@ -132,7 +138,9 @@ async function httpMcp() {
             capabilities: { tools: {} },
             serverInfo: { name: 'fixture', version: '1' },
           }
-        : { tools: [{ name: 'read', inputSchema: { type: 'object' } }] }
+        : message.method === 'tools/call'
+          ? { content: [{ type: 'text', text: 'OK' }] }
+          : { tools: [{ name: 'read', inputSchema: { type: 'object' } }] }
     response
       .writeHead(200, { 'Content-Type': 'application/json' })
       .end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }))
@@ -161,6 +169,128 @@ const options: CodexCompatibilityConfig = {
 }
 
 describe('Codex config and plugin resources', () => {
+  it('findings: honors plugin server policies even when retaining a broken plugin snapshot', async () => {
+    const home = await directory()
+    const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+    const config =
+      '[plugins."active@sample"]\nenabled=true\n' +
+      '[plugins."active@sample".mcp_servers.off]\nenabled=false\n' +
+      '[plugins."active@sample".mcp_servers.backend]\nenabled_tools=["read"]\ndisabled_tools=["write"]\ncommand="ignored"\n' +
+      '[plugins."active@sample".mcp_servers.backend.tools.remove]\nenabled=false\n'
+    await put(join(home, 'config.toml'), config)
+    await put(
+      join(plugin, '.codex-plugin/plugin.json'),
+      JSON.stringify({
+        name: 'actual-name',
+        mcpServers: './.mcp.json',
+      }),
+    )
+    await put(
+      join(plugin, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          backend: { command: 'fixture', tools: { other: { enabled: false } } },
+          off: { command: 'fixture' },
+        },
+      }),
+    )
+    const snapshot = await discoverCodexSnapshot(home, options)
+    expect(snapshot.mcp).toHaveLength(1)
+    expect(snapshot.mcp[0]).toMatchObject({
+      serverName: 'actual-name-backend',
+      command: 'fixture',
+      enabledTools: ['read'],
+      disabledTools: ['write', 'other', 'remove'],
+    })
+    expect(snapshot.items).toContainEqual({
+      name: 'actual-name-off',
+      kind: 'mcp',
+      state: 'disabled',
+    })
+    await put(join(plugin, '.mcp.json'), 'broken-json')
+    await put(
+      join(home, 'config.toml'),
+      config.replace(
+        'enabled_tools=["read"]',
+        'enabled=false\nenabled_tools=["read"]',
+      ),
+    )
+    const disabled = await discoverCodexSnapshot(home, options, {
+      previous: snapshot,
+    })
+    expect(disabled.mcp).toEqual([])
+    await put(
+      join(home, 'config.toml'),
+      config.replace('disabled_tools=["write"]', 'disabled_tools=["read"]'),
+    )
+    const narrowed = await discoverCodexSnapshot(home, options, {
+      previous: snapshot,
+    })
+    expect(narrowed.mcp[0]?.disabledTools).toContain('read')
+    expect(narrowed.mcp[0]?.disabledTools).toContain('write')
+  })
+
+  it.each([false, true])(
+    'findings: loads portable components with inline OpenAI overlay=%s',
+    async (inline) => {
+      const home = await directory(),
+        project = join(home, 'project')
+      await mkdir(project)
+      const plugin = join(home, 'plugins/cache/sample/portable/1.0.0')
+      await put(
+        join(home, 'config.toml'),
+        '[plugins."portable@sample"]\nenabled=true\n',
+      )
+      await put(
+        join(plugin, 'plugin.json'),
+        JSON.stringify({
+          $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
+          name: 'portable',
+          skills: './wrong-skills',
+          mcpServers: './wrong.json',
+          ...(inline ? { extensions: { 'com.openai': {} } } : {}),
+        }),
+      )
+      await put(
+        join(plugin, '.codex-plugin/plugin.json'),
+        JSON.stringify({
+          name: 'wrong-name',
+          skills: './wrong-skills',
+          mcpServers: './wrong.json',
+          apps: './.app.json',
+        }),
+      )
+      await put(
+        join(plugin, 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            backend: { type: 'stdio', command: '${PLUGIN_ROOT}/server' },
+          },
+        }),
+      )
+      const snapshot = await discoverCodexSnapshot(home, options, {
+        cwd: project,
+      })
+      expect(snapshot.mcp).toHaveLength(1)
+      expect(snapshot.mcp[0]).toMatchObject({
+        serverName: 'portable-backend',
+        command: join(plugin, 'server'),
+        cwd: project,
+      })
+      expect(snapshot.skillRoots).toContainEqual({
+        path: join(plugin, 'skills'),
+        plugin: 'portable',
+        pluginId: 'portable@sample',
+      })
+      expect(
+        snapshot.skillRoots.some((root) => root.path.includes('wrong-skills')),
+      ).toBe(false)
+      expect(
+        snapshot.items.some((item) => item.name === 'portable@sample/apps'),
+      ).toBe(!inline)
+    },
+  )
+
   it('maps HTTP authentication, inherited stdio env, filters, cwd and timeouts without persisting credentials', () => {
     const http = normalizeCodexMcp(
       'remote',
@@ -647,6 +777,290 @@ describe('Codex instruction context', () => {
 })
 
 describe('Codex runtime integration', () => {
+  it('findings: starts stdio MCPs in each Agent project and updates cwd on a project switch', async () => {
+    const home = await directory(),
+      aDir = join(home, 'a'),
+      bDir = join(home, 'b')
+    await mkdir(aDir)
+    await mkdir(bDir)
+    const server = join(home, 'cwd-server.mjs')
+    await put(
+      server,
+      `import readline from 'node:readline';
+const r=readline.createInterface({input:process.stdin});
+r.on('line',s=>{const q=JSON.parse(s);if(q.id===undefined)return;
+let result={};
+if(q.method==='initialize')result={protocolVersion:q.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'cwd',version:'1'}};
+if(q.method==='tools/list')result={tools:[{name:'cwd',inputSchema:{type:'object'}}]};
+if(q.method==='tools/call')result={content:[{type:'text',text:process.cwd()}]};
+process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
+    )
+    await put(
+      join(home, 'config.toml'),
+      `[mcp_servers.fixture]\ncommand=${JSON.stringify(process.execPath)}\nargs=[${JSON.stringify(server)}]\n`,
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    mcpHost(ctx)
+    ctx.provide('systemPrompt', {
+      tools() {},
+      section() {},
+      getSectionOrder() {
+        return 1
+      },
+    } as any)
+    await ctx.plugin(ToolsService)
+    const tools = ctx.get('tools') as ToolsService
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importSkills: false,
+    })
+    const a = await attachAgent(ctx, aDir),
+      b = await attachAgent(ctx, bDir)
+    const invoke = (agent: any) =>
+      tools
+        .definitions(agent)[0]!
+        .execute({}, { agent, signal: new AbortController().signal } as any)
+    expect(JSON.stringify(await invoke(a))).toContain(aDir)
+    expect(JSON.stringify(await invoke(b))).toContain(bDir)
+    a.cwd = bDir
+    await runtime.refresh()
+    expect(JSON.stringify(await invoke(a))).toContain(bDir)
+    const snapshot = await discoverCodexSnapshot(home, options, { cwd: aDir })
+    expect(snapshot.mcp[0]?.cwd).toBe(aDir)
+    expect(
+      normalizeCodexMcp(
+        'relative',
+        { command: './server' },
+        'plugin',
+        home,
+        {},
+        aDir,
+      )?.command,
+    ).toBe(join(home, 'server'))
+    expect(
+      normalizeCodexMcp(
+        'explicit',
+        { command: 'node', cwd: 'work' },
+        'plugin',
+        home,
+        {},
+        aDir,
+      )?.cwd,
+    ).toBe(join(home, 'work'))
+    await runtime.dispose()
+  })
+
+  it.each(['sync', 'async', 'single'])(
+    'waits for every MCP client when the first disposer fails (%s)',
+    async (mode) => {
+      const home = await directory()
+      await put(
+        join(home, 'config.toml'),
+        ['first', 'second', 'third']
+          .map((name) => `[mcp_servers.${name}]\ncommand="fixture"\n`)
+          .join('\n'),
+      )
+      const handlers = new Map<string, (...args: any[]) => any>()
+      const firstFailure = new Error('first transport close failed')
+      const secondFailure = new Error('second transport close failed')
+      const original = Client.prototype.callTool
+      const started: number[] = [],
+        finished: number[] = []
+      let index = 0,
+        release!: () => void,
+        settled = false
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const child: any = {
+        agents: { list: () => [] },
+        workingDirectory: { ensure: async (agent: any) => agent.cwd },
+        get: (name: string) => (name === 'fs' ? fixtureFs : undefined),
+        on: (name: string, listener: (...args: any[]) => any) =>
+          handlers.set(name, listener),
+      }
+      const ctx: any = {
+        inject(_dependencies: string[], apply: (ctx: any) => void) {
+          apply(child)
+          return { dispose: async () => {} }
+        },
+        effect() {},
+      }
+      const agent: any = {
+        cwd: home,
+        ctx: {
+          get: () => fixtureFs,
+          plugin() {
+            const id = index++
+            return {
+              dispose() {
+                started.push(id)
+                if (id === 0) {
+                  if (mode === 'sync') throw firstFailure
+                  return Promise.reject(firstFailure)
+                }
+                return gate.then(() => {
+                  finished.push(id)
+                  if (id === 1 && mode !== 'single') throw secondFailure
+                })
+              },
+            }
+          },
+        },
+      }
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importSkills: false,
+        importPluginResources: false,
+      })
+      let completion: Promise<unknown> | undefined
+      try {
+        await handlers.get('agent/created')!({ agent })
+        await runtime.refresh()
+        expect(index).toBe(3)
+        completion = runtime.dispose().then(
+          () => undefined,
+          (error) => error,
+        )
+        void completion.then(() => {
+          settled = true
+        })
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(started).toEqual([0, 1, 2])
+        expect(settled).toBe(false)
+        expect(Client.prototype.callTool).not.toBe(original)
+        release()
+        const error = await completion
+        expect(finished).toEqual([1, 2])
+        if (mode === 'single') expect(error).toBe(firstFailure)
+        else {
+          expect(error).toBeInstanceOf(AggregateError)
+          expect((error as AggregateError).errors).toEqual([
+            firstFailure,
+            secondFailure,
+          ])
+        }
+        expect(Client.prototype.callTool).toBe(original)
+      } finally {
+        release()
+        await completion
+        await runtime.dispose().catch(() => {})
+      }
+    },
+  )
+
+  it('findings: restores MCP metadata and completes sibling cleanup when a scope disposer rejects', async () => {
+    const home = await directory()
+    const original = Client.prototype.callTool
+    const failure = new Error('scope disposal failed')
+    const disposed: number[] = []
+    let index = 0
+    const ctx: any = {
+      inject() {
+        const id = index++
+        return {
+          async dispose() {
+            disposed.push(id)
+            if (id === 0) throw failure
+          },
+        }
+      },
+      effect() {},
+    }
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importSkills: false,
+    })
+    try {
+      await expect(runtime.dispose()).rejects.toBe(failure)
+      expect(disposed.sort()).toEqual([0, 1, 2])
+      expect(Client.prototype.callTool).toBe(original)
+      await expect(runtime.dispose()).rejects.toBe(failure)
+      expect(disposed).toHaveLength(3)
+    } finally {
+      Client.prototype.callTool = original
+    }
+  })
+
+  it('sends per-turn Codex metadata on concurrent imported MCP calls without changing arguments', async () => {
+    const home = await directory(),
+      server = await httpMcp()
+    await put(
+      join(home, 'config.toml'),
+      `[mcp_servers.fixture]\nurl=${JSON.stringify(server.url)}\n`,
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    mcpHost(ctx)
+    ctx.provide('systemPrompt', {
+      tools() {},
+      section() {},
+      getSectionOrder() {
+        return 1
+      },
+    } as any)
+    await ctx.plugin(ToolsService)
+    const tools = ctx.get('tools') as ToolsService
+    const boundaries = new Map<any, number | null>()
+    ;(ctx.get('agents') as any).turnBoundaryOf = (session: any) => ({
+      openTurnStartSeq: boundaries.get(session) ?? null,
+    })
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importSkills: false,
+      importInstructions: false,
+    })
+    const a = await attachAgent(ctx, home),
+      b = await attachAgent(ctx, home)
+    a.id = 'session-a'
+    a.session = {}
+    b.id = 'session-b'
+    b.session = {}
+    boundaries.set(a.session, 10)
+    boundaries.set(b.session, 20)
+    const invoke = (agent: any) =>
+      tools
+        .definitions(agent)[0]!
+        .execute({ code: 'example()', title: 'unchanged' }, {
+          agent,
+          signal: new AbortController().signal,
+        } as any)
+    await Promise.all([invoke(a), invoke(b)])
+    boundaries.set(a.session, 30)
+    await invoke(a)
+    const calls = server.messages.filter((m) => m.method === 'tools/call')
+    expect(
+      calls
+        .map((m) => m.params._meta?.['x-codex-turn-metadata'])
+        .sort((x, y) => x?.turn_id.localeCompare(y?.turn_id)),
+    ).toEqual([
+      { session_id: 'session-a', turn_id: 'session-a:10' },
+      { session_id: 'session-a', turn_id: 'session-a:30' },
+      { session_id: 'session-b', turn_id: 'session-b:20' },
+    ])
+    expect(
+      calls.every(
+        (m) =>
+          JSON.stringify(m.params.arguments) ===
+          JSON.stringify({ code: 'example()', title: 'unchanged' }),
+      ),
+    ).toBe(true)
+    boundaries.set(a.session, null)
+    await invoke(a)
+    expect(
+      server.messages.at(-1).params._meta?.['x-codex-turn-metadata'],
+    ).toBeUndefined()
+    await runtime.dispose()
+  })
+
   it('applies trusted project MCP overrides in separate Agent scopes and cleans up on unload', async () => {
     const home = await directory(),
       first = join(home, 'first'),
@@ -768,7 +1182,9 @@ describe('Codex runtime integration', () => {
       kind: 'mcp',
       state: 'loaded',
     })
-    const statusKeys = runtime.status().items.map((item) => `${item.kind}\0${item.name}`)
+    const statusKeys = runtime
+      .status()
+      .items.map((item) => `${item.kind}\0${item.name}`)
     expect(new Set(statusKeys).size).toBe(statusKeys.length)
   })
 

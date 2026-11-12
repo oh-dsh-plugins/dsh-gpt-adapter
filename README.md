@@ -22,14 +22,14 @@ Reasoning and speed presets are requests to the configured gateway, not guarante
 
 ## Compatibility and installation
 
-The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The published npm package is `dsh-gpt-adapter@0.2.2`.
+The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The published npm package is `dsh-gpt-adapter@0.2.3`.
 
 Requires Node.js `>=24.9.0` and DSH. Source builds also require pnpm.
 
 Install the published package in the web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.2
+dsh plugin --profile web add dsh-gpt-adapter@0.2.3
 ```
 
 Restart the DSH host after installing or upgrading. Configure GPT connections under **Settings → Models**; Codex environment reuse is enabled by default. The plugin extends the existing native settings and conversation controls.
@@ -42,7 +42,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.3.tgz
 ```
 
 `pnpm pack` runs the production build.
@@ -67,11 +67,13 @@ Codex compatibility is enabled by default. The root is the plugin's `codexHome` 
 | Codex skills                   | Discover `skills/` and `skills/.system/`; bodies load on demand                                                                                   |
 | Shared/project skills          | Retain native discovery and include `.agents/skills` at every directory from cwd to repository root; nearer project skills take precedence        |
 | Skill enablement               | Honor ordered `skills.config` name/path selectors and `skills.bundled.enabled`                                                                    |
-| Enabled plugins                | Read declared skill roots and inline or file-referenced `mcpServers`; disabled plugins stay disabled                                              |
+| Enabled plugins                | Support portable root `plugin.json` / `mcp.json` and legacy declarations; disabled plugins stay disabled                                          |
 
 The compatibility layer reads project instructions through DSH's filesystem, selects candidates using Codex precedence, and replaces native messages only for covered scopes. Additional nested instruction updates remain applicable. It does not import Codex's built-in system prompt. Configured fallback filenames such as `CLAUDE.md` are used only when supplied in Codex configuration. Instructions are recorded as ordinary user context with a bounded byte budget, including an explicit zero budget; they do not override system, developer, or direct user instructions. Existing conversation history is retained when the plugin is removed.
 
 Plugin resources are resolved from the configured local marketplace, or the newest locally cached version in the matching marketplace. Nothing is downloaded automatically. Plugin skills use `<plugin>-<skill>` names to fit DSH's skill-name format and avoid cross-plugin collisions. Original skill paths and relative resources remain intact.
+
+Portable Agent Plugins use fixed `skills/` and `mcp.json` components, regardless of legacy `skills` or `mcpServers` declarations. OpenAI settings come from the root manifest's `extensions.com.openai` object, including an empty object; only when absent does `.codex-plugin/plugin.json` supply the overlay. Plugin identity always comes from the root manifest.
 
 ## MCP compatibility
 
@@ -85,6 +87,14 @@ Supported configuration includes:
 - plugin-root substitutions in plugin server declarations.
 
 Global server names are retained where DSH permits them. Plugin servers use a plugin prefix. Unchanged connections are preserved. Changed or removed connections are disposed before replacement. Invalid configuration retains the last working snapshot, including individually invalid server entries. With automatic refresh enabled, failed startup retries with exponential backoff for up to ten attempts; a manual refresh resets that budget. The default two-second refresh detects configuration and plugin-resource changes; native skill watchers detect skill file changes.
+
+Plugin-scoped `plugins.<plugin>.mcp_servers.<server>` policies apply `enabled`, `enabled_tools`, `disabled_tools`, and per-tool disabling without overriding the plugin's executable, transport, or credentials. When plugin files are invalid, retained connections still receive current disabling and filtering restrictions; old restrictions are not relaxed until a valid declaration is available again.
+
+Stdio servers default to their Agent's project working directory and reconnect when that directory changes. An explicit `cwd` takes precedence. Without an explicit `cwd`, relative executable paths still resolve from the config or plugin root, independently of the process working directory. Plugin paths support `${PLUGIN_ROOT}`, `${CODEX_PLUGIN_ROOT}`, and `${CLAUDE_PLUGIN_ROOT}`.
+
+Imported MCP tools carry the current DSH session and turn in `tools/call` metadata under `_meta["x-codex-turn-metadata"]`. `session_id` is the Agent session ID; `turn_id` is `<session ID>:<turn/start event sequence>`. Calls in one turn share the same identity, new turns read a fresh boundary, and asynchronous sessions remain isolated. Diagnostic calls outside an active turn do not invent identities. These fields are transport metadata, never model-supplied tool arguments.
+
+The path is DSH Agent → imported tool execution context → MCP `tools/call` metadata → `node_repl` → browser service. This bridge addresses `Missing required Codex turn metadata: session_id, turn_id`; the browser extension, authentication, and App-specific services must still be available on the host. Unloading the plugin removes the bridge, and ordinary DSH MCP calls do not receive these fields.
 
 Credentials are not copied into DSH settings, plugin caches, or this repository. Status responses contain only resource names, states, and sanitized reason codes. Missing environment variables must exist in the DSH host environment to be inherited.
 
