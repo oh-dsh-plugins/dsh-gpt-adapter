@@ -13,6 +13,18 @@ describe('plugin packaging and compatible composition', () => {
       .split(',')
       .map((name) => name.trim())
     expect(parameters).toEqual(['sessionId', 'provider', 'modelId', 'tier'])
+    expect(
+      host
+        .match(/async setContextWindow\(([^)]*)\)/)![1]!
+        .split(',')
+        .map((name) => name.trim()),
+    ).toEqual([
+      'provider',
+      'modelId',
+      'mode',
+      'customTokens',
+      'expectedRevision',
+    ])
   })
   it('exports every built entry and an additive valid bundle', async () => {
     const manifest = JSON.parse(await readFile('package.json', 'utf8'))

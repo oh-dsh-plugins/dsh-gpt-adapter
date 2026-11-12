@@ -1,4 +1,10 @@
-import React, { useEffect, useId, useState, useSyncExternalStore } from 'react'
+import React, {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import {
   Button,
   Input,
@@ -20,6 +26,7 @@ import type {
   ModelDirectoryResolver,
 } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import styles from 'dsh-gpt-adapter/native-settings-styles'
+import { ContextWindowControl } from './context-window.js'
 
 type ProviderStatus = ReturnType<GptModels['status']>
 type SpeedStatus = ReturnType<GptModels['speed']>
@@ -42,19 +49,23 @@ export function apply(ctx: Context): void {
     const [value, setValue] = useState<ProviderStatus>()
     const [error, setError] = useState('')
     const [busy, setBusy] = useState(false)
+    const requests = useRef({ sequence: 0, writing: false })
     useEffect(() => {
       let active = true
+      requests.current.writing = false
+      setBusy(false)
       const refresh = () => {
-        if (!provider) return
+        if (!provider || requests.current.writing) return
+        const sequence = ++requests.current.sequence
         void call<ProviderStatus>('status', { provider })
           .then((value) => {
-            if (active) {
+            if (active && sequence === requests.current.sequence) {
               setValue(value)
               setError('')
             }
           })
           .catch((error) => {
-            if (active)
+            if (active && sequence === requests.current.sequence)
               setError(
                 error instanceof Error ? error.message : '无法读取 GPT 设置',
               )
@@ -64,22 +75,32 @@ export function apply(ctx: Context): void {
       const timer = setInterval(refresh, 3000)
       return () => {
         active = false
+        requests.current.sequence++
         clearInterval(timer)
       }
     }, [provider])
     async function act(method: string, args: Record<string, unknown>) {
-      if (busy) return
+      if (requests.current.writing) return
+      requests.current.writing = true
+      const sequence = ++requests.current.sequence
       setBusy(true)
       try {
         await call(method, args)
-        setValue(await call<ProviderStatus>('status', { provider }))
+        if (sequence !== requests.current.sequence) return false
+        const next = await call<ProviderStatus>('status', { provider })
+        if (sequence !== requests.current.sequence) return false
+        setValue(next)
         setError('')
         return true
       } catch (error) {
-        setError(error instanceof Error ? error.message : '操作失败，请重试')
+        if (sequence === requests.current.sequence)
+          setError(error instanceof Error ? error.message : '操作失败，请重试')
         return false
       } finally {
-        setBusy(false)
+        if (sequence === requests.current.sequence) {
+          requests.current.writing = false
+          setBusy(false)
+        }
       }
     }
     return { value, error, busy, act }
@@ -225,6 +246,28 @@ export function apply(ctx: Context): void {
                   移除上游未列出的模型（{stale}）
                 </Button>
               </div>
+            )}
+            {Object.keys(value.contextWindows ?? {}).length > 0 && (
+              <details className={styles.customized}>
+                <summary className={styles.customizedSummary}>
+                  上下文窗口
+                </summary>
+                <div className={styles.customizedBody}>
+                  {Object.entries(value.contextWindows).map(
+                    ([modelId, context]) => (
+                      <ContextWindowControl
+                        key={modelId}
+                        provider={provider.provider}
+                        modelId={modelId}
+                        value={context}
+                        revision={value.contextRevision}
+                        busy={busy}
+                        save={(args) => act('setContextWindow', args)}
+                      />
+                    ),
+                  )}
+                </div>
+              </details>
             )}
             <AdvancedSettings
               key={provider.provider}

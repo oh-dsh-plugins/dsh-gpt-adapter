@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import z from '@deepseek-ai/schemastery'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { Config } from '@deepseek-ai/dsh-llm-pi-ai'
+import { SettingsForms } from '@deepseek-ai/dsh-settings'
 import {
   GPT_REASONING_LEVELS,
   resolveCapabilities,
@@ -84,6 +85,103 @@ function schemaLevels(json: any) {
 }
 
 describe('plugin-owned reasoning on the native Models page', () => {
+  it('rejects a stale native model draft after metadata changes without freezing its old capacity', async () => {
+    let raw: any = {
+      providers: {
+        gateway: {
+          api: 'openai-responses',
+          baseURL: 'https://fixture.invalid/v1',
+          models: [{ id: 'gpt-example' }],
+        },
+      },
+    }
+    let capacity = 800000
+    let nativeRevision = 1
+    const entry = {
+      options: { id: 'llm-pi-ai' },
+      fiber: { runtime: { Config } },
+    }
+    // Exercise the real private writer and path operations, without filesystem writes.
+    const settings: any = Object.create(SettingsForms.prototype)
+    settings.ownerContext = {
+      configEditor: {
+        entries: () => [entry],
+        edit: async (
+          _entry: unknown,
+          change: (current: any, base: any) => any,
+        ) => {
+          const next = change(structuredClone(raw), {})
+          Config(next)
+          raw = next
+          nativeRevision++
+        },
+      },
+    }
+    settings.describe = () => [
+      {
+        ns: 'llm-pi-ai',
+        revision: nativeRevision,
+        schema: Config.toJSON(),
+        value: structuredClone(raw),
+        user: structuredClone(raw),
+        base: {},
+      },
+    ]
+    const dispose = installSettingsOverlay(settings, (_provider, model) => ({
+      ...resolveCapabilities({ id: model.id }, 'test'),
+      contextWindow: capacity,
+    }))
+    try {
+      const opened = settings.describe()[0]
+      const draft = opened.user.providers.gateway.models
+      draft[0].name = 'Renamed'
+      capacity = 900000
+      await expect(
+        settings.mutate(
+          'llm-pi-ai',
+          [
+            {
+              op: 'set',
+              path: ['providers', 'gateway', 'models'],
+              value: draft,
+            },
+          ],
+          opened.revision,
+        ),
+      ).rejects.toThrow('changed since it was read')
+      expect(raw.providers.gateway.models[0]).toEqual({ id: 'gpt-example' })
+      const refreshed = settings.describe()[0]
+      expect(refreshed.revision).not.toBe(opened.revision)
+      expect(settings.describe()[0].revision).toBe(refreshed.revision)
+      const freshDraft = refreshed.user.providers.gateway.models
+      freshDraft[0].name = 'Renamed'
+      await settings.mutate(
+        'llm-pi-ai',
+        [
+          {
+            op: 'set',
+            path: ['providers', 'gateway', 'models'],
+            value: freshDraft,
+          },
+        ],
+        refreshed.revision,
+      )
+      expect(raw.providers.gateway.models[0]).toEqual({
+        id: 'gpt-example',
+        name: 'Renamed',
+      })
+      await dispose.setContextWindow(
+        'gateway',
+        'gpt-example',
+        516000,
+        settings.describe()[0].revision,
+      )
+      expect(raw.providers.gateway.models[0].contextWindow).toBe(516000)
+    } finally {
+      dispose()
+    }
+  })
+
   it('overrides the real Cordis service across contexts and restores it on disposal', async () => {
     const ctx = new Context()
     class NativeSettings extends Service {

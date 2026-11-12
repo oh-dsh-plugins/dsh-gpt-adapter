@@ -62,6 +62,18 @@ export function installNativeAdapterBridge(
       })
     const models = new Proxy(snapshot.models, {
       get(target, key) {
+        if (key === 'getModel' && typeof target.getModel === 'function')
+          return (provider: string, modelId: string) => {
+            const model = target.getModel(provider, modelId)
+            const capacity = extension.model.context as
+              { contextWindow?: number } | undefined
+            return model &&
+              provider === options.provider &&
+              modelId === options.model &&
+              capacity?.contextWindow
+              ? { ...model, contextWindow: capacity.contextWindow }
+              : model
+          }
         if (key === 'streamSimple')
           return (model: any, context: any, settings: any) => {
             const call = extension.prepare(options)

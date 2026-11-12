@@ -1,4 +1,5 @@
 import { resolveCapabilities, isGptModel } from './capabilities.js'
+import { validContextWindow } from './context-window.js'
 import { createHash } from 'node:crypto'
 import type {
   CapabilityCatalog,
@@ -234,9 +235,7 @@ function parseCapabilityHints(
       : {}),
     ...(hasTierSignal ? { serviceTiers: tiers } : {}),
     ...(defaultTier ? { defaultServiceTier: defaultTier } : {}),
-    ...(typeof contextWindow === 'number' && contextWindow > 0
-      ? { contextWindow }
-      : {}),
+    ...(validContextWindow(contextWindow) ? { contextWindow } : {}),
     ...(typeof maxOutputTokens === 'number' && maxOutputTokens > 0
       ? { maxOutputTokens }
       : {}),

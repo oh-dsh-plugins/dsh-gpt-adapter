@@ -13,6 +13,14 @@ import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
+import {
+  contextWindowTokens,
+  resolveContextWindow,
+  validContextWindow,
+  type ContextWindowMode,
+  type ContextWindowResolution,
+} from './context-window.js'
 import { installNativeAdapterBridge } from './native-adapter.js'
 import {
   isGptModel,
@@ -20,7 +28,12 @@ import {
   mergeCapabilities,
   resolveCapabilities,
 } from './capabilities.js'
-import { installSettingsOverlay, projectModel } from './settings-overlay.js'
+import {
+  installSettingsOverlay,
+  projectModel,
+  type ContextWindowEdit,
+  type ContextWindowWriter,
+} from './settings-overlay.js'
 import {
   installCodexCompatibility,
   type CodexCompatibilityConfig,
@@ -111,6 +124,7 @@ declare module '@deepseek-ai/cordis' {
 /** Source-mode Remote markers are consumed by the existing authenticated Gateway. */
 export class GptModels extends Service {
   codex?: CodexCompatibilityRuntime
+  contextWriter: ContextWindowWriter | undefined
   readonly typertRemote: ReturnType<typeof bindTypertRemote>
   private readonly runners = new Map<string, ModelSynchronizer>()
   private readonly snapshots = new Map<string, SyncSnapshot>()
@@ -246,7 +260,9 @@ export class GptModels extends Service {
               api?: string
               reasoning?: string
               apiKeyEnv?: string
+              defaultContextWindow?: number
               models?: Array<{ id: string; [key: string]: unknown }>
+              modelOverrides?: Record<string, Record<string, unknown>>
             }
           >
         }
@@ -297,13 +313,15 @@ export class GptModels extends Service {
     snapshot: SyncSnapshot,
   ): Promise<void> {
     if (this.closed) return
-    const { descriptor, profile } = this.profile(provider)
+    const { profile } = this.profile(provider)
     const existing = profile.models ?? []
     const ids = new Set(existing.map((model) => model.id))
     const added = snapshot.models
       .filter((model) => !model.stale && !ids.has(model.id))
       .map((model) => ({ id: model.id, name: model.displayName ?? model.id }))
-    if (added.length) {
+    // Native catalog overrides cannot coexist with an explicit model list.
+    // Keep catalog mode intact; discovery still updates the plugin snapshot.
+    if (added.length && !Object.keys(profile.modelOverrides ?? {}).length) {
       await this.ctx.settings.mutate(
         'llm-pi-ai',
         [
@@ -311,13 +329,17 @@ export class GptModels extends Service {
             op: 'set',
             path: ['providers', provider, 'models'],
             value: [...existing, ...added].map((model) =>
-              projectModel(provider, model, (route, row) =>
-                this.capability(route, row.id, row.name),
+              projectModel(
+                provider,
+                model,
+                (route, row) => this.capability(route, row.id, row.name),
+                undefined,
+                ids.has(model.id),
               ),
             ),
           },
         ],
-        descriptor.revision,
+        this.modelsRevision(),
       )
     }
     if (this.closed) return
@@ -362,6 +384,19 @@ export class GptModels extends Service {
           stale: model.stale ?? false,
         })) ?? [],
       capabilities,
+      contextWindows: Object.fromEntries(
+        this.routeOptions(provider)?.enabled
+          ? (this.profile(provider).profile.models ?? [])
+              .filter(
+                (model) => this.capability(provider, model.id) !== undefined,
+              )
+              .map((model) => [
+                model.id,
+                this.contextWindow(provider, model.id),
+              ])
+          : [],
+      ),
+      contextRevision: this.modelsRevision(),
       options: this.routeOptions(provider) ?? {
         enabled: false,
         refreshIntervalMs: 1800000,
@@ -418,6 +453,15 @@ export class GptModels extends Service {
     const overrides: unknown = JSON.parse(overridesJSON)
     if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides))
       throw new Error('模型覆盖需要是 JSON 对象')
+    for (const entry of Object.values(overrides)) {
+      if (
+        entry &&
+        typeof entry === 'object' &&
+        'contextWindow' in entry &&
+        !validContextWindow(entry.contextWindow)
+      )
+        throw new Error('上下文窗口必须是正的安全整数')
+    }
     const descriptor = this.ctx.settings
       .describe()
       .find((entry) => entry.ns === this.settingsNs)
@@ -457,7 +501,7 @@ export class GptModels extends Service {
         .current()
         ?.models.filter((model) => model.stale)
         .map((model) => model.id) ?? []
-    const { descriptor, profile } = this.profile(provider)
+    const { profile } = this.profile(provider)
     const nextModels = profile.models?.filter(
       (model) => !staleIds.includes(model.id),
     )
@@ -469,15 +513,142 @@ export class GptModels extends Service {
             op: 'set',
             path: ['providers', provider, 'models'],
             value: nextModels.map((model) =>
-              projectModel(provider, model, (route, row) =>
-                this.capability(route, row.id, row.name),
+              projectModel(
+                provider,
+                model,
+                (route, row) => this.capability(route, row.id, row.name),
+                undefined,
               ),
             ),
           },
         ],
-        descriptor.revision,
+        this.modelsRevision(),
       )
     await runner.removeStale(staleIds)
+  }
+
+  /** Resolve raw metadata separately from merged capabilities and cached overrides. */
+  contextWindow(
+    provider: string,
+    modelId: string,
+    nativeDefault?: number,
+  ): ContextWindowResolution {
+    const { descriptor, profile } = this.profile(provider)
+    const overrides = JSON.parse(
+      this.routeOptions(provider, profile)?.overridesJSON ?? '{}',
+    )
+    const row = profile.models?.length
+      ? profile.models.find((model) => model.id === modelId)
+      : profile.modelOverrides?.[modelId]
+    const snapshot = this.snapshots.get(provider)
+    const raw = snapshot?.models.find((model) => model.id === modelId)
+    const userProfile = (descriptor.user as any)?.providers?.[provider]
+    // Schema defaults are present in value/base; only an explicit user field,
+    // a non-default inherited value, or an unlayered raw descriptor is intent.
+    const providerDefault =
+      userProfile?.defaultContextWindow ??
+      (profile.defaultContextWindow !== 1000000 ||
+      (descriptor.base === undefined && descriptor.user === undefined)
+        ? profile.defaultContextWindow
+        : undefined)
+    const catalogModel = getBuiltinModels(provider as never).find(
+      (model) => model.id === modelId,
+    )
+    return resolveContextWindow({
+      modelId,
+      legacy: overrides[modelId]?.contextWindow,
+      native: row?.contextWindow,
+      providerDefault,
+      upstream: raw?.capabilities?.contextWindow,
+      catalog: snapshot?.catalog?.models[modelId]?.contextWindow,
+      nativeDefault:
+        nativeDefault ??
+        catalogModel?.contextWindow ??
+        profile.defaultContextWindow,
+    })
+  }
+
+  contextWriteRevision(): number | undefined {
+    return this.nativeDescribe().find((row) => row.ns === this.settingsNs)
+      ?.revision
+  }
+
+  /** Public form revisions also cover changes to projected model capacities. */
+  private modelsRevision(): number {
+    const descriptor = this.ctx.settings
+      .describe()
+      .find((row) => row.ns === 'llm-pi-ai')
+    if (!descriptor) throw new Error('模型设置暂不可用')
+    return descriptor.revision
+  }
+
+  /** Remove only legacy context fields after the matching native save commits. */
+  async clearLegacyContext(
+    edits: ContextWindowEdit[],
+    expected?: number,
+  ): Promise<void> {
+    const operations: Array<{ op: 'set'; path: string[]; value: string }> = []
+    for (const provider of new Set(edits.map((edit) => edit.provider))) {
+      const text = this.options.routes[provider]?.overridesJSON
+      if (!text) continue
+      const overrides = JSON.parse(text)
+      let changed = false
+      for (const edit of edits.filter((entry) => entry.provider === provider)) {
+        if (
+          overrides[edit.modelId] &&
+          Object.hasOwn(overrides[edit.modelId], 'contextWindow')
+        ) {
+          delete overrides[edit.modelId].contextWindow
+          changed = true
+        }
+      }
+      if (changed)
+        operations.push({
+          op: 'set',
+          path: ['routes', provider, 'overridesJSON'],
+          value: JSON.stringify(overrides),
+        })
+    }
+    if (operations.length)
+      await this.ctx.settings.mutate(this.settingsNs, operations, expected)
+  }
+
+  @Remote
+  async setContextWindow(
+    provider: string,
+    modelId: string,
+    mode: ContextWindowMode,
+    customTokens?: number,
+    expectedRevision?: number,
+  ): Promise<void> {
+    const tokens = contextWindowTokens(mode, customTokens)
+    const { profile } = this.profile(provider)
+    if (!this.capability(provider, modelId))
+      throw new Error('请先启用该 GPT 模型的自动适配')
+    const index =
+      profile.models?.findIndex((model) => model.id === modelId) ?? -1
+    if (index < 0) throw new Error('模型已变更，请刷新后重试')
+    const effective =
+      tokens ?? this.contextWindow(provider, modelId).defaultTokens
+    const row = profile.models![index]!
+    const compaction = this.nativeDescribe().find(
+      (entry) => entry.ns === 'compaction-basic',
+    )?.value as any
+    const policy = compaction?.modelPolicies?.find(
+      (entry: any) => entry.provider === provider && entry.model === modelId,
+    )
+    const headroom = policy?.headroomTokens ?? compaction?.headroomTokens ?? 0
+    const output = validContextWindow(row.maxTokens) ? row.maxTokens : 0
+    if (effective <= output + headroom)
+      throw new Error('上下文窗口必须大于当前最大输出和压缩预留的总和')
+    if (!this.contextWriter) throw new Error('上下文设置暂不可用')
+    await this.contextWriter(
+      provider,
+      modelId,
+      tokens,
+      expectedRevision ?? this.modelsRevision(),
+    )
+    this.ctx.emit('llm/models-updated', provider)
   }
 
   @Remote({ resources: { session: (sessionId: SessionId) => sessionId } })
@@ -543,13 +714,17 @@ export class GptModels extends Service {
       ...overrides[modelId],
     }
     const current = this.snapshots.get(provider)?.capabilities[modelId]
-    return current
+    const result = current
       ? mergeCapabilities(current, override, current.capabilityRevision)
       : resolveCapabilities(
           { id: modelId, ...(displayName ? { displayName } : {}) },
           'gpt-preset',
           override,
         )
+    return {
+      ...result,
+      contextWindow: this.contextWindow(provider, modelId).effectiveTokens,
+    }
   }
 
   /** Capture request controls for the version-checked native runtime extension. */
@@ -568,6 +743,15 @@ export class GptModels extends Service {
     const protocol = (profile.api ?? 'openai-responses') as GptProtocol
     const model = {
       ...base,
+      context: {
+        ...((base.context as object) ?? {}),
+        contextWindow: this.contextWindow(
+          provider,
+          modelId,
+          (base.context as { contextWindow?: number } | undefined)
+            ?.contextWindow,
+        ).effectiveTokens,
+      },
       name:
         capabilities.displayName === modelId
           ? base.name
@@ -673,8 +857,14 @@ export async function apply(
         typeof model.id === 'string'
           ? service.capability(provider, model.id, model.name, profile)
           : undefined,
+      {
+        revision: () => service.contextWriteRevision(),
+        saved: (edits, revision) => service.clearLegacyContext(edits, revision),
+      },
     )
+    service.contextWriter = dispose.setContextWindow
     return () => {
+      service.contextWriter = undefined
       dispose()
       for (const provider of providers) ctx.emit('llm/models-updated', provider)
     }
