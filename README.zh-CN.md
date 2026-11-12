@@ -32,10 +32,16 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.1.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
 ```
 
 `pnpm pack` 会自动执行生产构建。升级安装包后重启 DSH 宿主。
+
+## 自动发布
+
+`Release` 工作流会在推送到 `main` 或手动运行时执行。版本号为正式的 `X.Y.Z` 时，工作流会运行测试、创建 `vX.Y.Z` 标签、创建对应的 GitHub Release，并将包发布到 npm。预发布版本会跳过；已有标签或 npm 版本会安全复用。
+
+首次发布前，请在仓库 Secrets 中添加 npm 访问令牌 `NPM_TOKEN`。
 在「设置 → 模型」中照常配置 GPT 连接；插件扩展现有原生设置与对话控件。
 
 ## 复用 Codex 环境

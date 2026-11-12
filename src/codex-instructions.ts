@@ -99,6 +99,71 @@ function lastBaseline(session: any) {
   }
 }
 
+function instructionHeading(change: any): string {
+  if (change.action === 'set')
+    return `Additional instructions from: ${change.path}`
+  if (change.action === 'replace')
+    return `Updated instructions from: ${change.path}`
+  return `Instructions removed: ${change.path}`
+}
+
+function retainNativeInstructionMessage(
+  message: any,
+  covered: (change: any) => boolean,
+) {
+  const source = message.source
+  if (
+    source?.kind !== 'agent-instructions' ||
+    !Array.isArray(source.changes) ||
+    source.changes.length === 0
+  )
+    return message
+  const unmatched = source.changes.filter((change: any) => !covered(change))
+  if (unmatched.length === 0) return undefined
+  if (unmatched.length === source.changes.length) return message
+  const blockIndex = (message.content ?? []).findIndex(
+    (block: any) => block?.type === 'text' && typeof block.text === 'string',
+  )
+  if (blockIndex < 0) return message
+  const lines = message.content[blockIndex].text.split('\n')
+  const sections = source.changes
+    .map((change: any) => ({
+      change,
+      start: lines.findIndex(
+        (line: string) => line === instructionHeading(change),
+      ),
+    }))
+    .sort((a: any, b: any) => a.start - b.start)
+  if (sections.some((section: any) => section.start < 0)) return message
+  const first = sections[0].start
+  const last = sections.at(-1).start
+  const closingOffset = lines
+    .slice(last)
+    .findIndex((line: string) => line.startsWith('</system-reminder>'))
+  const suffixStart = closingOffset < 0 ? lines.length : last + closingOffset
+  const kept = sections
+    .filter((section: any) => !covered(section.change))
+    .map((section: any) => {
+      const next = sections.find(
+        (candidate: any) => candidate.start > section.start,
+      )?.start
+      return lines.slice(section.start, next ?? suffixStart)
+    })
+    .flat()
+  const text = [
+    ...lines.slice(0, first),
+    ...kept,
+    ...lines.slice(suffixStart),
+  ].join('\n')
+  return {
+    ...message,
+    content: message.content.toSpliced(blockIndex, 1, {
+      ...message.content[blockIndex],
+      text,
+    }),
+  }
+}
+
 /** A logged user-message baseline, never an unlogged mutation of LLM requests. */
 export function installCodexInstructions(ctx: any, home: string): void {
   ctx.on(
@@ -153,12 +218,10 @@ export function installCodexInstructions(ctx: any, home: string): void {
             candidates.has(basename(path))
           )
         }
-        const entered = decision.messages.filter(
-          (m: any) =>
-            m.source?.kind !== 'agent-instructions' ||
-            !m.source.changes?.length ||
-            !m.source.changes.every(covered),
-        )
+        const entered = decision.messages.flatMap((message: any) => {
+          const retained = retainNativeInstructionMessage(message, covered)
+          return retained === undefined ? [] : [retained]
+        })
         if (
           previous?.identity === identity ||
           entered.some(

@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { readFile, readdir, stat } from 'node:fs/promises'
-import { realpathSync } from 'node:fs'
 import { parse } from 'smol-toml'
 
 export type JsonObject = Record<string, any>
@@ -444,7 +443,7 @@ export function skillEnabled(
     if (
       (typeof selector.path === 'string' &&
         skill.path &&
-        canonicalPath(selector.path) === canonicalPath(skill.path)) ||
+        resolve(selector.path) === resolve(skill.path)) ||
       selector.name === skill.name ||
       (plugin !== undefined && selector.name === `${plugin}:${skill.name}`)
     )
@@ -457,11 +456,48 @@ export function skillEnabled(
     return false
   return enabled
 }
-
-function canonicalPath(path: string): string {
-  try {
-    return realpathSync.native(path)
-  } catch {
-    return resolve(path)
+export async function skillEnabledWithFs(
+  config: JsonObject,
+  skill: { name: string; path?: string },
+  plugin: string | undefined,
+  fs: ProjectFileSystem,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const targets = new Map<string, unknown>()
+  const targetKey = async (path: string) => {
+    if (!targets.has(path)) {
+      const target = await fs.resolve(path, signal ? { signal } : {})
+      targets.set(
+        path,
+        target?.targetKey ?? target?.displayPath ?? resolve(path),
+      )
+    }
+    return targets.get(path)
   }
+  let enabled = true
+  for (const selector of Array.isArray(config.skills?.config)
+    ? config.skills.config
+    : []) {
+    let pathMatch = false
+    if (typeof selector.path === 'string' && skill.path) {
+      try {
+        pathMatch =
+          (await targetKey(selector.path)) === (await targetKey(skill.path))
+      } catch {
+        pathMatch = false
+      }
+    }
+    if (
+      pathMatch ||
+      selector.name === skill.name ||
+      (plugin !== undefined && selector.name === `${plugin}:${skill.name}`)
+    )
+      enabled = selector.enabled !== false
+  }
+  if (
+    config.skills?.bundled?.enabled === false &&
+    skill.path?.includes(`${join('skills', '.system')}/`)
+  )
+    return false
+  return enabled
 }

@@ -5,6 +5,7 @@ import {
   writeFile,
   rm,
   readFile,
+  readdir,
   stat,
   symlink,
   realpath,
@@ -22,6 +23,7 @@ import {
   normalizeCodexMcp,
   readCodexConfig,
   skillEnabled,
+  skillEnabledWithFs,
 } from '../src/codex-config.js'
 import {
   installCodexInstructions,
@@ -55,6 +57,38 @@ const fixtureFs = {
       return undefined
     }),
   readText: (path: string) => readFile(path, 'utf8'),
+}
+const skillFs = {
+  resolve: async (path: string) => ({ targetKey: path, displayPath: path }),
+  processPath: (target: any) => target.displayPath,
+  stat: async (target: any) => {
+    const info: any = await fixtureFs.stat(target.displayPath ?? target)
+    return info
+      ? {
+          type: info.isFile()
+            ? 'file'
+            : info.isDirectory()
+              ? 'directory'
+              : 'other',
+        }
+      : undefined
+  },
+  readText: (target: any) => fixtureFs.readText(target.displayPath ?? target),
+  listDir: async (target: any) =>
+    (await readdir(target.displayPath, { withFileTypes: true })).map(
+      (entry) => ({
+        name: entry.name,
+        type: entry.isDirectory()
+          ? 'directory'
+          : entry.isFile()
+            ? 'file'
+            : 'other',
+        target: {
+          targetKey: join(target.displayPath, entry.name),
+          displayPath: join(target.displayPath, entry.name),
+        },
+      }),
+    ),
 }
 function mcpHost(ctx: Context) {
   ctx.provide('fs', fixtureFs as any)
@@ -295,16 +329,21 @@ describe('Codex config and plugin resources', () => {
     await put(target, 'fixture')
     await mkdir(dirname(alias), { recursive: true })
     await symlink(dirname(target), alias)
-    expect(
-      skillEnabled(
+    const fs = {
+      resolve: async (path: string) => ({ targetKey: await realpath(path) }),
+    }
+    await expect(
+      skillEnabledWithFs(
         {
           skills: {
             config: [{ path: join(alias, 'SKILL.md'), enabled: false }],
           },
         },
         { name: 'alias', path: target },
+        undefined,
+        fs as any,
       ),
-    ).toBe(false)
+    ).resolves.toBe(false)
   })
 
   it('honors ordered disabled skill selectors and bundled policy', () => {
@@ -537,6 +576,23 @@ describe('Codex instruction context', () => {
           }))
         ).messages,
       ).toEqual([user, mixed])
+      const renderedMixed = {
+        ...mixed,
+        content: [
+          {
+            type: 'text',
+            text: `<system-reminder>\nAdditional instructions from: AGENTS.md\n\nCOVERED\n\n${action === 'set' ? 'Additional instructions from' : action === 'replace' ? 'Updated instructions from' : 'Instructions removed'}: nested/AGENTS.md\n\nNESTED_ONLY\n</system-reminder>`,
+          },
+        ],
+      }
+      const retained = (
+        await handler(payload, async () => ({
+          kind: 'accept',
+          messages: [user, renderedMixed],
+        }))
+      ).messages[1]
+      expect(retained.content[0].text).toContain('NESTED_ONLY')
+      expect(retained.content[0].text).not.toContain('COVERED')
     }
     await put(join(home, 'AGENTS.md'), 'global version 2')
     const updated = await handler(payload, next)
@@ -712,6 +768,8 @@ describe('Codex runtime integration', () => {
       kind: 'mcp',
       state: 'loaded',
     })
+    const statusKeys = runtime.status().items.map((item) => `${item.kind}\0${item.name}`)
+    expect(new Set(statusKeys).size).toBe(statusKeys.length)
   })
 
   it('automatically detects configuration changes and stops polling on disposal', async () => {
@@ -827,6 +885,7 @@ describe('Codex runtime integration', () => {
       importInstructions: false,
       importMcpServers: false,
     })
+    await new Promise<void>((done) => setImmediate(done))
     await runtime.refresh()
     expect((await registry.list({ cwd })).map((s) => s.name)).toContain(
       'child-only',
@@ -835,6 +894,50 @@ describe('Codex runtime integration', () => {
     expect(
       (await registry.list({ cwd: project })).map((s) => s.name),
     ).not.toContain('child-only')
+  })
+
+  it('applies trusted project plugin skill roots and retains the last-good scope on a broken layer', async () => {
+    const home = await directory(),
+      project = join(home, 'project'),
+      plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await put(
+      join(home, 'config.toml'),
+      `[plugins."active@sample"]\nenabled=false\n[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
+    )
+    await put(
+      join(project, '.codex/config.toml'),
+      '[plugins."active@sample"]\nenabled=true\n',
+    )
+    await put(
+      join(plugin, '.codex-plugin/plugin.json'),
+      JSON.stringify({ name: 'active', skills: './skills' }),
+    )
+    await put(
+      join(plugin, 'skills/example/SKILL.md'),
+      '---\nname: example\ndescription: Example\n---\nProject plugin skill',
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    ctx.provide('fs', skillFs as any)
+    await ctx.plugin(SkillRegistry)
+    const registry = ctx.get('skills') as SkillRegistry
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importMcpServers: false,
+    })
+    await new Promise<void>((done) => setImmediate(done))
+    await runtime.refresh()
+    expect(
+      (await registry.list({ cwd: project })).map((s) => s.name),
+    ).toContain('active-example')
+    await put(join(project, '.codex/config.toml'), 'broken = [')
+    expect(
+      (await registry.list({ cwd: project })).map((s) => s.name),
+    ).toContain('active-example')
+    await runtime.dispose()
   })
 
   it('connects a real stdio MCP, filters tools, preserves unchanged connections and removes deleted servers', async () => {

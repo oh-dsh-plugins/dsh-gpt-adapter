@@ -2,13 +2,14 @@ import { symbols } from '@deepseek-ai/cordis'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
 import { createHash } from 'node:crypto'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import {
   discoverCodexSnapshot,
   resolveCodexHome,
   readCodexConfig,
   projectDirectories,
   skillEnabled,
+  skillEnabledWithFs,
   type CompatibilityItem,
   type CodexSnapshot,
   type CodexMcpConfig,
@@ -54,6 +55,7 @@ function installSkillPolicy(
   ctx: any,
   snapshot: () => CodexSnapshot | undefined,
   home: string,
+  scopedConfig?: (options: any) => Promise<any>,
 ) {
   const service = ctx.skills[symbols.original] ?? ctx.skills
   const original = {
@@ -63,25 +65,48 @@ function installSkillPolicy(
   }
   const policy = async (options: any) =>
     options?.cwd
-      ? readCodexConfig(home, options.cwd, ctx.get('fs'), options.signal)
+      ? (scopedConfig?.(options) ??
+        readCodexConfig(home, options.cwd, ctx.get('fs'), options.signal))
       : (snapshot()?.config ?? {})
+  const allowed = (config: any, skill: any, signal?: AbortSignal) => {
+    const fs = ctx.get('fs')
+    return fs
+      ? skillEnabledWithFs(config, skill, undefined, fs, signal)
+      : Promise.resolve(skillEnabled(config, skill))
+  }
   async function list(this: any, ...args: any[]) {
-    const config = await policy(args[0])
-    return (await original.list.apply(this, args)).filter((s: any) =>
-      skillEnabled(config, s),
-    )
+    const options = args[0]
+    const config = await policy(options)
+    const entries = await original.list.apply(this, args)
+    return (
+      await Promise.all(
+        entries.map(async (skill: any) =>
+          (await allowed(config, skill, options?.signal)) ? skill : undefined,
+        ),
+      )
+    ).filter(Boolean)
   }
   async function catalog(this: any, ...args: any[]) {
+    const options = args[0]
     const result = await original.snapshot.apply(this, args)
-    const config = await policy(args[0])
+    const config = await policy(options)
+    const skills = (
+      await Promise.all(
+        result.skills.map(async (skill: any) =>
+          (await allowed(config, skill, options?.signal)) ? skill : undefined,
+        ),
+      )
+    ).filter(Boolean)
     return {
       ...result,
-      skills: result.skills.filter((s: any) => skillEnabled(config, s)),
+      skills,
     }
   }
   async function get(this: any, ...args: any[]) {
+    const options = args[1]
     const result = await original.get.apply(this, args)
-    return result && skillEnabled(await policy(args[1]), result)
+    return result &&
+      (await allowed(await policy(options), result, options?.signal))
       ? result
       : undefined
   }
@@ -126,6 +151,7 @@ export function installCodexCompatibility(
   let skillContext: any
   let mcpContext: any
   let skillsKey = ''
+  const scopedSnapshots = new Map<string, CodexSnapshot>()
   const home = resolveCodexHome(config.codexHome)
   if (!config.enabled)
     return {
@@ -133,6 +159,32 @@ export function installCodexCompatibility(
       refresh: async () => {},
       dispose: async () => {},
     }
+
+  const scopedSnapshot = async (
+    cwd: string,
+    signal: AbortSignal | undefined,
+    fallback?: CodexSnapshot,
+  ): Promise<CodexSnapshot> => {
+    const key = resolve(cwd)
+    const previous = scopedSnapshots.get(key) ?? fallback ?? latest
+    try {
+      const fs =
+        skillContext?.get('fs') ?? mcpContext?.get('fs') ?? ctx.get?.('fs')
+      const current = await discoverCodexSnapshot(home, config, {
+        cwd,
+        ...(fs ? { fs } : {}),
+        ...(signal ? { signal } : {}),
+        ...(previous ? { previous } : {}),
+      })
+      scopedSnapshots.set(key, current)
+      return current
+    } catch {
+      return (
+        previous ??
+        fallback ?? { config: {}, mcp: [], skillRoots: [], items: [] }
+      )
+    }
+  }
 
   const mountSkills = async (snapshot: CodexSnapshot) => {
     const nextKey = fingerprint({
@@ -160,14 +212,13 @@ export function installCodexCompatibility(
         async list(options: any) {
           const candidates: any[] = []
           let complete = true
-          const activeConfig = options.cwd
-            ? await readCodexConfig(
-                home,
-                options.cwd,
-                owner.get('fs'),
-                options.signal,
-              )
-            : (latest?.config ?? snapshot.config)
+          const activeSnapshot = options.cwd
+            ? await scopedSnapshot(options.cwd, options.signal, snapshot)
+            : snapshot
+          const activeConfig = activeSnapshot.config
+          const rootKey = (root: any) =>
+            `${root.path}\0${root.plugin ?? ''}\0${root.pluginId ?? ''}`
+          const activeRoots = new Set(activeSnapshot.skillRoots.map(rootKey))
           if (options.cwd) {
             const roots = await projectDirectories(
               options.cwd,
@@ -185,14 +236,26 @@ export function installCodexCompatibility(
               const result = await project.list(options)
               const entries = Array.isArray(result) ? result : result.candidates
               if (!Array.isArray(result) && !result.complete) complete = false
-              for (const [index, candidate] of entries.entries()) {
-                if (!skillEnabled(activeConfig, candidate)) continue
+              for (const candidate of entries) {
+                if (
+                  !(await skillEnabledWithFs(
+                    activeConfig,
+                    candidate,
+                    undefined,
+                    owner.get('fs'),
+                    options.signal,
+                  ))
+                )
+                  continue
                 candidates.push({
                   ...candidate,
                   provider: 'codex-filesystem',
                   source: 'project-agents',
-                  rank: 199 + index / (entries.length + 1),
-                  locator: { index: 0, candidate },
+                  rank: 199 + candidates.length / (entries.length + 1),
+                  locator: {
+                    rootPath: (candidate.locator as any)?.directory ?? options.cwd,
+                    candidate,
+                  },
                 })
               }
             } finally {
@@ -200,44 +263,108 @@ export function installCodexCompatibility(
             }
           }
           for (const [index, provider] of sources.entries()) {
+            const root = snapshot.skillRoots[index]
+            if (!root || !activeRoots.has(rootKey(root))) continue
             const result = await provider.list(options)
             const entries = Array.isArray(result) ? result : result.candidates
             if (!Array.isArray(result) && !result.complete) complete = false
             for (const candidate of entries) {
               const plugin = snapshot.skillRoots[index]?.plugin
-              if (!skillEnabled(activeConfig, candidate, plugin)) continue
+              if (
+                !(await skillEnabledWithFs(
+                  activeConfig,
+                  candidate,
+                  plugin,
+                  owner.get('fs'),
+                  options.signal,
+                ))
+              )
+                continue
               candidates.push({
                 ...candidate,
                 name: plugin ? `${plugin}-${candidate.name}` : candidate.name,
                 provider: 'codex-filesystem',
                 source: plugin ? 'codex-plugin' : 'codex-user',
                 rank: plugin ? 550 : 450,
-                locator: { index, candidate },
+                locator: { rootPath: root.path, candidate, plugin },
               })
+            }
+          }
+          for (const root of activeSnapshot.skillRoots) {
+            if (
+              snapshot.skillRoots.some(
+                (current) => rootKey(current) === rootKey(root),
+              )
+            )
+              continue
+            const provider = new FileSystemSkillProvider(owner, control, {
+              providerName: `codex-scoped-${root.path}`,
+              includeDefaultRoots: false,
+              customSkillDirs: [root.path],
+              watch: false,
+            })
+            try {
+              const result = await provider.list(options)
+              const entries = Array.isArray(result) ? result : result.candidates
+              if (!Array.isArray(result) && !result.complete) complete = false
+              for (const candidate of entries) {
+                if (
+                  !(await skillEnabledWithFs(
+                    activeConfig,
+                    candidate,
+                    root.plugin,
+                    owner.get('fs'),
+                    options.signal,
+                  ))
+                )
+                  continue
+                candidates.push({
+                  ...candidate,
+                  name: root.plugin
+                    ? `${root.plugin}-${candidate.name}`
+                    : candidate.name,
+                  provider: 'codex-filesystem',
+                  source: root.plugin ? 'codex-plugin' : 'codex-user',
+                  rank: root.plugin ? 550 : 450,
+                  locator: {
+                    rootPath: root.path,
+                    candidate,
+                    plugin: root.plugin,
+                  },
+                })
+              }
+            } finally {
+              await provider.dispose()
             }
           }
           return { candidates, complete }
         },
         async get(candidate: any, options: any) {
           const locator = candidate.locator
-          const result = await sources[locator.index]?.get(
-            locator.candidate,
-            options,
-          )
+          const provider = new FileSystemSkillProvider(owner, control, {
+            providerName: 'codex-get',
+            includeDefaultRoots: false,
+            customSkillDirs: [locator.rootPath],
+            watch: false,
+          })
+          let result
+          try {
+            result = await provider.get(locator.candidate, options)
+          } finally {
+            await provider.dispose()
+          }
           if (
             !result ||
-            !skillEnabled(
+            !(await skillEnabledWithFs(
               options.cwd
-                ? await readCodexConfig(
-                    home,
-                    options.cwd,
-                    owner.get('fs'),
-                    options.signal,
-                  )
-                : (latest?.config ?? snapshot.config),
+                ? (await scopedSnapshot(options.cwd, options.signal, snapshot))
+                    .config
+                : snapshot.config,
               result,
-              snapshot.skillRoots[locator.index]?.plugin,
-            )
+              locator.plugin,
+              owner.get('fs'),
+              options.signal,
+            ))
           )
             return undefined
           return {
@@ -503,7 +630,13 @@ export function installCodexCompatibility(
             skillsKey = ''
           }
         })
-        installSkillPolicy(child, () => latest, home)
+        installSkillPolicy(
+          child,
+          () => latest,
+          home,
+          async (options) =>
+            (await scopedSnapshot(options.cwd, options.signal)).config,
+        )
         void refresh()
       }
     }),
@@ -545,13 +678,28 @@ export function installCodexCompatibility(
     status: () => ({
       enabled: !closed,
       refreshing,
-      items: [
-        ...items,
-        ...[...agents.values()].flatMap((owner) => [
-          ...owner.items,
-          ...[...owner.clients.values()].map((c) => ({ ...c.state })),
-        ]),
-      ],
+      items: (() => {
+        const merged = new Map<string, CompatibilityItem>()
+        const priority = {
+          disabled: 0,
+          loaded: 1,
+          loading: 2,
+          unsupported: 3,
+          failed: 4,
+        }
+        const add = (item: CompatibilityItem) => {
+          const key = `${item.kind}\0${item.name}`
+          const previous = merged.get(key)
+          if (!previous || priority[item.state] > priority[previous.state])
+            merged.set(key, { ...item })
+        }
+        for (const item of items) add(item)
+        for (const owner of agents.values()) {
+          for (const item of owner.items) add(item)
+          for (const client of owner.clients.values()) add(client.state)
+        }
+        return [...merged.values()]
+      })(),
     }),
     refresh: async () => {
       await tail

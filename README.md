@@ -32,10 +32,16 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.1.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
 ```
 
 `pnpm pack` runs the production build. Restart the DSH host after upgrading the installed package.
+
+## Automated releases
+
+The `Release` workflow runs on pushes to `main` and manual dispatches. For a formal `X.Y.Z` version, it runs the test suite, creates `vX.Y.Z`, creates the matching GitHub Release, and publishes the package to npm. Prerelease versions are skipped, and existing tags or npm versions are reused safely.
+
+Add an npm access token as the repository secret `NPM_TOKEN` before the first release.
 Configure GPT connections as usual under **Settings → Models**. The plugin extends the existing native settings and conversation controls.
 
 ## Codex environment reuse

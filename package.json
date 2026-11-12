@@ -1,7 +1,10 @@
 {
   "name": "dsh-gpt-adapter",
-  "version": "0.2.1",
-  "private": true,
+  "version": "0.2.2",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
   "description": "GPT model adaptation and Codex environment compatibility for DeepSeek Harness.",
   "keywords": [
