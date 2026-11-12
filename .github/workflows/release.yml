@@ -43,6 +43,17 @@ jobs:
             echo "Skipping prerelease version $version"
           fi
 
+      - name: Check the npm publish credential
+        if: steps.version.outputs.release == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$NODE_AUTH_TOKEN" ]]; then
+            echo "::error::Repository secret NPM_TOKEN is required before creating a release"
+            exit 1
+          fi
+
       - name: Install dependencies
         if: steps.version.outputs.release == 'true'
         run: pnpm install --frozen-lockfile
