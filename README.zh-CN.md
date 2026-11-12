@@ -22,9 +22,19 @@
 
 ## 兼容性与安装
 
-原生集成面向 DSH `0.2.2-rc.1`、Cordis `4.1.0`，并校验适配器源码指纹。开发依赖固定 Pi AI `1.3.0`。插件不会修改已安装的第三方包文件，目前未发布到 npm。
+原生集成面向 DSH `0.2.2-rc.1`、Cordis `4.1.0`，并校验适配器源码指纹。开发依赖固定 Pi AI `1.3.0`。插件不会修改已安装的第三方包文件。当前 npm 发布版本为 `dsh-gpt-adapter@0.2.2`。
 
-需要 Node.js `>=24.9.0` 和 pnpm。
+需要 Node.js `>=24.9.0` 和 DSH。源码构建另外需要 pnpm。
+
+在 `web` 配置档（profile）中安装已发布的 npm 包：
+
+```sh
+dsh plugin --profile web add dsh-gpt-adapter@0.2.2
+```
+
+安装或升级后重启 DSH 宿主。在「设置 → 模型」中配置 GPT 连接；Codex 环境复用默认开启。插件扩展现有原生设置与对话控件。
+
+如需从源码安装进行开发或验证：
 
 ```sh
 git clone https://github.com/lxjmaster/dsh-gpt-adapter.git
@@ -35,14 +45,13 @@ pnpm pack --pack-destination artifacts
 dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
 ```
 
-`pnpm pack` 会自动执行生产构建。升级安装包后重启 DSH 宿主。
+`pnpm pack` 会自动执行生产构建。
 
 ## 自动发布
 
 `Release` 工作流会在推送到 `main` 或手动运行时执行。版本号为正式的 `X.Y.Z` 时，工作流会运行测试、创建 `vX.Y.Z` 标签、创建对应的 GitHub Release，并将包发布到 npm。预发布版本会跳过；已有标签或 npm 版本会安全复用。
 
-首次发布前，请在仓库 Secrets 中添加 npm 访问令牌 `NPM_TOKEN`。
-在「设置 → 模型」中照常配置 GPT 连接；插件扩展现有原生设置与对话控件。
+维护者需要在仓库 Secrets 中提供 npm 访问令牌 `NPM_TOKEN`，工作流才能发布。
 
 ## 复用 Codex 环境
 

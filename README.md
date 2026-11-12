@@ -22,9 +22,19 @@ Reasoning and speed presets are requests to the configured gateway, not guarante
 
 ## Compatibility and installation
 
-The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The package has not been published to npm.
+The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The published npm package is `dsh-gpt-adapter@0.2.2`.
 
-Requires Node.js `>=24.9.0` and pnpm.
+Requires Node.js `>=24.9.0` and DSH. Source builds also require pnpm.
+
+Install the published package in the web profile:
+
+```sh
+dsh plugin --profile web add dsh-gpt-adapter@0.2.2
+```
+
+Restart the DSH host after installing or upgrading. Configure GPT connections under **Settings → Models**; Codex environment reuse is enabled by default. The plugin extends the existing native settings and conversation controls.
+
+To install from source for development or verification:
 
 ```sh
 git clone https://github.com/lxjmaster/dsh-gpt-adapter.git
@@ -35,14 +45,13 @@ pnpm pack --pack-destination artifacts
 dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.2.tgz
 ```
 
-`pnpm pack` runs the production build. Restart the DSH host after upgrading the installed package.
+`pnpm pack` runs the production build.
 
 ## Automated releases
 
 The `Release` workflow runs on pushes to `main` and manual dispatches. For a formal `X.Y.Z` version, it runs the test suite, creates `vX.Y.Z`, creates the matching GitHub Release, and publishes the package to npm. Prerelease versions are skipped, and existing tags or npm versions are reused safely.
 
-Add an npm access token as the repository secret `NPM_TOKEN` before the first release.
-Configure GPT connections as usual under **Settings → Models**. The plugin extends the existing native settings and conversation controls.
+Maintainers must provide the npm access token as the repository secret `NPM_TOKEN` for this workflow.
 
 ## Codex environment reuse
 
