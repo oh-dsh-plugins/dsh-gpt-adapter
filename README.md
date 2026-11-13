@@ -12,7 +12,7 @@ Install one plugin to reuse local Codex instructions, skills, enabled plugin res
 
 - Discover upstream models with `GET /models` and retain stale entries until explicit cleanup.
 - Provide the GPT reasoning preset `low / medium / high / xhigh / max / ultra` through the native Models page and conversation menu.
-- Provide per-model Default, 516K, 1M, and Custom context windows, with the effective capacity and its source shown in settings.
+- Reuse the native per-model context field for manual capacities and automatic resolution, with support for K/M input.
 - Offer independent Standard and Fast speed choices. Fast sends `service_tier: "priority"`; Ultrafast requires an explicit upstream declaration or override.
 - Preserve optional function arguments on GPT Responses requests by setting missing `strict` values to `false`.
 - Read Codex instruction files and refresh them at the next model step without repeating unchanged baselines.
@@ -23,14 +23,14 @@ Reasoning and speed presets are requests to the configured gateway, not guarante
 
 ## Compatibility and installation
 
-The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The package version is `dsh-gpt-adapter@0.2.4`.
+The native integration targets DSH `0.2.2-rc.1`, Cordis `4.1.0`, and the pinned adapter source hash. The development dependency uses Pi AI `1.3.0`. Installed third-party package files are never edited. The package version is `dsh-gpt-adapter@0.2.5`.
 
 Requires Node.js `>=24.9.0` and DSH. Source builds also require pnpm.
 
 Install the published package in the web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.4
+dsh plugin --profile web add dsh-gpt-adapter@0.2.5
 ```
 
 Restart the DSH host after installing or upgrading. Configure GPT connections under **Settings → Models**; Codex environment reuse is enabled by default. The plugin extends the existing native settings and conversation controls.
@@ -43,7 +43,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.4.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.5.tgz
 ```
 
 `pnpm pack` runs the production build.
@@ -128,22 +128,19 @@ Capability precedence is user override, explicit upstream metadata, external cat
 
 ### Context windows
 
-Under **Settings → Models**, expand **Context window** in the provider's GPT adaptation section. Each managed GPT model has four choices:
+Under **Settings → Models → Custom settings → Model catalog**, edit the native **Context window** field. The plugin reuses this field and adds no separate context editor. Enter a count, `516K` (`516000` tokens), or `1M` (`1000000` tokens); clear the field and save to restore automatic resolution.
 
-| Choice | Capacity in tokens |
-| --- | --- |
-| Default | Resolve automatically for this model and provider. |
-| 516K | `516000` |
-| 1M | `1000000` |
-| Custom | A positive safe integer entered by the user. |
+Inherited model rows and provider defaults participate in edit detection and final budget validation. A failed legacy cleanup restores the previous native capacity while preserving unrelated edits.
 
-These use decimal units. The displayed capacity includes its source. Default uses a distinguishable explicit provider default, upstream model metadata, the configured capability catalog, the shipped exact-model preset, then the native catalog/DSH fallback. A native fallback is labeled as such. Shipped presets are dated data, not a live fetch from OpenAI: `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`, and `gpt-5.4` use `1050000`; `gpt-4.1` uses `1047576`; `gpt-4o` uses `128000`. Only documented snapshot aliases share these presets. References and verification dates are in [the preset table](src/context-window.ts).
+An empty native field means automatic resolution. Automatic capacities stay in the effective model information; the editable draft contains manual values only, including existing legacy overrides. An explicit value equal to the current automatic capacity is still saved as a manual value.
 
-Existing native per-model values, including catalog `modelOverrides`, and legacy JSON context overrides remain effective until deliberately edited. Saving a preset uses the native model field and clears only that model's legacy context override; Default removes both per-model overrides while retaining provider defaults and other settings. Saving unrelated settings or discovering models does not turn automatic values into manual overrides. Identical model IDs on different providers are independent. Saving Custom at a preset's exact value shows that preset after saving or reloading.
+Capacity suffixes use decimal units. Automatic resolution uses a distinguishable explicit provider default, upstream model metadata, the configured capability catalog, the shipped exact-model preset, then the native catalog/DSH fallback. Shipped presets are dated data, not a live fetch from OpenAI: `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`, and `gpt-5.4` use `1050000`; `gpt-4.1` uses `1047576`; `gpt-4o` uses `128000`. Only documented snapshot aliases share these presets. References and verification dates are in [the preset table](src/context-window.ts).
+
+Existing native per-model values, including catalog `modelOverrides`, and legacy JSON context overrides remain effective until deliberately edited. Editing the native context field clears only that model's legacy context override; clearing the field removes its manual context values while retaining provider defaults and other settings. Saving unrelated settings or discovering models does not turn automatic values into manual overrides. Identical model IDs on different providers are independent.
 
 Providers using native catalog `modelOverrides` keep their catalog configuration during synchronization. Discovery and stale cleanup update the plugin snapshot without creating an incompatible explicit `models` list or deleting native overrides.
 
-Native forms reject stale drafts when their automatic capacities change; refresh the form before retrying. The preset controls retain drafts across unrelated saves. If the same model changes, review its current value and use the keep-draft action before saving again.
+Native forms reject stale drafts when their automatic capacities change; refresh the form before retrying. Context, output-limit, and relevant provider-default edits are checked against the saved draft's output budget and native compaction headroom. An omitted output limit uses the native model catalog or provider/schema default. Invalid saves leave the previous values in place.
 
 Changes apply to the next prepared call; calls already prepared retain their captured capacity. Model information, the inference model, overflow detection, and native compaction use the same effective window. Maximum output tokens and DSH's compaction policy remain independent. A larger local window does not increase the gateway's accepted limit.
 

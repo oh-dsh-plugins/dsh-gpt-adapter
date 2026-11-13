@@ -26,6 +26,8 @@ export type ContextWindowEdit = {
   previousTokens: number | undefined
 }
 type ContextWrites = {
+  editableContext?(provider: string, model: JsonObject): number | undefined
+  validate?(provider: string, model: JsonObject, profile: JsonObject): void
   revision(): number | undefined
   saved(edits: ContextWindowEdit[], revision: number | undefined): Promise<void>
 }
@@ -114,8 +116,10 @@ function projectSchema(json: any, preserveNativeLevels: boolean): any {
 function nativeWrite(
   next: JsonObject,
   current: JsonObject,
+  base: JsonObject,
   resolve: CapabilityResolver,
   contextEdits: ContextWindowEdit[],
+  contextWrites?: ContextWrites,
 ): JsonObject {
   if (!next.providers) return next
   return {
@@ -123,64 +127,93 @@ function nativeWrite(
     providers: Object.fromEntries(
       Object.entries(next.providers).map(([provider, raw]) => {
         const profile = raw as JsonObject
-        if (!Array.isArray(profile?.models)) return [provider, profile]
-        const previous: JsonObject[] =
-          current.providers?.[provider]?.models ?? []
+        const inherited = base?.providers?.[provider] ?? {}
+        const ownershipProfile = {
+          ...inherited,
+          ...current.providers?.[provider],
+        }
+        const effectiveProfile = { ...inherited, ...profile }
+        const ownsModels = Array.isArray(profile?.models)
+        const models = ownsModels
+          ? profile.models
+          : inherited.models?.map((model: JsonObject) =>
+              projectModel(provider, model, resolve, ownershipProfile),
+            )
+        if (!Array.isArray(models)) return [provider, profile]
+        const previous: JsonObject[] = ownershipProfile.models ?? []
+        const savedModels = models.map((model: JsonObject) => {
+          const original = previous.find((row) => row.id === model.id)
+          const capability = resolve(provider, model, ownershipProfile)
+          if (!capability) return model
+          const managed = projectModel(
+            provider,
+            model,
+            resolve,
+            ownershipProfile,
+          )
+          if (
+            original &&
+            JSON.stringify(model.reasoningEfforts) !==
+              JSON.stringify(managed.reasoningEfforts)
+          )
+            throw new Error(
+              'GPT 思考等级由插件预设管理；请刷新后重试，或在模型能力覆盖中修改，停用自动适配可恢复原生编辑。',
+            )
+          const restored = { ...model }
+          const projectedContext = original
+            ? projectModel(provider, original, resolve, ownershipProfile)
+                .contextWindow
+            : undefined
+          const editedContext =
+            ownsModels &&
+            (original
+              ? model.contextWindow !== projectedContext
+              : Object.hasOwn(model, 'contextWindow'))
+          const budgetChanged =
+            editedContext ||
+            !original ||
+            model.maxTokens !== original.maxTokens ||
+            (model.maxTokens === undefined &&
+              effectiveProfile.defaultMaxTokens !==
+                ownershipProfile.defaultMaxTokens) ||
+            (model.contextWindow === undefined &&
+              effectiveProfile.defaultContextWindow !==
+                ownershipProfile.defaultContextWindow)
+          if (!editedContext) {
+            if (original && Object.hasOwn(original, 'contextWindow'))
+              restored.contextWindow = original.contextWindow
+            else delete restored.contextWindow
+          } else {
+            if (
+              model.contextWindow !== undefined &&
+              !validContextWindow(model.contextWindow)
+            )
+              throw new Error('上下文窗口必须是正的安全整数')
+            contextEdits.push({
+              provider,
+              modelId: model.id,
+              previousTokens: original?.contextWindow,
+            })
+          }
+          if (budgetChanged)
+            contextWrites?.validate?.(
+              provider,
+              editedContext
+                ? model
+                : { ...model, contextWindow: capability.contextWindow },
+              profile,
+            )
+          if (original && Object.hasOwn(original, 'reasoningEfforts'))
+            restored.reasoningEfforts = structuredClone(
+              original.reasoningEfforts,
+            )
+          else delete restored.reasoningEfforts
+          return restored
+        })
+        // Validate inherited models without materializing a user-owned array.
         return [
           provider,
-          {
-            ...profile,
-            models: profile.models.map((model: JsonObject) => {
-              const original = previous.find((row) => row.id === model.id)
-              const ownershipProfile = current.providers?.[provider] ?? profile
-              const capability = resolve(provider, model, ownershipProfile)
-              if (!capability) return model
-              const managed = projectModel(
-                provider,
-                model,
-                resolve,
-                ownershipProfile,
-              )
-              if (
-                original &&
-                JSON.stringify(model.reasoningEfforts) !==
-                  JSON.stringify(managed.reasoningEfforts)
-              )
-                throw new Error(
-                  'GPT 思考等级由插件预设管理；请刷新后重试，或在模型能力覆盖中修改，停用自动适配可恢复原生编辑。',
-                )
-              const restored = { ...model }
-              const projectedContext = original
-                ? projectModel(provider, original, resolve, ownershipProfile)
-                    .contextWindow
-                : undefined
-              const editedContext = original
-                ? model.contextWindow !== projectedContext
-                : Object.hasOwn(model, 'contextWindow')
-              if (!editedContext) {
-                if (original && Object.hasOwn(original, 'contextWindow'))
-                  restored.contextWindow = original.contextWindow
-                else delete restored.contextWindow
-              } else {
-                if (
-                  model.contextWindow !== undefined &&
-                  !validContextWindow(model.contextWindow)
-                )
-                  throw new Error('上下文窗口必须是正的安全整数')
-                contextEdits.push({
-                  provider,
-                  modelId: model.id,
-                  previousTokens: original?.contextWindow,
-                })
-              }
-              if (original && Object.hasOwn(original, 'reasoningEfforts'))
-                restored.reasoningEfforts = structuredClone(
-                  original.reasoningEfforts,
-                )
-              else delete restored.reasoningEfforts
-              return restored
-            }),
-          },
+          ownsModels ? { ...profile, models: savedModels } : profile,
         ]
       }),
     ),
@@ -198,6 +231,19 @@ export function installSettingsOverlay(
   settings = (settings as any)[symbols.original] ?? settings
   const originalDescribe = settings.describe
   const originalWrite = settings.write
+  // Editable drafts contain manual values only; automatic capacities belong in
+  // the effective view. Otherwise typing the current automatic value is lost.
+  const editableResolve: CapabilityResolver = (provider, model, profile) => {
+    const capability = resolve(provider, model, profile)
+    if (!capability) return undefined
+    const manual = contextWrites?.editableContext
+      ? contextWrites.editableContext(provider, model)
+      : model.contextWindow
+    const projected = { ...capability }
+    if (manual === undefined) delete projected.contextWindow
+    else projected.contextWindow = manual
+    return projected
+  }
   let viewRevision:
     { native: number; contexts: string; revision: number } | undefined
   function describe(this: SettingsLike, options?: any) {
@@ -248,8 +294,8 @@ export function installSettingsOverlay(
           ? {
               schema: projectSchema(row.schema, other),
               value,
-              base: projectConfiguration(row.base, resolve),
-              user: projectConfiguration(row.user, resolve),
+              base: projectConfiguration(row.base, editableResolve),
+              user: projectConfiguration(row.user, editableResolve),
             }
           : {}),
         ...(typeof row.revision === 'number'
@@ -275,13 +321,15 @@ export function installSettingsOverlay(
         : (current, base, schema) =>
             nativeWrite(
               change(
-                projectConfiguration(current, resolve),
-                projectConfiguration(base, resolve),
+                projectConfiguration(structuredClone(current), editableResolve),
+                projectConfiguration(structuredClone(base), editableResolve),
                 schema,
               ),
               current,
-              resolve,
+              base,
+              editableResolve,
               edits,
+              contextWrites,
             ),
       expected,
       paths,
@@ -362,6 +410,7 @@ export function installSettingsOverlay(
         edits.push({ provider, modelId, previousTokens: model.contextWindow })
         if (tokens === undefined) delete model.contextWindow
         else model.contextWindow = tokens
+        contextWrites?.validate?.(provider, model, next.providers[provider])
         return next
       },
       expected,

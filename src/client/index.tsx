@@ -26,7 +26,6 @@ import type {
   ModelDirectoryResolver,
 } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import styles from 'dsh-gpt-adapter/native-settings-styles'
-import { ContextWindowControl } from './context-window.js'
 
 type ProviderStatus = ReturnType<GptModels['status']>
 type SpeedStatus = ReturnType<GptModels['speed']>
@@ -247,28 +246,10 @@ export function apply(ctx: Context): void {
                 </Button>
               </div>
             )}
-            {Object.keys(value.contextWindows ?? {}).length > 0 && (
-              <details className={styles.customized}>
-                <summary className={styles.customizedSummary}>
-                  上下文窗口
-                </summary>
-                <div className={styles.customizedBody}>
-                  {Object.entries(value.contextWindows).map(
-                    ([modelId, context]) => (
-                      <ContextWindowControl
-                        key={modelId}
-                        provider={provider.provider}
-                        modelId={modelId}
-                        value={context}
-                        revision={value.contextRevision}
-                        busy={busy}
-                        save={(args) => act('setContextWindow', args)}
-                      />
-                    ),
-                  )}
-                </div>
-              </details>
-            )}
+            <p className={styles.advancedHint}>
+              上下文窗口请在「自定义设置 → 模型目录」的原生字段中修改，支持
+              516K、1M 或自定义数值；清空后保存可恢复自动值。
+            </p>
             <AdvancedSettings
               key={provider.provider}
               provider={provider.provider}

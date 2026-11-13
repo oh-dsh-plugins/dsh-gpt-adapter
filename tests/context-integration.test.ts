@@ -291,6 +291,7 @@ describe('context settings and live model integration', () => {
     })
     await f.legacy({
       'gpt-5.4': { contextWindow: 700000, defaultServiceTier: 'fast' },
+      'gpt-new': { contextWindow: 550000 },
     })
     f.models([
       { id: 'gpt-5.4', context_window: 900000 },
@@ -316,6 +317,14 @@ describe('context settings and live model integration', () => {
     expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
       700000,
     )
+    expect(
+      JSON.parse(f.options().routes.fixture.overridesJSON)['gpt-new'],
+    ).toEqual({
+      contextWindow: 550000,
+    })
+    expect(f.service.contextWindow('fixture', 'gpt-new').effectiveTokens).toBe(
+      550000,
+    )
     await f.service.setContextWindow('fixture', 'gpt-5.4', 'default')
     expect(f.service.contextWindow('fixture', 'gpt-5.4')).toMatchObject({
       mode: 'default',
@@ -326,6 +335,40 @@ describe('context settings and live model integration', () => {
     expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
       900000,
     )
+  })
+
+  it('preserves automatic and legacy capacities during stale model cleanup', async () => {
+    const f = await fixture()
+    f.models([
+      { id: 'gpt-5.4', context_window: 900000 },
+      { id: 'gpt-new', context_window: 600000 },
+    ])
+    await f.service.refresh('fixture')
+    await f.legacy({
+      'gpt-5.4': { contextWindow: 700000, defaultServiceTier: 'fast' },
+    })
+    f.models([{ id: 'gpt-5.4', context_window: 950000 }])
+    await f.service.refresh('fixture')
+    await f.service.removeStale('fixture')
+    expect(
+      f.raw().providers.fixture.models.map((model: any) => model.id),
+    ).toEqual(['gpt-5.4', 'gpt-4o'])
+    expect(
+      f
+        .raw()
+        .providers.fixture.models.every(
+          (model: any) => !Object.hasOwn(model, 'contextWindow'),
+        ),
+    ).toBe(true)
+    expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
+      700000,
+    )
+    expect(
+      JSON.parse(f.options().routes.fixture.overridesJSON)['gpt-5.4'],
+    ).toEqual({
+      contextWindow: 700000,
+      defaultServiceTier: 'fast',
+    })
   })
 
   it('saves explicit presets, resets both stores and isolates identical IDs across providers', async () => {
@@ -413,6 +456,203 @@ describe('context settings and live model integration', () => {
       JSON.parse(f.options().routes.fixture.overridesJSON)['gpt-5.4'],
     ).toEqual({ defaultServiceTier: 'fast' })
     expect(f.raw().providers.fixture.models[1].contextWindow).toBeUndefined()
+  })
+
+  it('pins a native manual value equal to the automatic capacity', async () => {
+    const f = await fixture()
+    const view = f.settings.describe().find((row) => row.ns === 'llm-pi-ai')!
+    expect(view.value.providers.fixture.models[0].contextWindow).toBe(800000)
+    expect(view.user!.providers.fixture.models[0].contextWindow).toBeUndefined()
+    await f.settings.write('llm-pi-ai', (current) => {
+      current.providers.fixture.models[0].contextWindow = 800000
+      return current
+    })
+    expect(f.model().contextWindow).toBe(800000)
+    f.models([{ id: 'gpt-5.4', context_window: 900000 }])
+    await f.service.refresh('fixture')
+    expect(f.service.contextWindow('fixture', 'gpt-5.4')).toMatchObject({
+      effectiveTokens: 800000,
+      defaultTokens: 900000,
+      source: 'native-user',
+    })
+  })
+
+  it('checks output-only and provider-default edits without blocking unrelated edits', async () => {
+    const f = await fixture()
+    await f.service.setContextWindow('fixture', 'gpt-5.4', '516k')
+    const before = structuredClone(f.raw())
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.models[0].maxTokens = 1000000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    expect(f.raw()).toEqual(before)
+    await f.settings.write('llm-pi-ai', (current) => {
+      delete current.providers.fixture.models[0].maxTokens
+      return current
+    })
+    const withDefaultOutput = structuredClone(f.raw())
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.defaultMaxTokens = 500000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.defaultContextWindow = 60000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    expect(f.raw()).toEqual(withDefaultOutput)
+    // Existing invalid budgets do not block unrelated model-name edits.
+    f.model().maxTokens = 1000000
+    await f.settings.write('llm-pi-ai', (current) => {
+      current.providers.fixture.models[0].name = 'Renamed'
+      return current
+    })
+    expect(f.model().name).toBe('Renamed')
+  })
+
+  it('uses the native schema and catalog output defaults for context validation', async () => {
+    const f = await fixture('openai-responses', true)
+    await f.settings.write('llm-pi-ai', (current) => {
+      delete current.providers.fixture.models[0].maxTokens
+      return current
+    })
+    const sdkDefault = (f.native() as any)
+      .current()
+      .models.getModel('fixture', 'gpt-5.4')
+    expect(sdkDefault.maxTokens).toBe(128000)
+    const before = structuredClone(f.raw())
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.models[0].contextWindow = 100000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    await expect(
+      f.service.setContextWindow('fixture', 'gpt-5.4', 'custom', 100000),
+    ).rejects.toThrow('上下文窗口必须大于')
+    expect(f.raw()).toEqual(before)
+    await f.settings.write('llm-pi-ai', (current) => {
+      current.providers.fixture.defaultMaxTokens = 16000
+      current.providers.fixture.models[0].contextWindow = 100000
+      return current
+    })
+    expect(
+      (f.native() as any).current().models.getModel('fixture', 'gpt-5.4')
+        .maxTokens,
+    ).toBe(16000)
+    f.raw().providers.openai.defaultMaxTokens = 500000
+    const catalog = (f.native() as any)
+      .current()
+      .models.getModel('openai', 'gpt-4o')
+    expect(catalog.maxTokens).toBe(16384)
+    expect(() =>
+      f.service.validateContextWindow(
+        'openai',
+        { id: 'gpt-4o', contextWindow: 100000 },
+        f.raw().providers.openai,
+      ),
+    ).not.toThrow()
+    expect(() =>
+      f.service.validateContextWindow(
+        'openai',
+        { id: 'gpt-4o', contextWindow: 80000 },
+        f.raw().providers.openai,
+      ),
+    ).toThrow('上下文窗口必须大于')
+  })
+
+  it('resets a native field to automatic resolution and removes only its legacy context', async () => {
+    const f = await fixture()
+    await f.service.setContextWindow('fixture', 'gpt-5.4', '516k')
+    await f.legacy({
+      'gpt-5.4': { contextWindow: 600000, defaultServiceTier: 'fast' },
+      'gpt-other': { contextWindow: 333333 },
+    })
+    const view = f.settings.describe().find((row) => row.ns === 'llm-pi-ai')!
+    expect(view.user!.providers.fixture.models[0].contextWindow).toBe(600000)
+    await f.settings.write('llm-pi-ai', (current) => {
+      delete current.providers.fixture.models[0].contextWindow
+      return current
+    })
+    expect(f.model()).toEqual({ id: 'gpt-5.4', maxTokens: 2048 })
+    expect(f.service.contextWindow('fixture', 'gpt-5.4')).toMatchObject({
+      mode: 'default',
+      effectiveTokens: 800000,
+      source: 'upstream',
+    })
+    expect(JSON.parse(f.options().routes.fixture.overridesJSON)).toEqual({
+      'gpt-5.4': { defaultServiceTier: 'fast' },
+      'gpt-other': { contextWindow: 333333 },
+    })
+  })
+
+  it('validates native context saves against the draft output budget and rolls back failed cleanup', async () => {
+    const f = await fixture()
+    const before = structuredClone(f.raw())
+    for (const tokens of [0, 1.5, 67584, Number.MAX_SAFE_INTEGER + 1])
+      await expect(
+        f.settings.write('llm-pi-ai', (current) => {
+          current.providers.fixture.models[0].contextWindow = tokens
+          return current
+        }),
+      ).rejects.toThrow()
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.models[0].contextWindow = 516000
+        current.providers.fixture.models[0].maxTokens = 500000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.defaultMaxTokens = 500000
+        delete current.providers.fixture.models[0].maxTokens
+        current.providers.fixture.models[0].contextWindow = 516000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    expect(f.raw()).toEqual(before)
+    await f.legacy({ 'gpt-5.4': { contextWindow: 600000 } })
+    f.failCleanup()
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        current.providers.fixture.models[0].contextWindow = 516000
+        return current
+      }),
+    ).rejects.toThrow('legacy cleanup failed')
+    expect(f.raw()).toEqual(before)
+    expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
+      600000,
+    )
+  })
+
+  it('validates a native reset against the provider default being saved', async () => {
+    const f = await fixture()
+    await f.service.setContextWindow('fixture', 'gpt-5.4', '516k')
+    const before = structuredClone(f.raw())
+    await expect(
+      f.settings.write('llm-pi-ai', (current) => {
+        delete current.providers.fixture.models[0].contextWindow
+        current.providers.fixture.defaultContextWindow = 60000
+        return current
+      }),
+    ).rejects.toThrow('上下文窗口必须大于')
+    expect(f.raw()).toEqual(before)
+    await f.settings.write('llm-pi-ai', (current) => {
+      delete current.providers.fixture.models[0].contextWindow
+      current.providers.fixture.defaultContextWindow = 850000
+      return current
+    })
+    expect(f.service.contextWindow('fixture', 'gpt-5.4')).toMatchObject({
+      mode: 'default',
+      effectiveTokens: 850000,
+      source: 'provider-default',
+    })
   })
 
   it.each(['openai-responses', 'openai-completions'])(

@@ -9,7 +9,7 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { createRequestBridge } from './bridge.js'
 import { ModelSynchronizer } from './runtime.js'
 import { JsonStorage } from './storage.js'
-import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
+import { Config as NativeConfig, PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -329,13 +329,7 @@ export class GptModels extends Service {
             op: 'set',
             path: ['providers', provider, 'models'],
             value: [...existing, ...added].map((model) =>
-              projectModel(
-                provider,
-                model,
-                (route, row) => this.capability(route, row.id, row.name),
-                undefined,
-                ids.has(model.id),
-              ),
+              this.editableModel(provider, model, ids.has(model.id)),
             ),
           },
         ],
@@ -513,12 +507,7 @@ export class GptModels extends Service {
             op: 'set',
             path: ['providers', provider, 'models'],
             value: nextModels.map((model) =>
-              projectModel(
-                provider,
-                model,
-                (route, row) => this.capability(route, row.id, row.name),
-                undefined,
-              ),
+              this.editableModel(provider, model),
             ),
           },
         ],
@@ -527,24 +516,61 @@ export class GptModels extends Service {
     await runner.removeStale(staleIds)
   }
 
+  /** Internal model-list writes must use the same manual fields as native drafts. */
+  private editableModel(
+    provider: string,
+    model: Record<string, any>,
+    existing = true,
+  ) {
+    const capability = this.capability(provider, model.id, model.name)
+    if (!capability) return model
+    const tokens = existing
+      ? this.editableContextWindow(provider, model)
+      : model.contextWindow
+    return projectModel(
+      provider,
+      tokens === undefined ? model : { ...model, contextWindow: tokens },
+      () => capability,
+      undefined,
+      false,
+    )
+  }
+
+  editableContextWindow(provider: string, model: Record<string, any>) {
+    const context = this.contextWindow(provider, model.id)
+    return context.source === 'legacy-override'
+      ? context.effectiveTokens
+      : model.contextWindow
+  }
+
   /** Resolve raw metadata separately from merged capabilities and cached overrides. */
   contextWindow(
     provider: string,
     modelId: string,
     nativeDefault?: number,
+    profileOverride?: {
+      defaultContextWindow?: number
+      models?: Array<{ id: string; [key: string]: unknown }>
+      modelOverrides?: Record<string, Record<string, unknown>>
+    },
   ): ContextWindowResolution {
-    const { descriptor, profile } = this.profile(provider)
+    const { descriptor, profile: storedProfile } = this.profile(provider)
+    const inherited = (descriptor.base as any)?.providers?.[provider]
+    const profile = profileOverride
+      ? { ...inherited, ...profileOverride }
+      : storedProfile
     const overrides = JSON.parse(
       this.routeOptions(provider, profile)?.overridesJSON ?? '{}',
     )
     const row = profile.models?.length
-      ? profile.models.find((model) => model.id === modelId)
+      ? profile.models.find((model: { id: string }) => model.id === modelId)
       : profile.modelOverrides?.[modelId]
     const snapshot = this.snapshots.get(provider)
     const raw = snapshot?.models.find((model) => model.id === modelId)
-    const userProfile = (descriptor.user as any)?.providers?.[provider]
-    // Schema defaults are present in value/base; only an explicit user field,
-    // a non-default inherited value, or an unlayered raw descriptor is intent.
+    const userProfile =
+      profileOverride ?? (descriptor.user as any)?.providers?.[provider]
+    // Drafts replace the user layer; absent fields fall back to the inherited
+    // profile. Schema defaults alone do not express a provider override.
     const providerDefault =
       userProfile?.defaultContextWindow ??
       (profile.defaultContextWindow !== 1000000 ||
@@ -566,6 +592,44 @@ export class GptModels extends Service {
         catalogModel?.contextWindow ??
         profile.defaultContextWindow,
     })
+  }
+
+  /** Both native form saves and the compatibility RPC validate the same budget. */
+  validateContextWindow(
+    provider: string,
+    model: Record<string, any>,
+    profile: Record<string, any>,
+  ): void {
+    const effective =
+      model.contextWindow ??
+      this.contextWindow(provider, model.id, undefined, profile).defaultTokens
+    const compaction = this.nativeDescribe().find(
+      (entry) => entry.ns === 'compaction-basic',
+    )?.value as any
+    const policy = compaction?.modelPolicies?.find(
+      (entry: any) => entry.provider === provider && entry.model === model.id,
+    )
+    const headroom = policy?.headroomTokens ?? compaction?.headroomTokens ?? 0
+    const inherited = (
+      this.nativeDescribe().find((entry) => entry.ns === 'llm-pi-ai')
+        ?.base as any
+    )?.providers?.[provider]
+    const defaults = NativeConfig({
+      providers: {
+        [provider]: {
+          defaultMaxTokens:
+            profile.defaultMaxTokens ?? inherited?.defaultMaxTokens,
+        },
+      },
+    }).providers.get()[provider]!
+    // Match native catalog resolution: explicit model, catalog, provider default.
+    const output =
+      model.maxTokens ??
+      getBuiltinModels(provider as never).find((entry) => entry.id === model.id)
+        ?.maxTokens ??
+      defaults.defaultMaxTokens
+    if (effective <= output + headroom)
+      throw new Error('上下文窗口必须大于当前最大输出和压缩预留的总和')
   }
 
   contextWriteRevision(): number | undefined {
@@ -628,19 +692,6 @@ export class GptModels extends Service {
     const index =
       profile.models?.findIndex((model) => model.id === modelId) ?? -1
     if (index < 0) throw new Error('模型已变更，请刷新后重试')
-    const effective =
-      tokens ?? this.contextWindow(provider, modelId).defaultTokens
-    const row = profile.models![index]!
-    const compaction = this.nativeDescribe().find(
-      (entry) => entry.ns === 'compaction-basic',
-    )?.value as any
-    const policy = compaction?.modelPolicies?.find(
-      (entry: any) => entry.provider === provider && entry.model === modelId,
-    )
-    const headroom = policy?.headroomTokens ?? compaction?.headroomTokens ?? 0
-    const output = validContextWindow(row.maxTokens) ? row.maxTokens : 0
-    if (effective <= output + headroom)
-      throw new Error('上下文窗口必须大于当前最大输出和压缩预留的总和')
     if (!this.contextWriter) throw new Error('上下文设置暂不可用')
     await this.contextWriter(
       provider,
@@ -858,6 +909,10 @@ export async function apply(
           ? service.capability(provider, model.id, model.name, profile)
           : undefined,
       {
+        editableContext: (provider, model) =>
+          service.editableContextWindow(provider, model),
+        validate: (provider, model, profile) =>
+          service.validateContextWindow(provider, model, profile),
         revision: () => service.contextWriteRevision(),
         saved: (edits, revision) => service.clearLegacyContext(edits, revision),
       },

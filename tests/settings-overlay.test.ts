@@ -133,6 +133,12 @@ describe('plugin-owned reasoning on the native Models page', () => {
     }))
     try {
       const opened = settings.describe()[0]
+      expect(opened.value.providers.gateway.models[0].contextWindow).toBe(
+        800000,
+      )
+      expect(
+        opened.user.providers.gateway.models[0].contextWindow,
+      ).toBeUndefined()
       const draft = opened.user.providers.gateway.models
       draft[0].name = 'Renamed'
       capacity = 900000
