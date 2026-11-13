@@ -38,7 +38,7 @@ Restart the DSH host after installing or upgrading. Configure GPT connections un
 To install from source for development or verification:
 
 ```sh
-git clone https://github.com/lxjmaster/dsh-gpt-adapter.git
+git clone https://github.com/oh-dsh-plugins/dsh-gpt-adapter.git
 cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts

@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    if: github.repository == 'lxjmaster/dsh-gpt-adapter' && github.ref == 'refs/heads/main'
+    if: github.repository == 'oh-dsh-plugins/dsh-gpt-adapter' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository

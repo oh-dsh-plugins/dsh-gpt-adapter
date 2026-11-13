@@ -23,12 +23,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/lxjmaster/dsh-gpt-adapter.git"
+    "url": "https://github.com/oh-dsh-plugins/dsh-gpt-adapter.git"
   },
   "bugs": {
-    "url": "https://github.com/lxjmaster/dsh-gpt-adapter/issues"
+    "url": "https://github.com/oh-dsh-plugins/dsh-gpt-adapter/issues"
   },
-  "homepage": "https://github.com/lxjmaster/dsh-gpt-adapter",
+  "homepage": "https://github.com/oh-dsh-plugins/dsh-gpt-adapter",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./dist/src/host.d.ts",

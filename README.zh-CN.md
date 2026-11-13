@@ -38,7 +38,7 @@ dsh plugin --profile web add dsh-gpt-adapter@0.2.6
 如需从源码安装进行开发或验证：
 
 ```sh
-git clone https://github.com/lxjmaster/dsh-gpt-adapter.git
+git clone https://github.com/oh-dsh-plugins/dsh-gpt-adapter.git
 cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
