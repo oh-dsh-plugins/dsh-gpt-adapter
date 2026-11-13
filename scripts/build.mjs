@@ -3,6 +3,8 @@ import { mkdir, writeFile, rm, readFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { compatibilitySource, menuSource } from './compat.mjs'
+import { nativeContextSettingsSource } from './native-context-settings.mjs'
+import { fileURLToPath } from 'node:url'
 
 await rm('lib', { recursive: true, force: true })
 await mkdir('lib', { recursive: true })
@@ -30,6 +32,7 @@ const settings = await readFile(
   require.resolve('@deepseek-ai/dsh-client-ui-settings-models/client'),
   'utf8',
 )
+const nativeContextSettings = nativeContextSettingsSource()
 const styleNames = [
   'customized',
   'customizedSummary',
@@ -62,8 +65,41 @@ await build({
     'react',
     'react/jsx-runtime',
     '@deepseek-ai/dsh-client-ui-primitives',
+    '@deepseek-ai/dsh-client-store',
   ],
   plugins: [
+    {
+      name: 'native-context-settings',
+      setup(build) {
+        build.onResolve(
+          { filter: new RegExp('^dsh-gpt-adapter/native-context-settings$') },
+          () => ({
+            path: 'native-context-settings',
+            namespace: 'gpt-context',
+          }),
+        )
+        build.onLoad({ filter: /.*/, namespace: 'gpt-context' }, () => ({
+          contents: `
+            import * as React from 'react';
+            import * as JSX from 'react/jsx-runtime';
+            import * as Primitives from '@deepseek-ai/dsh-client-ui-primitives';
+            import * as Store from '@deepseek-ai/dsh-client-store';
+            import { ContextWindowPreset } from ${JSON.stringify(fileURLToPath(new URL('../src/client/context-window-preset.tsx', import.meta.url)))};
+            import { isGptModel } from ${JSON.stringify(fileURLToPath(new URL('../src/capabilities.ts', import.meta.url)))};
+            import { validContextWindow } from ${JSON.stringify(fileURLToPath(new URL('../src/context-window.ts', import.meta.url)))};
+            const native = ((require) => { ${nativeContextSettings.body} })((name) => {
+              const modules = {'react': React, 'react/jsx-runtime': JSX, '@deepseek-ai/dsh-client-ui-primitives': Primitives, '@deepseek-ai/dsh-client-store': Store};
+              if (!(name in modules)) throw new Error('Unsupported native Models dependency: ' + name);
+              return modules[name];
+            });
+            export const NativeModelsSection = native.ModelsSection;
+            export const expectedModelsSectionSource = ${JSON.stringify(nativeContextSettings.expectedModelsSectionSource)};
+          `,
+          loader: 'js',
+          resolveDir: fileURLToPath(new URL('../', import.meta.url)),
+        }))
+      },
+    },
     {
       name: 'native-settings-styles',
       setup(build) {

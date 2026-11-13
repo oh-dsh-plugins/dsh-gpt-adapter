@@ -26,6 +26,7 @@ import type {
   ModelDirectoryResolver,
 } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import styles from 'dsh-gpt-adapter/native-settings-styles'
+import { installNativeContextPresets } from './native-context-settings.js'
 
 type ProviderStatus = ReturnType<GptModels['status']>
 type SpeedStatus = ReturnType<GptModels['speed']>
@@ -247,8 +248,8 @@ export function apply(ctx: Context): void {
               </div>
             )}
             <p className={styles.advancedHint}>
-              上下文窗口请在「自定义设置 → 模型目录」的原生字段中修改，支持
-              516K、1M 或自定义数值；清空后保存可恢复自动值。
+              在「自定义设置 → 模型目录」的上下文窗口中选择预设；
+              选择“自定义”后可输入数值，选择“默认”恢复自动解析。
             </p>
             <AdvancedSettings
               key={provider.provider}
@@ -376,12 +377,22 @@ export function apply(ctx: Context): void {
       </>
     )
   }
-  ctx.slots.inject('settings.models.provider-card', () =>
-    ctx.slots.register(
-      { name: 'settings.models.provider-card', key: 'llm-pi-ai' },
-      ProviderExtras,
-    ),
-  )
+  ctx.slots.inject('settings.models.provider-card', () => {
+    const restore = installNativeContextPresets(ctx.slots)
+    try {
+      const dispose = ctx.slots.register(
+        { name: 'settings.models.provider-card', key: 'llm-pi-ai' },
+        ProviderExtras,
+      )
+      return () => {
+        dispose()
+        restore()
+      }
+    } catch (error) {
+      restore()
+      throw error
+    }
+  })
   ctx.slots.inject('conversation.input.left', () =>
     ctx.slots.register(
       { name: 'conversation.input.left', id: 'gpt-speed', order: 20 },

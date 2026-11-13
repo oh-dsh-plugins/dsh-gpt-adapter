@@ -314,6 +314,9 @@ describe('built client contributions', () => {
         },
       },
       slots: {
+        entries: () => [],
+        subscribe: () => () => {},
+        provideRoot: () => () => {},
         inject: (_key: string, callback: () => void) => callback(),
         register: (
           entry: { name: string },
@@ -340,7 +343,7 @@ describe('built client contributions', () => {
       await new Promise((resolve) => setTimeout(resolve, 20))
     })
     expect(container.textContent).toContain('GPT 自动适配')
-    expect(container.textContent).toContain('原生字段')
+    expect(container.textContent).toContain('选择预设')
     expect(
       container.querySelector('input[type=number][aria-label*=上下文]'),
     ).toBeNull()
@@ -478,6 +481,9 @@ describe('built client contributions', () => {
         },
       },
       slots: {
+        entries: () => [],
+        subscribe: () => () => {},
+        provideRoot: () => () => {},
         inject: (_: string, fn: () => void) => fn(),
         register: (
           entry: { name: string },

@@ -6,9 +6,13 @@ from the pinned `@deepseek-ai/dsh-llm-pi-ai`,
 `@deepseek-ai/dsh-client-ui-settings-models`, and `@deepseek-ai/dsh-mcp-client` version `0.2.2-rc.1` packages.
 Original project: https://github.com/deepseek-ai/deepseek-harness
 
-The build records native source hashes and reads native Models CSS class names.
-The runtime extends the native adapter and injects controls into existing UI
-slots. MCP tool filtering uses the pinned client’s public tool-name encoding. Installed third-party package files are never modified.
+The build records native source hashes, reads native Models CSS class names,
+and adapts the pinned native Models renderer to add a preset selector at the
+original GPT context-window field. The runtime retains the original settings
+entry, controller, child slots, and save/cancel operations, and restores its
+renderer when unloaded. Other controls extend existing UI slots. MCP tool
+filtering uses the pinned client's public tool-name encoding. Installed
+third-party package files are never modified.
 
 ## DeepSeek Harness — MIT License
 
