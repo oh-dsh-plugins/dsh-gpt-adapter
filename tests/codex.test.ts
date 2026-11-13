@@ -853,6 +853,90 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     await runtime.dispose()
   })
 
+  it.each([false, true])(
+    'waits for agent-triggered cleanup during plugin disposal (failure=%s)',
+    async (fails) => {
+      const home = await directory()
+      await put(
+        join(home, 'config.toml'),
+        '[mcp_servers.fixture]\ncommand="fixture"\n',
+      )
+      const handlers = new Map<string, (...args: any[]) => any>()
+      const original = Client.prototype.callTool
+      const failure = new Error('transport close failed')
+      let release!: () => void, started!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const closing = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      const dispose = vi.fn(async () => {
+        started()
+        await gate
+        if (fails) throw failure
+      })
+      const child: any = {
+        agents: { list: () => [] },
+        workingDirectory: { ensure: async () => home },
+        get: () => fixtureFs,
+        on: (name: string, fn: (...args: any[]) => any) =>
+          handlers.set(name, fn),
+      }
+      const ctx: any = {
+        inject(_deps: string[], apply: (child: any) => void) {
+          apply(child)
+          return { dispose: async () => {} }
+        },
+        effect() {},
+      }
+      const agent = {
+        ctx: { get: () => fixtureFs, plugin: () => ({ dispose }) },
+      }
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importSkills: false,
+        importInstructions: false,
+        importPluginResources: false,
+      })
+      let shutdown: Promise<unknown> | undefined
+      try {
+        await handlers.get('agent/created')!({ agent })
+        await runtime.refresh()
+        const cleanup = handlers.get('agent/disposed')!({
+          agent,
+        }) as Promise<void>
+        const result = cleanup.then(
+          () => undefined,
+          (error) => error,
+        )
+        expect(handlers.get('agent/disposed')!({ agent })).toBe(cleanup)
+        await closing
+        let finished = false
+        shutdown = runtime.dispose().then(
+          () => undefined,
+          (error) => error,
+        )
+        void shutdown.then(() => {
+          finished = true
+        })
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(finished).toBe(false)
+        expect(Client.prototype.callTool).not.toBe(original)
+        expect(dispose).toHaveBeenCalledTimes(1)
+        release()
+        expect(await result).toBe(fails ? failure : undefined)
+        expect(await shutdown).toBe(fails ? failure : undefined)
+        expect(Client.prototype.callTool).toBe(original)
+      } finally {
+        release()
+        await shutdown
+        await runtime.dispose().catch(() => {})
+      }
+    },
+  )
+
   it.each(['sync', 'async', 'single'])(
     'waits for every MCP client when the first disposer fails (%s)',
     async (mode) => {
@@ -1137,6 +1221,104 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     await runtime.dispose()
     expect(tools.definitions(a)).toEqual([])
     expect(tools.definitions(b)).toEqual([])
+  })
+
+  it('coalesces repeated agent refreshes and lets a canceled caller stop waiting independently', async () => {
+    const home = await directory()
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    const ensure = vi.fn(
+      async (_agent?: unknown, _signal?: AbortSignal) => home,
+    )
+    ctx.provide('fs', fixtureFs as any)
+    ctx.provide('workingDirectory', { ensure } as any)
+    ctx.provide('agents', { list: () => [] } as any)
+    ctx.provide('tools', { register: () => () => {} } as any)
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importSkills: false,
+    })
+    const agent = await attachAgent(ctx, home)
+    ensure.mockClear()
+    let release!: (cwd: string) => void
+    ensure.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        }),
+    )
+    const abort = new AbortController()
+    const first = ctx.serial('agent/created', {
+      agent,
+      source: 'create',
+      signal: abort.signal,
+    } as any)
+    const canceled = expect(first).rejects.toThrow('caller canceled')
+    await vi.waitFor(() => expect(ensure).toHaveBeenCalledTimes(1))
+    const queued = Array.from({ length: 20 }, () =>
+      ctx.serial('agent/created', { agent, source: 'create' } as any),
+    )
+    await Promise.resolve()
+    expect(ensure).toHaveBeenCalledTimes(1)
+    abort.abort(new Error('caller canceled'))
+    await canceled
+    release(home)
+    await Promise.all(queued)
+    expect(ensure).toHaveBeenCalledTimes(2)
+    ensure.mockImplementationOnce(
+      (_agent, signal) =>
+        new Promise((_resolve, reject) => {
+          signal!.addEventListener('abort', () => reject(signal!.reason), {
+            once: true,
+          })
+        }),
+    )
+    const refreshing = runtime.refresh()
+    await vi.waitFor(() => expect(ensure).toHaveBeenCalledTimes(3))
+    await runtime.dispose()
+    await refreshing
+  })
+
+  it('bounds directory fallback snapshots and releases them on disposal', async () => {
+    const home = await directory()
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    await ctx.plugin(SkillRegistry)
+    const registry = ctx.get('skills') as SkillRegistry
+    let runtime!: ReturnType<typeof installCodexCompatibility>
+    await ctx.plugin({
+      name: 'bounded-codex',
+      apply(owner: Context) {
+        runtime = installCodexCompatibility(owner, {
+          ...options,
+          codexHome: home,
+          importMcpServers: false,
+          importInstructions: false,
+        })
+      },
+    })
+    await runtime.refresh()
+    const first = join(home, 'scope-0')
+    let snapshots: Map<string, unknown> | undefined
+    const originalSet = Map.prototype.set
+    const observer = vi
+      .spyOn(Map.prototype, 'set')
+      .mockImplementation(function (this: Map<any, any>, key: any, value: any) {
+        if (key === first && value?.skillRoots && value?.config && value?.items)
+          snapshots = this
+        return originalSet.call(this, key, value)
+      })
+    cleanup.push(async () => {
+      observer.mockRestore()
+    })
+    for (let index = 0; index < 65; index++)
+      await registry.list({ cwd: join(home, `scope-${index}`) } as any)
+    expect(snapshots?.size).toBe(64)
+    expect(snapshots?.has(first)).toBe(false)
+    await runtime.dispose()
+    expect(snapshots?.size).toBe(0)
   })
 
   it('automatically retries a transient initial MCP failure with backoff', async () => {

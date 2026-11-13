@@ -30,80 +30,232 @@ import { installNativeContextPresets } from './native-context-settings.js'
 
 type ProviderStatus = ReturnType<GptModels['status']>
 type SpeedStatus = ReturnType<GptModels['speed']>
-export const inject = ['slots', 'connection', 'sessions', 'modelDirectories']
+type ModelStatus = ReturnType<GptModels['modelStatus']>
+export const inject = [
+  'slots',
+  'connection',
+  'sessions',
+  'modelDirectories',
+  'remote',
+]
 
 export function apply(ctx: Context): void {
   async function call<T>(
     method: string,
     args: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const result = await (ctx as ClientContext).connection.rpc.call(
       '/api',
       `gptModels/${method}`,
       { args },
+      signal,
     )
     if (!result.ok) throw new Error(result.error.message)
     return result.value as T
   }
+  function useRead<T>(
+    method: string,
+    args: Record<string, unknown>,
+    enabled: boolean,
+    intervalMs = 0,
+  ) {
+    const [value, setValue] = useState<{ key: string; value: T }>()
+    const [error, setError] = useState('')
+    const controls = useRef<{
+      invalidate(): void
+      pause(): void
+      resume(): void
+    }>()
+    const key = JSON.stringify(args)
+    useEffect(() => {
+      setValue(undefined)
+      setError('')
+      if (!enabled) return
+      const parameters = JSON.parse(key)
+      let active = true,
+        running = false,
+        dirty = false,
+        paused = false,
+        generation = 0,
+        failures = 0
+      let current: T | undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let request: AbortController | undefined
+      let deadline: ReturnType<typeof setTimeout> | undefined
+      const clear = () => {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      const visible = () => document.visibilityState !== 'hidden'
+      const cancel = () => {
+        clearTimeout(deadline)
+        deadline = undefined
+        request?.abort()
+      }
+      const refresh = async () => {
+        clear()
+        if (!active || !visible() || paused) {
+          dirty = true
+          return
+        }
+        if (running) {
+          dirty = true
+          return
+        }
+        running = true
+        dirty = false
+        const sequence = generation
+        const controller = new AbortController()
+        request = controller
+        deadline = setTimeout(
+          () => controller.abort(new Error('读取 GPT 设置超时，请重试')),
+          15000,
+        )
+        try {
+          const next = await call<T>(method, parameters, controller.signal)
+          if (active && sequence === generation) {
+            current = next
+            failures = 0
+            setValue({ key, value: next })
+            setError('')
+          }
+        } catch (failure) {
+          if (active && sequence === generation) {
+            failures++
+            setError(
+              failure instanceof Error ? failure.message : '无法读取 GPT 设置',
+            )
+          }
+        } finally {
+          clearTimeout(deadline)
+          deadline = undefined
+          request = undefined
+          running = false
+          if (active && visible() && !paused) {
+            if (dirty) {
+              void refresh()
+              return
+            }
+            const delay = failures
+              ? Math.min(30000, 3000 * 2 ** Math.min(failures - 1, 4))
+              : method === 'status' &&
+                  (current as ProviderStatus | undefined)?.status.state ===
+                    'refreshing'
+                ? 3000
+                : intervalMs
+            if (delay) timer = setTimeout(() => void refresh(), delay)
+          }
+        }
+      }
+      const invalidate = () => {
+        generation++
+        dirty = true
+        void refresh()
+      }
+      const reset = () => {
+        generation++
+        dirty = true
+        clear()
+        cancel()
+        void refresh()
+      }
+      const controller = {
+        invalidate,
+        pause() {
+          paused = true
+          generation++
+          dirty = true
+          clear()
+          cancel()
+        },
+        resume() {
+          paused = false
+          invalidate()
+        },
+      }
+      controls.current = controller
+      const changedVisibility = () => {
+        if (visible()) invalidate()
+        else {
+          generation++
+          dirty = true
+          clear()
+          cancel()
+        }
+      }
+      document.addEventListener('visibilitychange', changedVisibility)
+      const disposers = [
+        ctx.on('connection/reset', reset),
+        ctx.remote.$on('settings/document-updated', invalidate),
+        ctx.remote.$on('llm/models-updated', (provider) => {
+          if (!provider || provider === parameters.provider) invalidate()
+        }),
+      ]
+      void refresh()
+      return () => {
+        active = false
+        generation++
+        clear()
+        cancel()
+        document.removeEventListener('visibilitychange', changedVisibility)
+        for (const dispose of disposers) dispose()
+        if (controls.current === controller) controls.current = undefined
+      }
+    }, [method, key, enabled, intervalMs])
+    return {
+      value: value?.key === key ? value.value : undefined,
+      error,
+      refresh: () => controls.current?.invalidate(),
+      pause: () => controls.current?.pause(),
+      resume: () => controls.current?.resume(),
+    }
+  }
   function useProvider(provider: string) {
-    const [value, setValue] = useState<ProviderStatus>()
+    const query = useRead<ProviderStatus>(
+      'status',
+      { provider },
+      !!provider,
+      30000,
+    )
     const [error, setError] = useState('')
     const [busy, setBusy] = useState(false)
     const requests = useRef({ sequence: 0, writing: false })
     useEffect(() => {
-      let active = true
+      requests.current.sequence++
       requests.current.writing = false
       setBusy(false)
-      const refresh = () => {
-        if (!provider || requests.current.writing) return
-        const sequence = ++requests.current.sequence
-        void call<ProviderStatus>('status', { provider })
-          .then((value) => {
-            if (active && sequence === requests.current.sequence) {
-              setValue(value)
-              setError('')
-            }
-          })
-          .catch((error) => {
-            if (active && sequence === requests.current.sequence)
-              setError(
-                error instanceof Error ? error.message : '无法读取 GPT 设置',
-              )
-          })
-      }
-      refresh()
-      const timer = setInterval(refresh, 3000)
+      setError('')
       return () => {
-        active = false
         requests.current.sequence++
-        clearInterval(timer)
       }
     }, [provider])
     async function act(method: string, args: Record<string, unknown>) {
       if (requests.current.writing) return
       requests.current.writing = true
       const sequence = ++requests.current.sequence
+      query.pause()
       setBusy(true)
+      setError('')
       try {
         await call(method, args)
         if (sequence !== requests.current.sequence) return false
-        const next = await call<ProviderStatus>('status', { provider })
-        if (sequence !== requests.current.sequence) return false
-        setValue(next)
-        setError('')
         return true
-      } catch (error) {
+      } catch (failure) {
         if (sequence === requests.current.sequence)
-          setError(error instanceof Error ? error.message : '操作失败，请重试')
+          setError(
+            failure instanceof Error ? failure.message : '操作失败，请重试',
+          )
         return false
       } finally {
         if (sequence === requests.current.sequence) {
           requests.current.writing = false
           setBusy(false)
+          query.resume()
         }
       }
     }
-    return { value, error, busy, act }
+    return { value: query.value, error: error || query.error, busy, act }
   }
   function AdvancedSettings({
     provider,
@@ -281,51 +433,50 @@ export function apply(ctx: Context): void {
     ).current
     const provider = selection?.provider ?? ''
     const modelId = selection?.model ?? ''
-    const { value } = useProvider(provider)
-    const [speed, setSpeed] = useState<SpeedStatus>({
-      selected: 'default',
-      last: null,
-    })
+    const metadata = useRead<ModelStatus>(
+      'modelStatus',
+      { provider, modelId },
+      !!provider && !!modelId,
+    )
+    const speedQuery = useRead<SpeedStatus>(
+      'speed',
+      { sessionId, provider, modelId },
+      !!metadata.value?.enabled,
+      3000,
+    )
+    const speed = speedQuery.value ?? { selected: 'default', last: null }
     const [open, setOpen] = useState(false)
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState('')
+    const action = useRef(0)
     useEffect(() => {
-      let active = true
-      const refresh = () => {
-        if (provider && modelId)
-          void call<SpeedStatus>('speed', { sessionId, provider, modelId })
-            .then((value) => {
-              if (active) setSpeed(value)
-            })
-            .catch((error) => {
-              if (active)
-                setError(
-                  error instanceof Error ? error.message : '无法读取速度设置',
-                )
-            })
-      }
-      refresh()
-      const timer = setInterval(refresh, 3000)
+      action.current++
+      setBusy(false)
+      setOpen(false)
+      setError('')
       return () => {
-        active = false
-        clearInterval(timer)
+        action.current++
       }
     }, [sessionId, provider, modelId])
-    const capability = value?.enabled ? value.capabilities[modelId] : undefined
+    const capability = metadata.value?.enabled ? metadata.value : undefined
     if (!capability) return null
     async function select(tier: ServiceTier) {
+      const sequence = ++action.current
       setBusy(true)
+      speedQuery.pause()
       try {
         await call('setSpeed', { sessionId, provider, modelId, tier })
-        setSpeed(
-          await call<SpeedStatus>('speed', { sessionId, provider, modelId }),
-        )
+        if (sequence !== action.current) return
         setError('')
         setOpen(false)
-      } catch (error) {
-        setError(error instanceof Error ? error.message : '设置速度失败')
+      } catch (failure) {
+        if (sequence === action.current)
+          setError(failure instanceof Error ? failure.message : '设置速度失败')
       } finally {
-        setBusy(false)
+        if (sequence === action.current) {
+          setBusy(false)
+          speedQuery.resume()
+        }
       }
     }
     const label =
@@ -369,9 +520,9 @@ export function apply(ctx: Context): void {
             </Button>
           }
         />
-        {error && (
+        {(error || metadata.error || speedQuery.error) && (
           <span className={styles.error} role="alert">
-            {error}
+            {error || metadata.error || speedQuery.error}
           </span>
         )}
       </>

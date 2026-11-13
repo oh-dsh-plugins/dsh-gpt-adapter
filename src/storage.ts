@@ -22,12 +22,17 @@ export class JsonStorage {
     }
   }
 
-  async write(key: string, value: unknown): Promise<void> {
+  async write(
+    key: string,
+    value: unknown,
+    beforeCommit?: () => void,
+  ): Promise<void> {
     await mkdir(this.directory, { recursive: true })
     const target = this.path(key)
     const temp = `${target}.${randomUUID()}.tmp`
     try {
       await writeFile(temp, JSON.stringify(value), { mode: 0o600 })
+      beforeCommit?.()
       await rename(temp, target)
     } finally {
       await rm(temp, { force: true })

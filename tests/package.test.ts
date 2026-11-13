@@ -15,6 +15,12 @@ describe('plugin packaging and compatible composition', () => {
     expect(parameters).toEqual(['sessionId', 'provider', 'modelId', 'tier'])
     expect(
       host
+        .match(/modelStatus\(([^)]*)\)/)![1]!
+        .split(',')
+        .map((name) => name.trim()),
+    ).toEqual(['provider', 'modelId'])
+    expect(
+      host
         .match(/async setContextWindow\(([^)]*)\)/)![1]!
         .split(',')
         .map((name) => name.trim()),

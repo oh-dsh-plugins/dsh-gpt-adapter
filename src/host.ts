@@ -8,6 +8,7 @@ import type { SessionId } from '@deepseek-ai/dsh-client-connection/client'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { createRequestBridge } from './bridge.js'
 import { ModelSynchronizer } from './runtime.js'
+import { restoreSnapshot, syncCacheKey, syncConfigKey } from './sync.js'
 import { JsonStorage } from './storage.js'
 import { Config as NativeConfig, PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { createRequire } from 'node:module'
@@ -33,6 +34,7 @@ import {
   projectModel,
   type ContextWindowEdit,
   type ContextWindowWriter,
+  type SettingsResolution,
 } from './settings-overlay.js'
 import {
   installCodexCompatibility,
@@ -53,6 +55,17 @@ type RouteOptions = {
   refreshIntervalMs: number
   capabilityCatalogUrl?: string
   overridesJSON: string
+}
+type SettingsRead = {
+  rows: any[]
+  descriptor: any
+  routes: PluginConfig['routes']
+  snapshots: Map<string, SyncSnapshot>
+  overrides: Map<string, Record<string, ModelOverride>>
+  models: WeakMap<object, Map<string, any>>
+  upstream: Map<string, Map<string, any>>
+  builtin: Map<string, Map<string, any>>
+  outputDefaults: WeakMap<object, number>
 }
 export type PluginConfig = {
   routes: Record<string, RouteOptions>
@@ -125,10 +138,12 @@ declare module '@deepseek-ai/cordis' {
 export class GptModels extends Service {
   codex?: CodexCompatibilityRuntime
   contextWriter: ContextWindowWriter | undefined
+  modelRevision: ((rows: any[]) => number) | undefined
   readonly typertRemote: ReturnType<typeof bindTypertRemote>
   private readonly runners = new Map<string, ModelSynchronizer>()
   private readonly snapshots = new Map<string, SyncSnapshot>()
-  private readonly speeds = new Map<string, ServiceTier>()
+  private readonly publications = new Map<string, Promise<void>>()
+  private speeds = new Map<string, ServiceTier>()
   private readonly results = new Map<
     string,
     { requested: string; actual?: string }
@@ -139,6 +154,7 @@ export class GptModels extends Service {
   private readonly nativeDescribe: Context['settings']['describe']
   private closed = false
   private speedWrites: Promise<void> = Promise.resolve()
+  private nativeRead: { snapshot: object; read: SettingsRead } | undefined
 
   constructor(
     ctx: Context,
@@ -148,9 +164,38 @@ export class GptModels extends Service {
     super(ctx, 'gptModels')
     this.nativeDescribe = ctx.settings.describe.bind(ctx.settings)
     this.typertRemote = bindTypertRemote(this, 'gptModels')
-    ctx.effect(() => () => {
+    ctx.on('settings/document-updated', () => {
+      this.nativeRead = undefined
+    })
+    ctx.on('llm/models-updated', () => {
+      this.nativeRead = undefined
+    })
+    ctx.on('credentials/reference-updated', (ref) => {
+      if (this.closed) return
+      const read = this.readSettings()
+      for (const [provider, profile] of Object.entries(
+        this.configuredProfiles(read),
+      )) {
+        if (this.apiKeyRef(provider, profile) !== ref) continue
+        this.runners.get(provider)?.dispose()
+        this.runners.delete(provider)
+        this.snapshots.delete(provider)
+        this.nativeRead = undefined
+        if (this.routeOptions(provider, profile, read)?.enabled)
+          this.startRunner(provider)
+        this.ctx.emit('llm/models-updated', provider)
+      }
+    })
+    ctx.on('api-session/removed', (sessionId) => {
+      for (const key of this.results.keys())
+        if (JSON.parse(key)[0] === sessionId) this.results.delete(key)
+    })
+    ctx.effect(() => async () => {
       this.closed = true
       for (const runner of this.runners.values()) runner.dispose()
+      this.nativeRead = undefined
+      this.results.clear()
+      await Promise.allSettled(this.publications.values())
     })
   }
 
@@ -162,8 +207,21 @@ export class GptModels extends Service {
         this.speeds.set(key, value)
     }
     for (const provider of this.enabledProviders()) {
-      const initial = await this.store.read<SyncSnapshot>(`route:${provider}`)
+      let initial = await this.store.read<SyncSnapshot>(`route:${provider}`)
+      if (initial) {
+        try {
+          initial = restoreSnapshot(await this.routeConfig(provider), initial)
+        } catch {
+          initial = undefined
+        }
+      }
       if (this.closed) return
+      // A credential event may have replaced this route while cache I/O waited.
+      if (this.runners.has(provider)) continue
+      if (initial) {
+        this.snapshots.set(provider, structuredClone(initial))
+        this.nativeRead = undefined
+      }
       this.startRunner(provider, initial)
     }
     let scheduled = false
@@ -193,21 +251,66 @@ export class GptModels extends Service {
     })
   }
 
-  private configuredProfiles(): Record<string, any> {
-    return (
-      (
-        this.nativeDescribe().find((entry) => entry.ns === 'llm-pi-ai')
-          ?.value as any
-      )?.providers ?? {}
-    )
+  private readSettings(rows = this.nativeDescribe()): SettingsRead {
+    return {
+      rows,
+      descriptor: rows.find((entry) => entry.ns === 'llm-pi-ai'),
+      routes: this.options.routes,
+      snapshots: new Map(this.snapshots),
+      overrides: new Map(),
+      models: new WeakMap(),
+      upstream: new Map(),
+      builtin: new Map(),
+      outputDefaults: new WeakMap(),
+    }
+  }
+
+  private configuredProfiles(read = this.readSettings()): Record<string, any> {
+    return read.descriptor?.value?.providers ?? {}
+  }
+
+  private modelIndex(read: SettingsRead, profile: Record<string, any>) {
+    const key = profile.models ?? profile
+    let index = read.models.get(key)
+    if (!index) {
+      index = new Map(
+        (profile.models ?? []).map((model: any) => [model.id, model]),
+      )
+      read.models.set(key, index)
+    }
+    return index
+  }
+
+  private builtinModel(read: SettingsRead, provider: string, modelId: string) {
+    let index = read.builtin.get(provider)
+    if (!index) {
+      index = new Map(
+        getBuiltinModels(provider as never).map((model) => [model.id, model]),
+      )
+      read.builtin.set(provider, index)
+    }
+    return index.get(modelId)
+  }
+
+  private modelOverrides(read: SettingsRead, provider: string, profile: any) {
+    let overrides = read.overrides.get(provider)
+    if (!overrides) {
+      overrides = JSON.parse(
+        this.routeOptions(provider, profile, read)?.overridesJSON ?? '{}',
+      )
+      read.overrides.set(provider, overrides!)
+    }
+    return overrides!
   }
 
   private routeOptions(
     provider: string,
-    profile = this.configuredProfiles()[provider],
+    profile?: Record<string, any>,
+    read?: SettingsRead,
   ): RouteOptions | undefined {
-    const explicit = this.options.routes[provider]
+    const explicit = (read?.routes ?? this.options.routes)[provider]
     if (explicit) return explicit
+    profile ??= this.configuredProfiles(read)[provider]
     if (
       !profile ||
       !['openai-responses', 'openai-completions'].includes(
@@ -238,7 +341,13 @@ export class GptModels extends Service {
     const runner = new ModelSynchronizer(
       () => this.routeConfig(provider),
       async (snapshot) => {
-        if (!this.closed) await this.publish(provider, snapshot)
+        await this.publish(
+          provider,
+          snapshot,
+          () =>
+            this.runners.get(provider) === runner &&
+            runner.getStatus().state !== 'stopped',
+        )
       },
       fetch,
       initial,
@@ -247,10 +356,8 @@ export class GptModels extends Service {
     runner.start()
   }
 
-  private profile(provider: string) {
-    const descriptor = this.nativeDescribe().find(
-      (entry) => entry.ns === 'llm-pi-ai',
-    )
+  private profile(provider: string, read = this.readSettings()) {
+    const descriptor = read.descriptor
     const value = descriptor?.value as
       | {
           providers?: Record<
@@ -273,6 +380,13 @@ export class GptModels extends Service {
     return { descriptor, profile }
   }
 
+  private apiKeyRef(provider: string, profile: { apiKeyEnv?: string }) {
+    return (
+      profile.apiKeyEnv ??
+      (provider === 'openai' ? 'OPENAI_API_KEY' : undefined)
+    )
+  }
+
   private async routeConfig(provider: string): Promise<SyncConfig> {
     const { profile } = this.profile(provider)
     const options = this.routeOptions(provider, profile)
@@ -280,9 +394,7 @@ export class GptModels extends Service {
     const protocol = profile.api ?? 'openai-responses'
     if (protocol !== 'openai-completions' && protocol !== 'openai-responses')
       throw new Error('GPT adaptation requires an OpenAI protocol')
-    const ref =
-      profile.apiKeyEnv ??
-      (provider === 'openai' ? 'OPENAI_API_KEY' : undefined)
+    const ref = this.apiKeyRef(provider, profile)
     if (!ref)
       throw new Error('Save an API key on the existing provider card first')
     const credential = await this.ctx.credentials.resolve(credentialRef(ref))
@@ -308,12 +420,57 @@ export class GptModels extends Service {
     }
   }
 
-  private async publish(
+  private routeState(provider: string, read: SettingsRead): string {
+    const { profile } = this.profile(provider, read)
+    return JSON.stringify([
+      profile.api,
+      profile.baseURL,
+      profile.apiKeyEnv,
+      this.routeOptions(provider, profile, read),
+    ])
+  }
+
+  private publish(
     provider: string,
     snapshot: SyncSnapshot,
+    ownsRoute: () => boolean,
   ): Promise<void> {
-    if (this.closed) return
-    const { profile } = this.profile(provider)
+    const work = (this.publications.get(provider) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.publishSnapshot(provider, snapshot, ownsRoute))
+    this.publications.set(provider, work)
+    const finished = () => {
+      if (this.publications.get(provider) === work)
+        this.publications.delete(provider)
+    }
+    void work.then(finished, finished)
+    return work
+  }
+
+  private async publishSnapshot(
+    provider: string,
+    snapshot: SyncSnapshot,
+    ownsRoute: () => boolean,
+  ): Promise<void> {
+    const assertOwner = () => {
+      if (this.closed || !ownsRoute()) throw new Error('synchronizer stopped')
+    }
+    assertOwner()
+    const read = this.readSettings()
+    const state = this.routeState(provider, read)
+    const assertCurrent = () => {
+      assertOwner()
+      if (this.routeState(provider, this.readSettings()) !== state)
+        throw new Error('configuration changed during publication')
+    }
+    const config = await this.routeConfig(provider)
+    assertCurrent()
+    if (
+      snapshot.cacheKey !== syncCacheKey(config) ||
+      snapshot.configKey !== syncConfigKey(config)
+    )
+      throw new Error('configuration changed during publication')
+    const { profile } = this.profile(provider, read)
     const existing = profile.models ?? []
     const ids = new Set(existing.map((model) => model.id))
     const added = snapshot.models
@@ -322,24 +479,30 @@ export class GptModels extends Service {
     // Native catalog overrides cannot coexist with an explicit model list.
     // Keep catalog mode intact; discovery still updates the plugin snapshot.
     if (added.length && !Object.keys(profile.modelOverrides ?? {}).length) {
-      await this.ctx.settings.mutate(
+      const models = [...existing, ...added].map((model) =>
+        this.editableModel(provider, model, ids.has(model.id), read),
+      )
+      const settings = this.ctx.settings as unknown as Parameters<
+        typeof installSettingsOverlay
+      >[0]
+      await settings.write!(
         'llm-pi-ai',
-        [
-          {
-            op: 'set',
-            path: ['providers', provider, 'models'],
-            value: [...existing, ...added].map((model) =>
-              this.editableModel(provider, model, ids.has(model.id)),
-            ),
-          },
-        ],
-        this.modelsRevision(),
+        (current: any) => {
+          assertCurrent()
+          current.providers ??= {}
+          current.providers[provider] ??= {}
+          current.providers[provider].models = models
+          return current
+        },
+        this.modelsRevision(read),
+        [['providers', provider, 'models']],
       )
     }
-    if (this.closed) return
-    await this.store.write(`route:${provider}`, snapshot)
-    if (this.closed) return
+    assertCurrent()
+    await this.store.write(`route:${provider}`, snapshot, assertCurrent)
+    assertCurrent()
     this.snapshots.set(provider, snapshot)
+    this.nativeRead = undefined
     this.ctx.emit('llm/models-updated', provider)
   }
 
@@ -357,20 +520,35 @@ export class GptModels extends Service {
 
   @Remote
   status(provider: string) {
-    const snapshot = this.snapshots.get(provider)
+    const read = this.readSettings()
+    const snapshot = read.snapshots.get(provider)
     const capabilities = { ...snapshot?.capabilities }
-    if (this.routeOptions(provider)?.enabled) {
-      for (const model of this.profile(provider).profile.models ?? []) {
+    const profile = this.configuredProfiles(read)[provider]
+    const options = this.routeOptions(provider, profile, read)
+    const contextWindows: Record<string, ContextWindowResolution> = {}
+    if (options?.enabled && profile) {
+      for (const model of profile.models ?? []) {
         const value = this.capability(
           provider,
           model.id,
           model.name as string | undefined,
+          undefined,
+          read,
         )
-        if (value) capabilities[model.id] = value
+        if (value) {
+          capabilities[model.id] = value
+          contextWindows[model.id] = this.contextWindow(
+            provider,
+            model.id,
+            undefined,
+            undefined,
+            read,
+          )
+        }
       }
     }
     return {
-      enabled: this.routeOptions(provider)?.enabled ?? false,
+      enabled: options?.enabled ?? false,
       status: this.runners.get(provider)?.getStatus() ?? { state: 'idle' },
       models:
         snapshot?.models.map((model) => ({
@@ -378,20 +556,9 @@ export class GptModels extends Service {
           stale: model.stale ?? false,
         })) ?? [],
       capabilities,
-      contextWindows: Object.fromEntries(
-        this.routeOptions(provider)?.enabled
-          ? (this.profile(provider).profile.models ?? [])
-              .filter(
-                (model) => this.capability(provider, model.id) !== undefined,
-              )
-              .map((model) => [
-                model.id,
-                this.contextWindow(provider, model.id),
-              ])
-          : [],
-      ),
-      contextRevision: this.modelsRevision(),
-      options: this.routeOptions(provider) ?? {
+      contextWindows,
+      contextRevision: this.modelsRevision(read),
+      options: options ?? {
         enabled: false,
         refreshIntervalMs: 1800000,
         overridesJSON: '{}',
@@ -400,11 +567,19 @@ export class GptModels extends Service {
   }
 
   @Remote
+  modelStatus(provider: string, modelId: string) {
+    const capability = this.capability(provider, modelId)
+    return {
+      enabled: !!capability,
+      serviceTiers: capability?.serviceTiers ?? [],
+    }
+  }
+
+  @Remote
   async configure(provider: string, enabled: boolean): Promise<void> {
-    this.profile(provider)
-    const descriptor = this.ctx.settings
-      .describe()
-      .find((entry) => entry.ns === this.settingsNs)
+    const read = this.readSettings()
+    this.profile(provider, read)
+    const descriptor = read.rows.find((entry) => entry.ns === this.settingsNs)
     if (!descriptor) throw new Error('GPT plugin settings unavailable')
     await this.ctx.settings.mutate(
       this.settingsNs,
@@ -432,7 +607,8 @@ export class GptModels extends Service {
     capabilityCatalogUrl: string,
     overridesJSON: string,
   ): Promise<void> {
-    this.profile(provider)
+    const read = this.readSettings()
+    const { profile } = this.profile(provider, read)
     if (
       !Number.isInteger(refreshIntervalMs) ||
       refreshIntervalMs < 1000 ||
@@ -456,9 +632,7 @@ export class GptModels extends Service {
       )
         throw new Error('上下文窗口必须是正的安全整数')
     }
-    const descriptor = this.ctx.settings
-      .describe()
-      .find((entry) => entry.ns === this.settingsNs)
+    const descriptor = read.rows.find((entry) => entry.ns === this.settingsNs)
     if (!descriptor) throw new Error('GPT plugin settings unavailable')
     await this.ctx.settings.mutate(
       this.settingsNs,
@@ -468,7 +642,8 @@ export class GptModels extends Service {
           path: ['routes', provider],
           value: {
             ...this.options.routes[provider],
-            enabled: this.routeOptions(provider)?.enabled ?? false,
+            enabled:
+              this.routeOptions(provider, profile, read)?.enabled ?? false,
             refreshIntervalMs,
             capabilityCatalogUrl,
             overridesJSON,
@@ -490,29 +665,61 @@ export class GptModels extends Service {
   async removeStale(provider: string): Promise<void> {
     const runner = this.runners.get(provider)
     if (!runner) throw new Error('Enable GPT adaptation first')
+    const snapshot = runner.current()
     const staleIds =
-      runner
-        .current()
-        ?.models.filter((model) => model.stale)
+      snapshot?.models
+        .filter((model) => model.stale)
         .map((model) => model.id) ?? []
-    const { profile } = this.profile(provider)
+    if (!staleIds.length) return
+    const read = this.readSettings()
+    const state = this.routeState(provider, read)
+    const assertCurrent = () => {
+      if (
+        this.closed ||
+        this.runners.get(provider) !== runner ||
+        runner.getStatus().state === 'stopped'
+      )
+        throw new Error('synchronizer stopped')
+      if (this.routeState(provider, this.readSettings()) !== state)
+        throw new Error('configuration changed during cleanup')
+      const stale = new Set(
+        this.snapshots
+          .get(provider)
+          ?.models.filter((model) => model.stale)
+          .map((model) => model.id),
+      )
+      if (staleIds.some((id) => !stale.has(id)))
+        throw new Error('model list changed during cleanup')
+    }
+    const config = await this.routeConfig(provider)
+    assertCurrent()
+    if (snapshot?.configKey !== syncConfigKey(config))
+      throw new Error('configuration changed during cleanup; refresh first')
+    const { profile } = this.profile(provider, read)
     const nextModels = profile.models?.filter(
       (model) => !staleIds.includes(model.id),
     )
-    if (nextModels)
-      await this.ctx.settings.mutate(
-        'llm-pi-ai',
-        [
-          {
-            op: 'set',
-            path: ['providers', provider, 'models'],
-            value: nextModels.map((model) =>
-              this.editableModel(provider, model),
-            ),
-          },
-        ],
-        this.modelsRevision(),
+    if (nextModels) {
+      const models = nextModels.map((model) =>
+        this.editableModel(provider, model, true, read),
       )
+      const settings = this.ctx.settings as unknown as Parameters<
+        typeof installSettingsOverlay
+      >[0]
+      await settings.write!(
+        'llm-pi-ai',
+        (current: any) => {
+          assertCurrent()
+          current.providers ??= {}
+          current.providers[provider] ??= {}
+          current.providers[provider].models = models
+          return current
+        },
+        this.modelsRevision(read),
+        [['providers', provider, 'models']],
+      )
+    }
+    assertCurrent()
     await runner.removeStale(staleIds)
   }
 
@@ -521,11 +728,18 @@ export class GptModels extends Service {
     provider: string,
     model: Record<string, any>,
     existing = true,
+    read = this.readSettings(),
   ) {
-    const capability = this.capability(provider, model.id, model.name)
+    const capability = this.capability(
+      provider,
+      model.id,
+      model.name,
+      undefined,
+      read,
+    )
     if (!capability) return model
     const tokens = existing
-      ? this.editableContextWindow(provider, model)
+      ? this.editableContextWindow(provider, model, read)
       : model.contextWindow
     return projectModel(
       provider,
@@ -536,8 +750,18 @@ export class GptModels extends Service {
     )
   }
 
-  editableContextWindow(provider: string, model: Record<string, any>) {
-    const context = this.contextWindow(provider, model.id)
+  editableContextWindow(
+    provider: string,
+    model: Record<string, any>,
+    read = this.readSettings(),
+  ) {
+    const context = this.contextWindow(
+      provider,
+      model.id,
+      undefined,
+      undefined,
+      read,
+    )
     return context.source === 'legacy-override'
       ? context.effectiveTokens
       : model.contextWindow
@@ -553,20 +777,26 @@ export class GptModels extends Service {
       models?: Array<{ id: string; [key: string]: unknown }>
       modelOverrides?: Record<string, Record<string, unknown>>
     },
+    read = this.readSettings(),
   ): ContextWindowResolution {
-    const { descriptor, profile: storedProfile } = this.profile(provider)
+    const { descriptor, profile: storedProfile } = this.profile(provider, read)
     const inherited = (descriptor.base as any)?.providers?.[provider]
     const profile = profileOverride
       ? { ...inherited, ...profileOverride }
       : storedProfile
-    const overrides = JSON.parse(
-      this.routeOptions(provider, profile)?.overridesJSON ?? '{}',
-    )
+    const overrides = this.modelOverrides(read, provider, profile)
     const row = profile.models?.length
-      ? profile.models.find((model: { id: string }) => model.id === modelId)
+      ? this.modelIndex(read, profile).get(modelId)
       : profile.modelOverrides?.[modelId]
-    const snapshot = this.snapshots.get(provider)
-    const raw = snapshot?.models.find((model) => model.id === modelId)
+    const snapshot = read.snapshots.get(provider)
+    let upstream = read.upstream.get(provider)
+    if (!upstream) {
+      upstream = new Map(
+        snapshot?.models.map((model) => [model.id, model]) ?? [],
+      )
+      read.upstream.set(provider, upstream)
+    }
+    const raw = upstream.get(modelId)
     const userProfile =
       profileOverride ?? (descriptor.user as any)?.providers?.[provider]
     // Drafts replace the user layer; absent fields fall back to the inherited
@@ -577,9 +807,7 @@ export class GptModels extends Service {
       (descriptor.base === undefined && descriptor.user === undefined)
         ? profile.defaultContextWindow
         : undefined)
-    const catalogModel = getBuiltinModels(provider as never).find(
-      (model) => model.id === modelId,
-    )
+    const catalogModel = this.builtinModel(read, provider, modelId)
     return resolveContextWindow({
       modelId,
       legacy: overrides[modelId]?.contextWindow,
@@ -599,51 +827,69 @@ export class GptModels extends Service {
     provider: string,
     model: Record<string, any>,
     profile: Record<string, any>,
+    read = this.readSettings(),
   ): void {
     const effective =
       model.contextWindow ??
-      this.contextWindow(provider, model.id, undefined, profile).defaultTokens
-    const compaction = this.nativeDescribe().find(
+      this.contextWindow(provider, model.id, undefined, profile, read)
+        .defaultTokens
+    const compaction = read.rows.find(
       (entry) => entry.ns === 'compaction-basic',
     )?.value as any
     const policy = compaction?.modelPolicies?.find(
       (entry: any) => entry.provider === provider && entry.model === model.id,
     )
     const headroom = policy?.headroomTokens ?? compaction?.headroomTokens ?? 0
-    const inherited = (
-      this.nativeDescribe().find((entry) => entry.ns === 'llm-pi-ai')
-        ?.base as any
-    )?.providers?.[provider]
-    const defaults = NativeConfig({
-      providers: {
-        [provider]: {
-          defaultMaxTokens:
-            profile.defaultMaxTokens ?? inherited?.defaultMaxTokens,
+    const inherited = (read.descriptor?.base as any)?.providers?.[provider]
+    let defaultMaxTokens = read.outputDefaults.get(profile)
+    if (defaultMaxTokens === undefined) {
+      defaultMaxTokens = NativeConfig({
+        providers: {
+          [provider]: {
+            defaultMaxTokens:
+              profile.defaultMaxTokens ?? inherited?.defaultMaxTokens,
+          },
         },
-      },
-    }).providers.get()[provider]!
+      }).providers.get()[provider]!.defaultMaxTokens
+      read.outputDefaults.set(profile, defaultMaxTokens)
+    }
     // Match native catalog resolution: explicit model, catalog, provider default.
     const output =
       model.maxTokens ??
-      getBuiltinModels(provider as never).find((entry) => entry.id === model.id)
-        ?.maxTokens ??
-      defaults.defaultMaxTokens
+      this.builtinModel(read, provider, model.id)?.maxTokens ??
+      defaultMaxTokens
     if (effective <= output + headroom)
       throw new Error('上下文窗口必须大于当前最大输出和压缩预留的总和')
   }
 
-  contextWriteRevision(): number | undefined {
-    return this.nativeDescribe().find((row) => row.ns === this.settingsNs)
-      ?.revision
+  contextWriteRevision(read = this.readSettings()): number | undefined {
+    return read.rows.find((row) => row.ns === this.settingsNs)?.revision
   }
 
   /** Public form revisions also cover changes to projected model capacities. */
-  private modelsRevision(): number {
-    const descriptor = this.ctx.settings
-      .describe()
-      .find((row) => row.ns === 'llm-pi-ai')
+  private modelsRevision(read = this.readSettings()): number {
+    if (this.modelRevision) return this.modelRevision(read.rows)
+    const descriptor = read.descriptor
     if (!descriptor) throw new Error('模型设置暂不可用')
     return descriptor.revision
+  }
+
+  settingsResolution(rows: any[]): SettingsResolution {
+    const read = this.readSettings(rows)
+    return {
+      resolve: (provider, model, profile) =>
+        typeof model.id === 'string'
+          ? this.capability(provider, model.id, model.name, profile, read)
+          : undefined,
+      writes: {
+        editableContext: (provider, model) =>
+          this.editableContextWindow(provider, model, read),
+        validate: (provider, model, profile) =>
+          this.validateContextWindow(provider, model, profile, read),
+        revision: () => this.contextWriteRevision(read),
+        saved: (edits, expected) => this.clearLegacyContext(edits, expected),
+      },
+    }
   }
 
   /** Remove only legacy context fields after the matching native save commits. */
@@ -686,8 +932,9 @@ export class GptModels extends Service {
     expectedRevision?: number,
   ): Promise<void> {
     const tokens = contextWindowTokens(mode, customTokens)
-    const { profile } = this.profile(provider)
-    if (!this.capability(provider, modelId))
+    const read = this.readSettings()
+    const { profile } = this.profile(provider, read)
+    if (!this.capability(provider, modelId, undefined, undefined, read))
       throw new Error('请先启用该 GPT 模型的自动适配')
     const index =
       profile.models?.findIndex((model) => model.id === modelId) ?? -1
@@ -697,7 +944,7 @@ export class GptModels extends Service {
       provider,
       modelId,
       tokens,
-      expectedRevision ?? this.modelsRevision(),
+      expectedRevision ?? this.modelsRevision(read),
     )
     this.ctx.emit('llm/models-updated', provider)
   }
@@ -717,7 +964,7 @@ export class GptModels extends Service {
       const next = new Map(this.speeds)
       next.set(key, tier)
       await this.store.write('speeds', Object.fromEntries(next))
-      this.speeds.set(key, tier)
+      this.speeds = next
     })
     this.speedWrites = write.catch(() => undefined)
     await write
@@ -743,10 +990,12 @@ export class GptModels extends Service {
     modelId: string,
     displayName?: string,
     profileOverride?: { api?: string; reasoning?: string },
+    read?: SettingsRead,
   ): ModelCapabilities | undefined {
     if (!isGptModel({ id: modelId })) return undefined
-    const profile = profileOverride ?? this.profile(provider).profile
-    const options = this.routeOptions(provider, profile)
+    read ??= this.readSettings()
+    const profile = profileOverride ?? this.profile(provider, read).profile
+    const options = this.routeOptions(provider, profile, read)
     if (!options?.enabled) return undefined
     if (
       !['openai-responses', 'openai-completions'].includes(
@@ -754,17 +1003,14 @@ export class GptModels extends Service {
       )
     )
       return undefined
-    const overrides = JSON.parse(options.overridesJSON) as Record<
-      string,
-      ModelOverride
-    >
+    const overrides = this.modelOverrides(read, provider, profile)
     const override = {
       ...(GPT_REASONING_LEVELS.some((level) => level === profile.reasoning)
         ? { defaultReasoningId: profile.reasoning! }
         : {}),
       ...overrides[modelId],
     }
-    const current = this.snapshots.get(provider)?.capabilities[modelId]
+    const current = read.snapshots.get(provider)?.capabilities[modelId]
     const result = current
       ? mergeCapabilities(current, override, current.capabilityRevision)
       : resolveCapabilities(
@@ -774,7 +1020,13 @@ export class GptModels extends Service {
         )
     return {
       ...result,
-      contextWindow: this.contextWindow(provider, modelId).effectiveTokens,
+      contextWindow: this.contextWindow(
+        provider,
+        modelId,
+        undefined,
+        undefined,
+        read,
+      ).effectiveTokens,
     }
   }
 
@@ -783,14 +1035,29 @@ export class GptModels extends Service {
     provider: string,
     modelId: string,
     base: BaseModelInfo,
+    nativeSnapshot?: object,
   ): NativeExtension | undefined {
-    const current = this.capability(provider, modelId, base.name)
+    if (!isGptModel({ id: modelId })) return undefined
+    let read: SettingsRead
+    if (nativeSnapshot && this.nativeRead?.snapshot === nativeSnapshot) {
+      read = this.nativeRead.read
+    } else {
+      read = this.readSettings()
+      if (nativeSnapshot) this.nativeRead = { snapshot: nativeSnapshot, read }
+    }
+    const current = this.capability(
+      provider,
+      modelId,
+      base.name,
+      undefined,
+      read,
+    )
     if (!current) return undefined
     // The plugin preset also covers configured GPT models missing from the upstream list.
     const preserveReasoning = current.reasoning.status === 'unknown'
     const capabilities: ModelCapabilities = structuredClone(current)
-    const speeds = new Map(this.speeds)
-    const { profile } = this.profile(provider)
+    const speeds = this.speeds
+    const { profile } = this.profile(provider, read)
     const protocol = (profile.api ?? 'openai-responses') as GptProtocol
     const model = {
       ...base,
@@ -801,6 +1068,8 @@ export class GptModels extends Service {
           modelId,
           (base.context as { contextWindow?: number } | undefined)
             ?.contextWindow,
+          undefined,
+          read,
         ).effectiveTokens,
       },
       name:
@@ -838,7 +1107,15 @@ export class GptModels extends Service {
               : {}),
           ...(speeds.has(key) ? { serviceTier: speeds.get(key)! } : {}),
         })
-        this.results.set(key, { requested: payload.service_tier ?? 'default' })
+        const result: { requested: string; actual?: string } = {
+          requested: String(payload.service_tier ?? 'default'),
+        }
+        if (!this.closed) {
+          this.results.delete(key)
+          this.results.set(key, result)
+          if (this.results.size > 512)
+            this.results.delete(this.results.keys().next().value!)
+        }
         return {
           payload,
           observe: (event: unknown) => {
@@ -849,11 +1126,12 @@ export class GptModels extends Service {
                   service_tier?: string
                 } | null
               )?.response ?? (event as { service_tier?: string } | null)
-            if (typeof response?.service_tier === 'string')
-              this.results.set(key, {
-                requested: payload.service_tier ?? 'default',
-                actual: response.service_tier,
-              })
+            if (
+              !this.closed &&
+              this.results.get(key) === result &&
+              typeof response?.service_tier === 'string'
+            )
+              result.actual = response.service_tier
           },
         }
       },
@@ -897,7 +1175,8 @@ export async function apply(
       PiAiAdapter.prototype as unknown as Parameters<
         typeof installNativeAdapterBridge
       >[0],
-      (provider, model, base) => service.capture(provider, model, base),
+      (provider, model, base, snapshot) =>
+        service.capture(provider, model, base, snapshot),
     ),
   )
   ctx.effect(() => {
@@ -916,10 +1195,13 @@ export async function apply(
         revision: () => service.contextWriteRevision(),
         saved: (edits, revision) => service.clearLegacyContext(edits, revision),
       },
+      (rows) => service.settingsResolution(rows),
     )
     service.contextWriter = dispose.setContextWindow
+    service.modelRevision = dispose.modelRevision
     return () => {
       service.contextWriter = undefined
+      service.modelRevision = undefined
       dispose()
       for (const provider of providers) ctx.emit('llm/models-updated', provider)
     }

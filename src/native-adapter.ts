@@ -29,6 +29,7 @@ export function installNativeAdapterBridge(
     provider: string,
     model: string,
     base: any,
+    snapshot: Snapshot,
   ) => NativeExtension | undefined,
 ): () => void {
   const original = {
@@ -150,12 +151,12 @@ export function installNativeAdapterBridge(
     model: string,
   ) {
     const base = original.modelInfo.call(this, snapshot, provider, model)
-    return capture(provider, model, base)?.model ?? base
+    return capture(provider, model, base, snapshot)?.model ?? base
   }
   function prepareCall(this: NativeAdapter, provider: string, model: string) {
     const snapshot = this.current()
     const base = original.modelInfo.call(this, snapshot, provider, model)
-    const extension = capture(provider, model, base)
+    const extension = capture(provider, model, base, snapshot)
     return Promise.resolve({
       model: extension?.model ?? base,
       stream: (options: any) =>
@@ -174,7 +175,7 @@ export function installNativeAdapterBridge(
       this,
       options,
       snapshot,
-      capture(options.provider, options.model, base),
+      capture(options.provider, options.model, base, snapshot),
       base,
     )
   }

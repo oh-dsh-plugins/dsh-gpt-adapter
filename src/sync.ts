@@ -355,7 +355,7 @@ function revisionFor(
   return `catalog:${createHash('sha256').update(value).digest('hex')}`
 }
 
-function cacheKey(
+export function syncCacheKey(
   config: Pick<SyncConfig, 'baseUrl' | 'cacheIdentity' | 'apiKey' | 'protocol'>,
 ): string {
   return createHash('sha256')
@@ -366,6 +366,21 @@ function cacheKey(
         config.protocol ?? 'openai-responses',
         config.apiKey,
       ]),
+    )
+    .digest('hex')
+}
+
+/** Bind publication to input settings without narrowing upstream cache reuse. */
+export function syncConfigKey(config: SyncConfig): string {
+  return createHash('sha256')
+    .update(
+      stableJson({
+        cacheKey: syncCacheKey(config),
+        refreshIntervalMs: config.refreshIntervalMs,
+        capabilityCatalogUrl: config.capabilityCatalogUrl ?? null,
+        overrides: config.overrides ?? {},
+        catalog: config.catalog ?? null,
+      }),
     )
     .digest('hex')
 }
@@ -443,13 +458,45 @@ export function buildSnapshot(
   }
 }
 
+/** Rebuild derived capabilities from raw metadata and the current local config. */
+export function restoreSnapshot(
+  config: SyncConfig,
+  cached: SyncSnapshot,
+): SyncSnapshot | undefined {
+  if (cached.cacheKey !== syncCacheKey(config)) return undefined
+  const catalog =
+    config.catalog ??
+    (config.capabilityCatalogUrl &&
+    config.capabilityCatalogUrl === cached.capabilityCatalogUrl
+      ? cached.catalog
+      : undefined)
+  const effectiveConfig = { ...config, ...(catalog ? { catalog } : {}) }
+  const next = buildSnapshot(
+    cached.models,
+    effectiveConfig,
+    revisionFor(cached.models, effectiveConfig),
+    cached,
+    cached.cacheKey,
+  )
+  next.source = 'cache'
+  next.configKey = syncConfigKey(config)
+  next.fetchedAt = cached.fetchedAt
+  if (cached.etag !== undefined) next.etag = cached.etag
+  if (cached.upstreamModels !== undefined)
+    next.upstreamModels = cached.upstreamModels
+  if (catalog && !config.catalog && config.capabilityCatalogUrl)
+    next.capabilityCatalogUrl = config.capabilityCatalogUrl
+  return next
+}
+
 export async function synchronize(
   config: SyncConfig,
   previous: SyncSnapshot | undefined,
   fetchImpl: FetchLike = fetch,
   signal?: AbortSignal,
 ): Promise<SyncResult> {
-  const currentCacheKey = cacheKey(config)
+  const currentCacheKey = syncCacheKey(config)
+  const currentConfigKey = syncConfigKey(config)
   const reusable = previous?.cacheKey === currentCacheKey ? previous : undefined
   const result = await fetchModels(config, fetchImpl, signal, reusable?.etag)
   const catalog =
@@ -477,6 +524,9 @@ export async function synchronize(
     )
     if (reusable.etag !== undefined) next.etag = reusable.etag
     next.upstreamModels = upstreamModels
+    next.configKey = currentConfigKey
+    if (!config.catalog && config.capabilityCatalogUrl)
+      next.capabilityCatalogUrl = config.capabilityCatalogUrl
     return {
       snapshot: { ...next, source: 'cache' },
       changed: !modelsEqual(reusable, next),
@@ -491,7 +541,10 @@ export async function synchronize(
     currentCacheKey,
   )
   next.upstreamModels = result.models
+  next.configKey = currentConfigKey
   if (result.etag !== undefined) next.etag = result.etag
+  if (!config.catalog && config.capabilityCatalogUrl)
+    next.capabilityCatalogUrl = config.capabilityCatalogUrl
   return { snapshot: next, changed: !modelsEqual(reusable, next) }
 }
 

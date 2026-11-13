@@ -24,12 +24,17 @@ export type ContextWindowEdit = {
   provider: string
   modelId: string
   previousTokens: number | undefined
+  appliedTokens: number | undefined
 }
 type ContextWrites = {
   editableContext?(provider: string, model: JsonObject): number | undefined
   validate?(provider: string, model: JsonObject, profile: JsonObject): void
   revision(): number | undefined
   saved(edits: ContextWindowEdit[], revision: number | undefined): Promise<void>
+}
+export type SettingsResolution = {
+  resolve: CapabilityResolver
+  writes?: ContextWrites
 }
 export type ContextWindowWriter = (
   provider: string,
@@ -193,6 +198,7 @@ function nativeWrite(
               provider,
               modelId: model.id,
               previousTokens: original?.contextWindow,
+              appliedTokens: model.contextWindow,
             })
           }
           if (budgetChanged)
@@ -225,29 +231,82 @@ export function installSettingsOverlay(
   settings: SettingsLike,
   resolve: CapabilityResolver,
   contextWrites?: ContextWrites,
+  prepare?: (rows: any[]) => SettingsResolution,
 ) {
   // Cordis returns a fresh tracing proxy on service access. Patch the actual
   // service so every caller sees the view, and disposal can compare identities.
   settings = (settings as any)[symbols.original] ?? settings
   const originalDescribe = settings.describe
   const originalWrite = settings.write
+  let pendingWrite: Promise<unknown> = Promise.resolve()
+  function serialize<T>(action: () => Promise<T>): Promise<T> {
+    const work = pendingWrite.then(action)
+    pendingWrite = work.catch(() => undefined)
+    return work
+  }
   // Editable drafts contain manual values only; automatic capacities belong in
   // the effective view. Otherwise typing the current automatic value is lost.
-  const editableResolve: CapabilityResolver = (provider, model, profile) => {
-    const capability = resolve(provider, model, profile)
-    if (!capability) return undefined
-    const manual = contextWrites?.editableContext
-      ? contextWrites.editableContext(provider, model)
-      : model.contextWindow
-    const projected = { ...capability }
-    if (manual === undefined) delete projected.contextWindow
-    else projected.contextWindow = manual
-    return projected
+  function operation(rows?: any[]) {
+    const scope = prepare?.(rows ?? originalDescribe.call(settings)) ?? {
+      resolve,
+      writes: contextWrites,
+    }
+    const editableResolve: CapabilityResolver = (provider, model, profile) => {
+      const capability = scope.resolve(provider, model, profile)
+      if (!capability) return undefined
+      const manual = scope.writes?.editableContext
+        ? scope.writes.editableContext(provider, model)
+        : model.contextWindow
+      const projected = { ...capability }
+      if (manual === undefined) delete projected.contextWindow
+      else projected.contextWindow = manual
+      return projected
+    }
+    return { ...scope, editableResolve }
   }
   let viewRevision:
     { native: number; contexts: string; revision: number } | undefined
+  function revision(row: any, value: any) {
+    // The native revision tracks stored config only. A model-list form also
+    // carries derived capacities; reject its stale draft if those change.
+    const contexts = JSON.stringify(
+      Object.entries(value?.providers ?? {}).map(([provider, profile]) => [
+        provider,
+        (profile as JsonObject).models?.map((model: JsonObject) => [
+          model.id,
+          model.contextWindow,
+        ]),
+      ]),
+    )
+    if (typeof row.revision === 'number') {
+      if (!viewRevision)
+        viewRevision = {
+          native: row.revision,
+          contexts,
+          revision: row.revision,
+        }
+      else if (
+        viewRevision.native !== row.revision ||
+        viewRevision.contexts !== contexts
+      )
+        viewRevision = {
+          native: row.revision,
+          contexts,
+          revision: Math.max(row.revision, viewRevision.revision + 1),
+        }
+    }
+    return viewRevision?.revision
+  }
+  function modelRevision(rows: any[]) {
+    const row = rows.find((entry) => entry.ns === 'llm-pi-ai')
+    if (!row) throw new Error('模型设置暂不可用')
+    const scope = operation(rows)
+    return revision(row, projectConfiguration(row.value, scope.resolve))!
+  }
   function describe(this: SettingsLike, options?: any) {
-    return originalDescribe.call(this, options).map((row) => {
+    const rows = originalDescribe.call(this, options)
+    const { resolve: resolveModel, editableResolve } = operation(rows)
+    return rows.map((row) => {
       if (row.ns !== 'llm-pi-ai') return row
       let managed = false
       let other = false
@@ -255,39 +314,13 @@ export function installSettingsOverlay(
         row.value?.providers ?? {},
       ))
         for (const model of (profile as JsonObject).models ?? [])
-          if (resolve(provider, model, profile as JsonObject)) managed = true
+          if (resolveModel(provider, model, profile as JsonObject))
+            managed = true
           else other = true
       const value = managed
-        ? projectConfiguration(row.value, resolve)
+        ? projectConfiguration(row.value, resolveModel)
         : row.value
-      // The native revision tracks stored config only. A model-list form also
-      // carries derived capacities; reject its stale draft if those change.
-      const contexts = JSON.stringify(
-        Object.entries(value?.providers ?? {}).map(([provider, profile]) => [
-          provider,
-          (profile as JsonObject).models?.map((model: JsonObject) => [
-            model.id,
-            model.contextWindow,
-          ]),
-        ]),
-      )
-      if (typeof row.revision === 'number') {
-        if (!viewRevision)
-          viewRevision = {
-            native: row.revision,
-            contexts,
-            revision: row.revision,
-          }
-        else if (
-          viewRevision.native !== row.revision ||
-          viewRevision.contexts !== contexts
-        )
-          viewRevision = {
-            native: row.revision,
-            contexts,
-            revision: Math.max(row.revision, viewRevision.revision + 1),
-          }
-      }
+      const projectedRevision = revision(row, value)
       return {
         ...row,
         ...(managed
@@ -299,7 +332,7 @@ export function installSettingsOverlay(
             }
           : {}),
         ...(typeof row.revision === 'number'
-          ? { revision: viewRevision!.revision }
+          ? { revision: projectedRevision }
           : {}),
       }
     })
@@ -311,30 +344,55 @@ export function installSettingsOverlay(
     expected?: number,
     paths?: string[][],
   ) {
+    if (ns !== 'llm-pi-ai')
+      return originalWrite!.call(this, ns, change, expected, paths)
+    return serialize(() => writeModels.call(this, ns, change, expected, paths))
+  }
+  async function writeModels(
+    this: SettingsLike,
+    ns: string,
+    change: (current: any, base: any, schema: any) => any,
+    expected?: number,
+    paths?: string[][],
+  ) {
     const edits: ContextWindowEdit[] = []
-    const legacyRevision = contextWrites?.revision()
+    let writes: ContextWrites | undefined
+    let legacyRevision: number | undefined
     await originalWrite!.call(
       this,
       ns,
-      ns !== 'llm-pi-ai'
-        ? change
-        : (current, base, schema) =>
-            nativeWrite(
-              change(
-                projectConfiguration(structuredClone(current), editableResolve),
-                projectConfiguration(structuredClone(base), editableResolve),
-                schema,
-              ),
-              current,
-              base,
-              editableResolve,
-              edits,
-              contextWrites,
+      (current, base, schema) => {
+        // The native writer acquires its lock before invoking this callback.
+        const scope = operation()
+        writes = scope.writes
+        legacyRevision = writes?.revision()
+        return nativeWrite(
+          change(
+            projectConfiguration(
+              structuredClone(current),
+              scope.editableResolve,
             ),
+            projectConfiguration(structuredClone(base), scope.editableResolve),
+            schema,
+          ),
+          current,
+          base,
+          scope.editableResolve,
+          edits,
+          writes,
+        )
+      },
       expected,
       paths,
     )
-    await finishContextWrite.call(this, ns, edits, legacyRevision, paths)
+    await finishContextWrite.call(
+      this,
+      ns,
+      edits,
+      legacyRevision,
+      paths,
+      writes,
+    )
   }
   async function finishContextWrite(
     this: SettingsLike,
@@ -342,13 +400,14 @@ export function installSettingsOverlay(
     edits: ContextWindowEdit[],
     legacyRevision: number | undefined,
     paths?: string[][],
+    writes = contextWrites,
   ) {
-    if (ns !== 'llm-pi-ai' || !edits.length || !contextWrites) return
+    if (ns !== 'llm-pi-ai' || !edits.length || !writes) return
     const committedRevision = describe
       .call(this)
       .find((row) => row.ns === ns)?.revision
     try {
-      await contextWrites.saved(edits, legacyRevision)
+      await writes.saved(edits, legacyRevision)
     } catch (error) {
       // Only compensate these context edits, never replace concurrent settings.
       try {
@@ -356,6 +415,15 @@ export function installSettingsOverlay(
           this,
           ns,
           (current) => {
+            // A profile reload can bypass this overlay's write queue.
+            // Never compensate a field another writer has since replaced.
+            for (const edit of edits) {
+              const row = current.providers?.[edit.provider]?.models?.find(
+                (model: any) => model.id === edit.modelId,
+              )
+              if (!row || row.contextWindow !== edit.appliedTokens)
+                throw new Error('上下文已被其他保存修改，未执行恢复')
+            }
             const restored = structuredClone(current)
             for (const edit of edits) {
               const row = restored.providers?.[edit.provider]?.models?.find(
@@ -386,7 +454,13 @@ export function installSettingsOverlay(
     if (originalWrite && settings.write === write)
       settings.write = originalWrite
   }
-  const setContextWindow: ContextWindowWriter = async (
+  const setContextWindow: ContextWindowWriter = (
+    provider,
+    modelId,
+    tokens,
+    expected,
+  ) => serialize(() => writeContextWindow(provider, modelId, tokens, expected))
+  const writeContextWindow: ContextWindowWriter = async (
     provider,
     modelId,
     tokens,
@@ -396,21 +470,30 @@ export function installSettingsOverlay(
     if (tokens !== undefined && !validContextWindow(tokens))
       throw new Error('上下文窗口必须是正的安全整数')
     const edits: ContextWindowEdit[] = []
-    const legacyRevision = contextWrites?.revision()
+    let writes: ContextWrites | undefined
+    let legacyRevision: number | undefined
     const paths = [['providers', provider, 'models']]
     await originalWrite.call(
       settings,
       'llm-pi-ai',
       (current) => {
+        const scope = operation()
+        writes = scope.writes
+        legacyRevision = writes?.revision()
         const next = structuredClone(current)
         const model = next.providers?.[provider]?.models?.find(
           (row: any) => row.id === modelId,
         )
         if (!model) throw new Error('模型已变更，请刷新后重试')
-        edits.push({ provider, modelId, previousTokens: model.contextWindow })
+        edits.push({
+          provider,
+          modelId,
+          previousTokens: model.contextWindow,
+          appliedTokens: tokens,
+        })
         if (tokens === undefined) delete model.contextWindow
         else model.contextWindow = tokens
-        contextWrites?.validate?.(provider, model, next.providers[provider])
+        writes?.validate?.(provider, model, next.providers[provider])
         return next
       },
       expected,
@@ -422,7 +505,8 @@ export function installSettingsOverlay(
       edits,
       legacyRevision,
       paths,
+      writes,
     )
   }
-  return Object.assign(dispose, { setContextWindow })
+  return Object.assign(dispose, { setContextWindow, modelRevision })
 }

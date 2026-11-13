@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { buildSnapshot, synchronize, type FetchLike } from '../src/sync.js'
+import {
+  buildSnapshot,
+  restoreSnapshot,
+  synchronize,
+  type FetchLike,
+} from '../src/sync.js'
 
 function response(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -76,6 +81,103 @@ describe('upstream model synchronization', () => {
       'GPT Custom',
     )
   })
+
+  it('restores raw metadata and current overrides without changing cache age or stale state', async () => {
+    const config = {
+      baseUrl: 'https://gateway.invalid/v1',
+      apiKey: 'key',
+      cacheIdentity: 'route',
+      refreshIntervalMs: 1000,
+    }
+    const { snapshot: previous } = await synchronize(
+      config,
+      undefined,
+      async () =>
+        response(
+          { data: [{ id: 'gpt-custom', context_window: 321000 }] },
+          { headers: { etag: 'v1' } },
+        ),
+    )
+    previous.fetchedAt = '2026-01-01T00:00:00.000Z'
+    previous.models[0]!.stale = true
+    const restored = restoreSnapshot(
+      {
+        ...config,
+        overrides: { 'gpt-custom': { displayName: 'Current name' } },
+      },
+      previous,
+    )!
+    expect(restored).toMatchObject({
+      models: previous.models,
+      upstreamModels: previous.upstreamModels,
+      fetchedAt: previous.fetchedAt,
+      etag: 'v1',
+      source: 'cache',
+      cacheKey: previous.cacheKey,
+    })
+    expect(restored.capabilities['gpt-custom']).toMatchObject({
+      displayName: 'Current name',
+      contextWindow: 321000,
+    })
+    expect(previous.capabilities['gpt-custom']!.displayName).toBe('gpt-custom')
+    expect(
+      restoreSnapshot({ ...config, apiKey: 'another-key' }, previous),
+    ).toBeUndefined()
+  })
+
+  it.each(['same', 'changed', 'removed', 'legacy'] as const)(
+    'only restores a cached external catalog from the current source (%s)',
+    async (mode) => {
+      const config = {
+        baseUrl: 'https://gateway.invalid/v1',
+        apiKey: 'key',
+        cacheIdentity: 'route',
+        refreshIntervalMs: 1000,
+        capabilityCatalogUrl: 'https://catalog.invalid/old.json',
+      }
+      const { snapshot: previous } = await synchronize(
+        config,
+        undefined,
+        async (url) =>
+          response(
+            url.endsWith('/models')
+              ? { data: [{ id: 'gpt-custom' }] }
+              : {
+                  version: 'v1',
+                  models: { 'gpt-custom': { context_window: 321000 } },
+                },
+          ),
+      )
+      expect(previous.capabilityCatalogUrl).toBe(config.capabilityCatalogUrl)
+      if (mode === 'legacy') delete previous.capabilityCatalogUrl
+      const { capabilityCatalogUrl: _url, ...connection } = config
+      const restored = restoreSnapshot(
+        {
+          ...connection,
+          ...(mode === 'removed'
+            ? {}
+            : {
+                capabilityCatalogUrl:
+                  mode === 'changed'
+                    ? 'https://catalog.invalid/new.json'
+                    : config.capabilityCatalogUrl,
+              }),
+        },
+        previous,
+      )!
+      if (mode === 'same') {
+        expect(restored.catalog).toEqual(previous.catalog)
+        expect(restored.capabilityCatalogUrl).toBe(config.capabilityCatalogUrl)
+        expect(restored.capabilities['gpt-custom']!.contextWindow).toBe(321000)
+      } else {
+        expect(restored.catalog).toBeUndefined()
+        expect(restored.capabilityCatalogUrl).toBeUndefined()
+        expect(restored.capabilities['gpt-custom']!.contextWindow).not.toBe(
+          321000,
+        )
+      }
+    },
+  )
 
   it('upgrades a cached Standard-only preset even when the model list returns 304', async () => {
     const config = {

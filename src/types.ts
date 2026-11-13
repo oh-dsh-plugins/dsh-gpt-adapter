@@ -93,8 +93,12 @@ export type SyncSnapshot = {
   fetchedAt: string
   source: 'network' | 'cache'
   cacheKey: string
+  /** Fingerprint of the input settings used to generate this snapshot. */
+  configKey?: string
   etag?: string
   catalog?: CapabilityCatalog
+  /** Source URL of a fetched catalog; absent for inline or legacy catalogs. */
+  capabilityCatalogUrl?: string
 }
 
 export type RequestSelection = {
