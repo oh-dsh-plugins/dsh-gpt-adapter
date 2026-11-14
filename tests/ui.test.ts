@@ -468,8 +468,8 @@ describe('built client contributions', () => {
       require.resolve('@deepseek-ai/dsh-client-ui-settings-models/client'),
       'utf8',
     ).replace(
-      'exports.apply = apply;',
-      'exports.ModelListEditor = ModelListEditor; exports.apply = apply;',
+      'exports.apply',
+      'exports.ModelListEditor = ModelListEditor; exports.apply',
     )
     new Function(source)()
     let automatic = 800000
@@ -715,8 +715,8 @@ describe('built client contributions', () => {
       require.resolve('@deepseek-ai/dsh-client-ui-settings-models/client'),
       'utf8',
     ).replace(
-      'exports.apply = apply;',
-      'exports.ModelReasoningEfforts = ModelReasoningEfforts; exports.apply = apply;',
+      'exports.apply',
+      'exports.ModelReasoningEfforts = ModelReasoningEfforts; exports.apply',
     )
     new Function(source)()
     const container = document.createElement('div')

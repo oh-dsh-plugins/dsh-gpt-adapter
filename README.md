@@ -20,12 +20,12 @@ Reasoning levels, speed tiers, and context limits depend on the configured model
 
 ## Installation
 
-Requires Node.js `>=24.9.0` and DSH `0.2.2-rc.1` with Cordis `4.1.0`.
+Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`, or `0.2.2-rc.3`.
 
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.8
+dsh plugin --profile web add dsh-gpt-adapter@0.2.9
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -38,7 +38,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.8.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.9.tgz
 ```
 
 ## Using GPT models

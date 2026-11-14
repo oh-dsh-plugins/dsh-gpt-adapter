@@ -1,21 +1,8 @@
 import React from 'react'
 import type { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
-import {
-  NativeModelsSection,
-  expectedModelsSectionSource,
-} from 'dsh-gpt-adapter/native-context-settings'
+import { nativeModelsRuntimes } from 'dsh-gpt-adapter/native-context-settings'
 import { ContextWindowPresetScope } from './context-window-preset.js'
-
-function ModelsWithContextPresets(props: Record<string, unknown>) {
-  return (
-    <ContextWindowPresetScope.Provider
-      value={props.gptContextPresetControls === true}
-    >
-      <NativeModelsSection {...props} />
-    </ContextWindowPresetScope.Provider>
-  )
-}
 
 /** Keep the native entry, controller, stores, child slots, and save operations. */
 export function installNativeContextPresets(
@@ -25,14 +12,15 @@ export function installNativeContextPresets(
     | {
         entry: StoredEntry
         original: unknown
+        component: React.ComponentType<Record<string, unknown>>
         release: () => void
       }
     | undefined
   const restore = () => {
     if (!current) return
-    const { entry, original, release } = current
+    const { entry, original, component, release } = current
     current = undefined
-    if (entry.component === ModelsWithContextPresets) entry.component = original
+    if (entry.component === component) entry.component = original
     release()
   }
   const sync = () => {
@@ -43,19 +31,30 @@ export function installNativeContextPresets(
           entry.options.id === 'models' &&
           entry.children?.['settings.models.provider-card'],
       )
-    if (
-      entry === current?.entry &&
-      entry?.component === ModelsWithContextPresets
-    )
+    if (entry === current?.entry && entry?.component === current?.component)
       return
     restore()
     if (!entry) return
     const original = entry.component
-    if (
-      typeof original !== 'function' ||
-      Function.prototype.toString.call(original) !== expectedModelsSectionSource
+    const source =
+      typeof original === 'function'
+        ? Function.prototype.toString.call(original)
+        : undefined
+    const runtime = nativeModelsRuntimes.find(
+      (candidate) => candidate.expectedModelsSectionSource === source,
     )
+    if (!runtime)
       throw new Error('原生模型设置组件与已核验版本不一致，无法安装上下文预设')
+    const NativeModelsSection = runtime.getComponent()
+    function ModelsWithContextPresets(props: Record<string, unknown>) {
+      return (
+        <ContextWindowPresetScope.Provider
+          value={props.gptContextPresetControls === true}
+        >
+          <NativeModelsSection {...props} />
+        </ContextWindowPresetScope.Provider>
+      )
+    }
     entry.component = ModelsWithContextPresets
     try {
       // This supported root source publishes the control policy and refreshes
@@ -63,7 +62,12 @@ export function installNativeContextPresets(
       const release = slots.provideRoot({
         props: { gptContextPresetControls: true },
       })
-      current = { entry, original, release }
+      current = {
+        entry,
+        original,
+        component: ModelsWithContextPresets,
+        release,
+      }
     } catch (error) {
       entry.component = original
       throw error

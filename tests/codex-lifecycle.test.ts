@@ -620,7 +620,8 @@ describe('Codex MCP ownership', () => {
     }
   })
 
-  it('retains failed idle cleanup ownership and blocks client replacement', async () => {
+  const cleanupChanges = ['idle', 'replace', 'remove'] as const
+  it.each(cleanupChanges)('blocks admission on %s failure', async (change) => {
     const home = await directory()
     await put(
       join(home, 'config.toml'),
@@ -634,7 +635,8 @@ describe('Codex MCP ownership', () => {
     }))
     const warn = vi.fn(),
       handlers = new Map<string, (...args: any[]) => any>()
-    const tools = { resolve: async (_context: any) => ({ dispose() {} }) }
+    const admitted = vi.fn(async (_context: any) => ({ dispose() {} }))
+    const tools = { resolve: admitted }
     const ctx: any = {
       effect() {},
       inject(_deps: string[], apply: (child: any) => void) {
@@ -666,15 +668,35 @@ describe('Codex MCP ownership', () => {
     })
     try {
       await tools.resolve({ agent })
-      handlers.get('agent/status')!({ agent, status: 'idle' })
-      await vi.waitFor(() => expect(warn).toHaveBeenCalled())
+      if (change === 'idle') {
+        handlers.get('agent/status')!({ agent, status: 'idle' })
+        await vi.waitFor(() => expect(warn).toHaveBeenCalled())
+      } else {
+        await put(
+          join(home, 'config.toml'),
+          change === 'remove'
+            ? ''
+            : '[mcp_servers.fixture]\nurl="https://replacement.invalid/mcp"\n',
+        )
+      }
       await expect(tools.resolve({ agent })).rejects.toBe(failure)
+      expect(admitted).toHaveBeenCalledTimes(1)
       expect(spawn).toHaveBeenCalledTimes(1)
       expect(
         runtime
           .status()
           .items.some((entry) => entry.reason?.includes('replacement blocked')),
       ).toBe(true)
+      expect(runtime.status().items).toContainEqual({
+        name: 'fixture',
+        kind: 'mcp',
+        state: 'failed',
+        reason: 'cleanup-failed; replacement blocked',
+      })
+      await put(join(home, 'config.toml'), 'broken = [')
+      await expect(tools.resolve({ agent })).rejects.toBe(failure)
+      expect(admitted).toHaveBeenCalledTimes(1)
+      expect(spawn).toHaveBeenCalledTimes(1)
       await expect(runtime.dispose()).rejects.toBe(failure)
     } finally {
       await runtime.dispose().catch(() => {})

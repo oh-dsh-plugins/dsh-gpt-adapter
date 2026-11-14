@@ -1146,17 +1146,20 @@ export async function apply(
 ): Promise<void> {
   const require = createRequire(import.meta.url)
   const version = require('@deepseek-ai/dsh-llm-pi-ai/package.json').version
-  if (version !== '0.2.2-rc.1')
-    throw new Error(
-      `Unsupported DSH Pi AI adapter ${version}; expected 0.2.2-rc.1`,
-    )
   const compatibility = JSON.parse(
     readFileSync(new URL('./compatibility.json', import.meta.url), 'utf8'),
+  ) as { runtimes: Array<{ adapterVersion: string; sourceSha256: string }> }
+  const runtime = compatibility.runtimes.find(
+    (entry) => entry.adapterVersion === version,
   )
+  if (!runtime)
+    throw new Error(
+      `Unsupported DSH Pi AI adapter ${version}; expected ${compatibility.runtimes.map((entry) => entry.adapterVersion).join(', ')}`,
+    )
   const sourceHash = createHash('sha256')
     .update(readFileSync(require.resolve('@deepseek-ai/dsh-llm-pi-ai')))
     .digest('hex')
-  if (sourceHash !== compatibility.sourceSha256)
+  if (sourceHash !== runtime.sourceSha256)
     throw new Error(
       'The installed DSH Pi AI adapter differs from the verified build',
     )

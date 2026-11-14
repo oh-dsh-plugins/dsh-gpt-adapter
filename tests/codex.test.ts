@@ -19,6 +19,7 @@ import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
 import ToolsService from '@deepseek-ai/dsh-tools'
+import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import {
   CodexResourceCache,
@@ -1815,7 +1816,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
       importSkills: false,
       importInstructions: false,
     })
-    await attachAgent(ctx, home)
+    const agent = await attachAgent(ctx, home)
     await runtime.refresh()
     expect(runtime.status().items).toContainEqual({
       name: 'fixture',
@@ -1845,6 +1846,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     })
     await put(join(home, 'config.toml'), 'broken = [')
     await runtime.refresh()
+    await expect(preStep(ctx, agent)).resolves.toBeUndefined()
     expect(tools.get('mcp__fixture__echo')).toBe(original)
     expect(runtime.status().items.some((i) => i.state === 'failed')).toBe(true)
     await put(join(home, 'config.toml'), '')
@@ -1852,6 +1854,80 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     expect(tools.size).toBe(0)
     await runtime.dispose()
   })
+
+  it
+    .runIf('connectionStatusOf' in McpClient)
+    .each(['idle', 'replace', 'remove'] as const)(
+    'blocks admission when native MCP disposal reports incomplete cleanup after %s',
+    async (change) => {
+      const home = await directory()
+      const upstream = await httpMcp()
+      await put(
+        join(home, 'config.toml'),
+        `[mcp_servers.fixture]\nurl=${JSON.stringify(upstream.url)}\n`,
+      )
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      mcpHost(ctx)
+      const register = vi.fn(() => () => {
+        throw new Error('fixture tool cleanup failed')
+      })
+      const admitted = vi.fn(async () => ({ dispose() {} }))
+      ctx.provide('tools', {
+        resolve: admitted,
+        register,
+      } as any)
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importSkills: false,
+        mcpIdleTimeoutMs: 1,
+      })
+      const agent = await attachAgent(ctx, home)
+      expect(register).toHaveBeenCalledTimes(1)
+      if (change === 'idle') {
+        ctx.emit('agent/status', { agent, status: 'idle' } as any)
+        await vi.waitFor(() =>
+          expect(runtime.status().items).toContainEqual({
+            name: 'codex-mcp',
+            kind: 'mcp',
+            state: 'failed',
+            reason: 'cleanup-failed; replacement blocked',
+          }),
+        )
+      } else {
+        await put(
+          join(home, 'config.toml'),
+          change === 'remove'
+            ? ''
+            : `[mcp_servers.fixture]\nurl=${JSON.stringify(upstream.url + '/replacement')}\n`,
+        )
+      }
+      await expect(preStep(ctx, agent)).rejects.toThrow(
+        'MCP connection cleanup is incomplete',
+      )
+      expect(admitted).toHaveBeenCalledTimes(1)
+      expect(runtime.status().items).toContainEqual({
+        name: 'fixture',
+        kind: 'mcp',
+        state: 'failed',
+        reason: 'cleanup-failed; replacement blocked',
+      })
+      await put(join(home, 'config.toml'), 'broken = [')
+      await expect(preStep(ctx, agent)).rejects.toThrow(
+        'MCP connection cleanup is incomplete',
+      )
+      expect(admitted).toHaveBeenCalledTimes(1)
+      expect(register).toHaveBeenCalledTimes(1)
+      expect(
+        upstream.messages.filter((message) => message.method === 'initialize'),
+      ).toHaveLength(1)
+      await expect(runtime.dispose()).rejects.toThrow(
+        'MCP connection cleanup is incomplete',
+      )
+    },
+  )
 
   it('connects a real HTTP MCP with imported headers and refreshes a disabled server without exposing credentials in status', async () => {
     const home = await directory(),

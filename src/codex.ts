@@ -54,6 +54,14 @@ type PrepareSkills = <T>(
   options: any,
   action: (options: any) => Promise<T>,
 ) => Promise<T>
+type McpClosure = { closeConfirmed: boolean; cleanupError?: string }
+type McpStatus = { closure(): McpClosure }
+// rc.2+ reports incomplete cleanup through a retained status handle.
+const mcpStatusOf = (
+  McpClient as unknown as {
+    connectionStatusOf?: (fiber: any) => McpStatus | undefined
+  }
+).connectionStatusOf
 const skillAllowed = (
   config: CodexSnapshot['config'],
   skill: any,
@@ -158,6 +166,7 @@ export function installCodexCompatibility(
     state: CompatibilityItem
     attempts: number
     retryAt: number
+    closure(): McpClosure | undefined
     disposal?: Promise<void>
   }
   type AgentState = {
@@ -607,11 +616,25 @@ export function installCodexCompatibility(
   }
 
   const closeClient = (client: Client): Promise<void> =>
-    (client.disposal ??= Promise.resolve().then(async () => {
-      await client.fiber.dispose()
-      // Agent-scope teardown may already have claimed the raw disposer.
-      while (client.fiber.inertia !== undefined) await client.fiber.inertia
-    }))
+    (client.disposal ??= Promise.resolve()
+      .then(async () => {
+        await client.fiber.dispose()
+        // Agent-scope teardown may already have claimed the raw disposer.
+        while (client.fiber.inertia !== undefined) await client.fiber.inertia
+        const closure = client.closure()
+        if (
+          closure &&
+          (!closure.closeConfirmed || closure.cleanupError !== undefined)
+        )
+          throw new Error(
+            'MCP connection cleanup is incomplete; restart the DSH host',
+          )
+      })
+      .catch((error) => {
+        client.state.state = 'failed'
+        client.state.reason = 'cleanup-failed; replacement blocked'
+        throw error
+      }))
 
   const mountMcp = async (
     owner: AgentState,
@@ -635,6 +658,7 @@ export function installCodexCompatibility(
         kind: 'mcp',
         state: 'loading',
       }
+      let nativeStatus: McpStatus | undefined
       const plugin = {
         name: `codex-mcp-${entry.serverName}`,
         inject: ['tools'],
@@ -688,16 +712,19 @@ export function installCodexCompatibility(
                   url: entry.url!,
                   headers: entry.headers ?? {},
                 }
-          await McpClient.apply(
+          const ready = McpClient.apply(
             child.extend({ tools }),
             McpClient.Config({
               ...connection,
               serverName: entry.serverName,
               toolCallTimeoutMs: entry.toolCallTimeoutMs,
+              ...(mcpStatusOf ? { startupTimeoutMs } : {}),
               failOnStartupError: true,
               reconnect: { enabled: true },
             }),
           )
+          nativeStatus = mcpStatusOf?.(child.fiber)
+          await ready
         },
       }
       const fiber = owner.agent.ctx.plugin(plugin)
@@ -707,6 +734,7 @@ export function installCodexCompatibility(
         state,
         attempts,
         retryAt: 0,
+        closure: () => nativeStatus?.closure(),
       }
       owner.clients.set(entry.serverName, client)
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -753,15 +781,20 @@ export function installCodexCompatibility(
   const refreshAgentOnce = async (owner: AgentState) => {
     const signal = owner.abort.signal
     if (closed || owner.disposed) return
+    signal.throwIfAborted()
+    // Retained cleanup failures block every admission, including config fallbacks.
+    for (const client of owner.clients.values())
+      if (client.disposal) await client.disposal
+    signal.throwIfAborted()
+    const cwd = await mcpContext.workingDirectory.ensure(owner.agent, signal)
+    if (owner.cwd !== undefined && owner.cwd !== cwd) {
+      await Promise.all([...owner.clients.values()].map(closeClient))
+      owner.clients.clear()
+      delete owner.snapshot
+    }
+    owner.cwd = cwd
+    let snapshot: CodexSnapshot
     try {
-      signal?.throwIfAborted()
-      const cwd = await mcpContext.workingDirectory.ensure(owner.agent, signal)
-      if (owner.cwd !== undefined && owner.cwd !== cwd) {
-        await Promise.all([...owner.clients.values()].map(closeClient))
-        owner.clients.clear()
-        delete owner.snapshot
-      }
-      owner.cwd = cwd
       const fs = owner.agent.ctx.get('fs')
       const observation = publicResources
       const configResources = owner.freshConfig ? resources : observation
@@ -774,7 +807,7 @@ export function installCodexCompatibility(
         configResources,
       )
       signal.throwIfAborted()
-      const snapshot = await discoverCodexSnapshot(home, config, {
+      snapshot = await discoverCodexSnapshot(home, config, {
         config: currentConfig,
         resources: observation,
         cwd,
@@ -782,33 +815,6 @@ export function installCodexCompatibility(
         signal,
         ...(owner.snapshot ? { previous: owner.snapshot } : {}),
       })
-      signal?.throwIfAborted()
-      if (closed || owner.disposed) return
-      owner.snapshot = snapshot
-      owner.items = snapshot.items
-      const next = new Map(
-        snapshot.mcp.map((entry) => [entry.serverName, entry]),
-      )
-      for (const [name, client] of owner.clients) {
-        if (!next.has(name) || fingerprint(next.get(name)) !== client.key) {
-          await closeClient(client)
-          owner.clients.delete(name)
-        }
-      }
-      await Promise.all(
-        [...next].map(async ([name, entry]) => {
-          const client = owner.clients.get(name)
-          if (
-            client &&
-            (client.state.state !== 'failed' ||
-              client.attempts >= 10 ||
-              Date.now() < client.retryAt)
-          )
-            return
-          if (client) await closeClient(client)
-          await mountMcp(owner, entry, (client?.attempts ?? 0) + 1)
-        }),
-      )
     } catch {
       if (closed || owner.disposed) return
       signal.throwIfAborted()
@@ -820,7 +826,33 @@ export function installCodexCompatibility(
           reason: 'unreadable-or-invalid-config; previous snapshot retained',
         },
       ]
+      return
     }
+    signal.throwIfAborted()
+    if (closed || owner.disposed) return
+    owner.snapshot = snapshot
+    owner.items = snapshot.items
+    const next = new Map(snapshot.mcp.map((entry) => [entry.serverName, entry]))
+    for (const [name, client] of owner.clients) {
+      if (!next.has(name) || fingerprint(next.get(name)) !== client.key) {
+        await closeClient(client)
+        owner.clients.delete(name)
+      }
+    }
+    await Promise.all(
+      [...next].map(async ([name, entry]) => {
+        const client = owner.clients.get(name)
+        if (
+          client &&
+          (client.state.state !== 'failed' ||
+            client.attempts >= 10 ||
+            Date.now() < client.retryAt)
+        )
+          return
+        if (client) await closeClient(client)
+        await mountMcp(owner, entry, (client?.attempts ?? 0) + 1)
+      }),
+    )
   }
   const waitForAgentWork = (
     work: Promise<void>,
@@ -861,7 +893,12 @@ export function installCodexCompatibility(
           // A caller waits for this round, never for future polling to drain.
           // Clearing at start permits at most one coalesced follow-up round.
           owner.queued = undefined
-          await refreshAgentOnce(owner)
+          try {
+            await refreshAgentOnce(owner)
+          } catch (error) {
+            // Teardown joins client cleanup separately; contain stopped-owner work.
+            if (!closed && !owner.disposed) throw error
+          }
         })
     }
     return waitForAgentWork(owner.queued, signal)

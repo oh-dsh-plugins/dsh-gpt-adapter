@@ -4,6 +4,8 @@ import { ReasoningEffortId, type LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-client-connection/client'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { mkdtemp, rm, readFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Config, type GptModels } from '../src/host.js'
@@ -105,6 +107,36 @@ function streamResponse(protocol: string, serviceTier = 'priority') {
 }
 
 describe('built plugin and official transport integration', () => {
+  it('records all supported runtimes and verifies the installed native source', async () => {
+    const versions = ['0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3']
+    const manifest = JSON.parse(await readFile('package.json', 'utf8'))
+    expect(manifest.engines.dsh).toBe(versions.join(' || '))
+    for (const [name, range] of Object.entries(manifest.peerDependencies)) {
+      if (name.startsWith('@deepseek-ai/dsh-'))
+        expect(range).toBe(manifest.engines.dsh)
+    }
+    const compatibility = JSON.parse(
+      await readFile('lib/compatibility.json', 'utf8'),
+    )
+    expect(
+      compatibility.runtimes.map((runtime: any) => runtime.adapterVersion),
+    ).toEqual(versions)
+    const require = createRequire(import.meta.url)
+    const version = require('@deepseek-ai/dsh-llm-pi-ai/package.json').version
+    const runtime = compatibility.runtimes.find(
+      (entry: any) => entry.adapterVersion === version,
+    )
+    for (const [field, name] of [
+      ['sourceSha256', '@deepseek-ai/dsh-llm-pi-ai'],
+      ['settingsSha256', '@deepseek-ai/dsh-client-ui-settings-models/client'],
+      ['menuSha256', '@deepseek-ai/dsh-client-ui-model-selection/client'],
+    ]) {
+      const hash = createHash('sha256')
+        .update(await readFile(require.resolve(name!)))
+        .digest('hex')
+      expect(runtime[field!]).toBe(hash)
+    }
+  })
   it.each(['openai-responses', 'openai-completions'] as const)(
     'sends the native effort and priority through the actual %s implementation',
     async (protocol) => {
@@ -422,9 +454,6 @@ describe('built plugin and official transport integration', () => {
             .reasoningEfforts,
         ),
       ).toEqual(levels)
-      expect(
-        await readFile(join(process.cwd(), 'lib/compatibility.json'), 'utf8'),
-      ).toContain('0.2.2-rc.1')
     },
   )
 })

@@ -20,7 +20,16 @@ const require = createRequire(import.meta.url)
 const { nativeContextSettingsSource } = await import(
   pathToFileURL(resolve('scripts/native-context-settings.mjs')).href
 )
-const adapted = nativeContextSettingsSource()
+const packages = [
+  '@deepseek-ai/dsh-client-ui-settings-models',
+  'dsh-rc2-model-settings',
+  'dsh-rc3-model-settings',
+]
+type NativeSource = {
+  source: string
+  body: string
+  expectedModelsSectionSource: string
+}
 const roots: Root[] = []
 const cleanup: Array<() => void> = []
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
@@ -68,7 +77,7 @@ function modules(name: string): any {
   )
 }
 
-function nativeComponents() {
+function nativeComponents(adapted: NativeSource) {
   return new Function(
     'require',
     'ContextWindowPreset',
@@ -78,8 +87,13 @@ function nativeComponents() {
   )(modules, ContextWindowPreset, validContextWindow, isGptModel)
 }
 
-async function editor(initial: any[], disabled = false, enabled = true) {
-  const native = nativeComponents()
+async function renderEditor(
+  adapted: NativeSource,
+  initial: any[],
+  disabled = false,
+  enabled = true,
+) {
+  const native = nativeComponents(adapted)
   let draft = initial
   const onBusyChange = () => {}
   function Editor() {
@@ -147,7 +161,10 @@ async function editor(initial: any[], disabled = false, enabled = true) {
   }
 }
 
-describe('preset selector in the native context field', () => {
+describe.each(packages)('native context presets (%s)', (packageName) => {
+  const adapted = nativeContextSettingsSource(packageName)
+  const editor = (initial: any[], disabled = false, enabled = true) =>
+    renderEditor(adapted, initial, disabled, enabled)
   it('offers four choices at the original field and shows an input only for custom', async () => {
     const f = await editor([
       {
@@ -229,7 +246,11 @@ describe('preset selector in the native context field', () => {
     expect(f.select().disabled).toBe(true)
     expect(f.custom()!.disabled).toBe(true)
     const other = await editor([
-      { id: 'claude-fixture', contextWindow: 750000, reasoningEfforts: false },
+      {
+        id: 'claude-fixture',
+        contextWindow: 750000,
+        reasoningEfforts: false,
+      },
     ])
     await other.open()
     expect(other.select()).toBeNull()
@@ -396,7 +417,7 @@ describe('preset selector in the native context field', () => {
   })
 })
 
-function originalNative() {
+function originalNative(adapted: NativeSource) {
   let result: any
   Object.assign(window, {
     __ModuleLoader__: {
@@ -407,8 +428,8 @@ function originalNative() {
   })
   new Function(
     adapted.source.replace(
-      'exports.apply = apply;',
-      'exports.ModelsSection = ModelsSection; exports.apply = apply;',
+      'exports.apply',
+      'exports.ModelsSection = ModelsSection; exports.apply',
     ),
   )()
   return result
@@ -427,9 +448,10 @@ function client() {
   return result
 }
 
-describe('original native Models entry integration', () => {
+describe.each(packages)('native Models entry (%s)', (packageName) => {
+  const adapted = nativeContextSettingsSource(packageName)
   it('preserves the entry/controller/child slots and restores the native renderer on disposal', () => {
-    const original = originalNative().ModelsSection
+    const original = originalNative(adapted).ModelsSection
     expect(Function.prototype.toString.call(original)).toBe(
       adapted.expectedModelsSectionSource,
     )
@@ -474,12 +496,9 @@ describe('original native Models entry integration', () => {
     expect(entry.component).toBe(original)
     expect(rootProps).toEqual({})
     expect(listeners.size).toBe(0)
-    expect(
-      readFileSync(
-        require.resolve('@deepseek-ai/dsh-client-ui-settings-models/client'),
-        'utf8',
-      ),
-    ).toBe(adapted.source)
+    expect(readFileSync(require.resolve(packageName + '/client'), 'utf8')).toBe(
+      adapted.source,
+    )
   })
 
   it('publishes and removes the preset policy through the real slot renderer', async () => {
@@ -530,7 +549,7 @@ describe('original native Models entry integration', () => {
         )
       },
     )
-    const original = originalNative().ModelsSection
+    const original = originalNative(adapted).ModelsSection
     slots.register(
       {
         name: 'settings.section',

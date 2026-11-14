@@ -1,8 +1,11 @@
 import { build } from 'esbuild'
-import { mkdir, writeFile, rm, readFile } from 'node:fs/promises'
+import { mkdir, writeFile, rm } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { createRequire } from 'node:module'
-import { compatibilitySource, menuSource } from './compat.mjs'
+import {
+  compatibilitySource,
+  compatibilityTargets,
+  menuSource,
+} from './compat.mjs'
 import { nativeContextSettingsSource } from './native-context-settings.mjs'
 import { fileURLToPath } from 'node:url'
 
@@ -26,34 +29,36 @@ await build({
   target: 'node22',
   packages: 'external',
 })
-const menu = menuSource()
-const require = createRequire(import.meta.url)
-const settings = await readFile(
-  require.resolve('@deepseek-ai/dsh-client-ui-settings-models/client'),
-  'utf8',
-)
-const nativeContextSettings = nativeContextSettingsSource()
-const styleNames = [
-  'customized',
-  'customizedSummary',
-  'customizedBody',
-  'rowHead',
-  'rowName',
-  'rowActions',
-  'advancedHint',
-  'field',
-  'fieldLabel',
-  'input',
-  'editorActions',
-  'error',
-]
-const settingsStyles = Object.fromEntries(
-  styleNames.map((key) => {
-    const match = settings.match(new RegExp('"' + key + '": "([^"]+)"'))
-    if (!match) throw new Error('Unsupported native Models styles: ' + key)
-    return [key, match[1]]
-  }),
-)
+const runtimes = compatibilityTargets.map((target) => {
+  const adapter = compatibilitySource(target.adapter)
+  const menu = menuSource(target.menu)
+  const settings = nativeContextSettingsSource(target.settings)
+  if (
+    [adapter.version, menu.version, settings.version].some(
+      (version) => version !== target.version,
+    )
+  )
+    throw new Error(
+      'Mismatched native build dependencies for ' + target.version,
+    )
+  return { adapter, menu, settings }
+})
+const settingsStyles = runtimes[0].settings.settingsStyles
+const nativeContextSettings = []
+for (const { settings } of runtimes) {
+  if (
+    JSON.stringify(settings.settingsStyles) !== JSON.stringify(settingsStyles)
+  )
+    throw new Error('Unsupported native Models styles for ' + settings.version)
+  const existing = nativeContextSettings.find(
+    (candidate) =>
+      candidate.expectedModelsSectionSource ===
+      settings.expectedModelsSectionSource,
+  )
+  if (existing && existing.body !== settings.body)
+    throw new Error('Ambiguous native Models renderer for ' + settings.version)
+  if (!existing) nativeContextSettings.push(settings)
+}
 await build({
   entryPoints: ['src/client/index.tsx'],
   outfile: 'lib/client.js',
@@ -87,13 +92,25 @@ await build({
             import { ContextWindowPreset } from ${JSON.stringify(fileURLToPath(new URL('../src/client/context-window-preset.tsx', import.meta.url)))};
             import { isGptModel } from ${JSON.stringify(fileURLToPath(new URL('../src/capabilities.ts', import.meta.url)))};
             import { validContextWindow } from ${JSON.stringify(fileURLToPath(new URL('../src/context-window.ts', import.meta.url)))};
-            const native = ((require) => { ${nativeContextSettings.body} })((name) => {
+            function nativeRequire(name) {
               const modules = {'react': React, 'react/jsx-runtime': JSX, '@deepseek-ai/dsh-client-ui-primitives': Primitives, '@deepseek-ai/dsh-client-store': Store};
               if (!(name in modules)) throw new Error('Unsupported native Models dependency: ' + name);
               return modules[name];
-            });
-            export const NativeModelsSection = native.ModelsSection;
-            export const expectedModelsSectionSource = ${JSON.stringify(nativeContextSettings.expectedModelsSectionSource)};
+            }
+            export const nativeModelsRuntimes = [${nativeContextSettings
+              .map(
+                (settings) => `(() => {
+              let component;
+              return {
+                expectedModelsSectionSource: ${JSON.stringify(settings.expectedModelsSectionSource)},
+                getComponent() {
+                  if (!component) component = ((require) => { ${settings.body} })(nativeRequire).ModelsSection;
+                  return component;
+                },
+              };
+            })()`,
+              )
+              .join(',')}];
           `,
           loader: 'js',
           resolveDir: fileURLToPath(new URL('../', import.meta.url)),
@@ -122,16 +139,18 @@ await build({
   },
   footer: { js: 'return module.exports; }});' },
 })
-const { source, version } = compatibilitySource()
+const sha256 = (source) => createHash('sha256').update(source).digest('hex')
 await writeFile(
   'lib/compatibility.json',
   JSON.stringify(
     {
-      adapterVersion: version,
-      sourceSha256: createHash('sha256').update(source).digest('hex'),
-      menuVersion: menu.version,
-      settingsSha256: createHash('sha256').update(settings).digest('hex'),
-      menuSha256: createHash('sha256').update(menu.source).digest('hex'),
+      runtimes: runtimes.map(({ adapter, menu, settings }) => ({
+        adapterVersion: adapter.version,
+        sourceSha256: sha256(adapter.source),
+        menuVersion: menu.version,
+        settingsSha256: sha256(settings.source),
+        menuSha256: sha256(menu.source),
+      })),
     },
     null,
     2,

@@ -1,17 +1,32 @@
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import ts from 'typescript'
+import { supportedDshVersions } from './compat.mjs'
+
+const styleNames = [
+  'customized',
+  'customizedSummary',
+  'customizedBody',
+  'rowHead',
+  'rowName',
+  'rowActions',
+  'advancedHint',
+  'field',
+  'fieldLabel',
+  'input',
+  'editorActions',
+  'error',
+]
 
 /** Adapt the pinned native model field without editing the installed package. */
-export function nativeContextSettingsSource() {
+export function nativeContextSettingsSource(
+  packageName = '@deepseek-ai/dsh-client-ui-settings-models',
+) {
   const require = createRequire(import.meta.url)
-  const pkg = require('@deepseek-ai/dsh-client-ui-settings-models/package.json')
-  if (pkg.version !== '0.2.2-rc.1')
+  const pkg = require(packageName + '/package.json')
+  if (!supportedDshVersions.includes(pkg.version))
     throw new Error('Unsupported native Models UI ' + pkg.version)
-  const source = readFileSync(
-    require.resolve('@deepseek-ai/dsh-client-ui-settings-models/client'),
-    'utf8',
-  )
+  const source = readFileSync(require.resolve(packageName + '/client'), 'utf8')
   const ast = ts.createSourceFile(
     'native-models.js',
     source,
@@ -52,7 +67,7 @@ export function nativeContextSettingsSource() {
       (node) =>
         ts.isCallExpression(node) &&
         node.arguments[0] &&
-        ts.isStringLiteral(node.arguments[0]) &&
+        ts.isStringLiteralLike(node.arguments[0]) &&
         node.arguments[0].text === 'input' &&
         node.arguments[1] &&
         ts.isObjectLiteralExpression(node.arguments[1]) &&
@@ -71,7 +86,7 @@ export function nativeContextSettingsSource() {
     !(
       ts.isCallExpression(label) &&
       label.arguments[0] &&
-      ts.isStringLiteral(label.arguments[0]) &&
+      ts.isStringLiteralLike(label.arguments[0]) &&
       label.arguments[0].text === 'label'
     )
   )
@@ -135,5 +150,36 @@ export function nativeContextSettingsSource() {
       edit.text +
       body.slice(edit.end - start)
   }
-  return { source, body, expectedModelsSectionSource: models.getText(ast) }
+  const styles = one(
+    nodes.filter(
+      (node) =>
+        ts.isVariableDeclaration(node) &&
+        node.name.getText(ast) === 'ModelsSection_module_css_default' &&
+        node.initializer &&
+        ts.isObjectLiteralExpression(node.initializer),
+    ),
+    'style map',
+  ).initializer
+  const settingsStyles = Object.fromEntries(
+    styleNames.map((key) => {
+      const property = one(
+        styles.properties.filter(
+          (node) =>
+            ts.isPropertyAssignment(node) &&
+            (ts.isStringLiteralLike(node.name) || ts.isIdentifier(node.name)) &&
+            node.name.text === key &&
+            ts.isStringLiteralLike(node.initializer),
+        ),
+        'style ' + key,
+      )
+      return [key, property.initializer.text]
+    }),
+  )
+  return {
+    version: pkg.version,
+    source,
+    body,
+    settingsStyles,
+    expectedModelsSectionSource: models.getText(ast),
+  }
 }

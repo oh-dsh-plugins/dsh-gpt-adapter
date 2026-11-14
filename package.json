@@ -1,6 +1,6 @@
 {
   "name": "dsh-gpt-adapter",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -59,7 +59,7 @@
   ],
   "engines": {
     "node": ">=24.9.0",
-    "dsh": "0.2.2-rc.1"
+    "dsh": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3"
   },
   "dsh": {
     "bundle": {
@@ -86,6 +86,7 @@
     "prepack": "pnpm build",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build && vitest run",
+    "test:compat": "pnpm build && node scripts/test-compat.mjs",
     "test:watch": "vitest",
     "format": "prettier --write ."
   },
@@ -132,24 +133,30 @@
     "typescript": "^5.8.2",
     "vitest": "^3.0.8",
     "yaml": "^2.8.1",
+    "dsh-rc2-pi-ai": "npm:@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.2",
+    "dsh-rc2-model-selection": "npm:@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.2",
+    "dsh-rc2-model-settings": "npm:@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.2",
+    "dsh-rc3-pi-ai": "npm:@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.3",
+    "dsh-rc3-model-selection": "npm:@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.3",
+    "dsh-rc3-model-settings": "npm:@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.3",
     "@modelcontextprotocol/client": "2.2.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
-    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-brand": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-credentials": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-hmr": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-home-paths": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-launch-environment": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-settings": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-skill-filesystem": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-timeout": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-util-values": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-brand": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-hmr": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-home-paths": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-launch-environment": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-settings": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-skill-filesystem": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-timeout": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
+    "@deepseek-ai/dsh-util-values": "0.2.2-rc.1 || 0.2.2-rc.2 || 0.2.2-rc.3",
     "@deepseek-ai/schemastery": "3.19.0",
     "@earendil-works/pi-ai": "1.3.0",
     "@modelcontextprotocol/client": "2.2.0"

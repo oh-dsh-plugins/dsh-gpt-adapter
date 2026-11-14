@@ -1,0 +1,7 @@
+# Exact, verified build inputs for the requested DSH rc.3 compatibility.
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/dsh-brand@0.2.2-rc.3'
+  - '@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.3'
+  - '@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.3'
+  - '@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.3'
+  - '@deepseek-ai/dsh-util-values@0.2.2-rc.3'

@@ -60,7 +60,9 @@ jobs:
 
       - name: Run the release checks
         if: steps.version.outputs.release == 'true'
-        run: pnpm test
+        run: |
+          pnpm test
+          node scripts/test-compat.mjs
 
       - name: Create the version tag
         if: steps.version.outputs.release == 'true'
