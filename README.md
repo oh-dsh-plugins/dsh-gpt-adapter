@@ -25,7 +25,7 @@ Requires Node.js `>=24.9.0` and DSH `0.2.2-rc.1` with Cordis `4.1.0`.
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.7
+dsh plugin --profile web add dsh-gpt-adapter@0.2.8
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -38,7 +38,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.7.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.8.tgz
 ```
 
 ## Using GPT models
@@ -88,7 +88,9 @@ Plugin resources must already exist in a configured local marketplace or the Cod
 
 Supported transports are stdio and Streamable HTTP. Existing server configuration can supply commands, arguments, working directories, environment variables, headers, bearer-token environment variables, timeouts, and enabled/disabled tool lists.
 
-Each Agent owns its imported MCP connections. Trusted project overrides apply within that Agent's scope. Stdio servers use the Agent's working directory unless an explicit `cwd` is configured. Configuration changes update the corresponding connections automatically.
+MCP connections start before an Agent's first model step. Each Agent owns its connections, and trusted project overrides apply within that Agent's scope. Stdio servers use the Agent's working directory unless an explicit `cwd` is configured. Idle Agents release their connections after one minute and reconnect before the next step. With watching enabled, active Agents update their connections automatically; idle Agents apply configuration changes when they resume.
+
+Set `mcpIdleTimeoutMs` to change the idle retention period, or `0` to keep connections until the Agent is disposed. Reconnecting can reset server state held only in memory; use `0` for servers that need to preserve that state between turns.
 
 Authentication variables must be available in the DSH host environment. Servers that depend on Codex App authentication, browser extensions, or other local services still require those services to be available. The adapter does not reproduce Codex OAuth/keychain sessions, App IPC services, hooks, proprietary commands, or permission policies. DSH retains its own approvals and sandbox behavior.
 
@@ -105,6 +107,7 @@ codexCompatibility:
   importMcpServers: true
   importPluginResources: true
   watch: true
+  mcpIdleTimeoutMs: 60000
   pollIntervalMs: 2000
   mcpAllowlist: []
 ```

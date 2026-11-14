@@ -59,6 +59,114 @@ export async function optionalText(path: string): Promise<string | undefined> {
   }
 }
 
+/** Runtime-owned Host resources; project filesystem reads keep their own boundary. */
+export type CodexResourceReader = {
+  read<T>(
+    path: string,
+    kind: string,
+    load: () => Promise<T>,
+  ): Promise<T | undefined>
+}
+export type CodexResourceObservation = CodexResourceReader & { clear(): void }
+
+export class CodexResourceCache implements CodexResourceReader {
+  private readonly entries = new Map<
+    string,
+    { stamp: string; value: Promise<unknown> }
+  >()
+  private closed = false
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error('Codex resource cache disposed')
+  }
+
+  /** One observation validates each public resource once, across all consumers. */
+  observe(): CodexResourceObservation {
+    const reads = new Map<string, Promise<unknown>>()
+    return {
+      read: async <T>(path: string, kind: string, load: () => Promise<T>) => {
+        this.assertOpen()
+        const key = `${kind}:${path}`
+        let pending = reads.get(key)
+        if (!pending) {
+          pending = this.read(path, kind, load)
+          reads.set(key, pending)
+          if (reads.size > 256) reads.delete(reads.keys().next().value!)
+          const failed = () => {
+            if (reads.get(key) === pending) reads.delete(key)
+          }
+          void pending.catch(failed)
+        }
+        const value = (await pending) as T | undefined
+        this.assertOpen()
+        return value
+      },
+      clear: () => reads.clear(),
+    }
+  }
+
+  async read<T>(
+    path: string,
+    kind: string,
+    load: () => Promise<T>,
+  ): Promise<T | undefined> {
+    this.assertOpen()
+    let info
+    try {
+      info = await stat(path, { bigint: true })
+    } catch (error: any) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error
+    }
+    this.assertOpen()
+    const key = `${kind}:${path}`
+    if (!info) {
+      this.entries.delete(key)
+      return undefined
+    }
+    // Stamp before loading: a concurrent edit forces another read next time.
+    const stamp = `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
+    let entry = this.entries.get(key)
+    if (entry?.stamp === stamp) {
+      this.entries.delete(key)
+      this.entries.set(key, entry)
+    } else {
+      entry = { stamp, value: load() }
+      this.entries.set(key, entry)
+      if (this.entries.size > 256)
+        this.entries.delete(this.entries.keys().next().value!)
+    }
+    try {
+      const value = (await entry.value) as T
+      this.assertOpen()
+      return value
+    } catch (error) {
+      if (this.entries.get(key) === entry) this.entries.delete(key)
+      throw error
+    }
+  }
+
+  dispose(): void {
+    this.closed = true
+    this.entries.clear()
+  }
+}
+
+async function optionalJson(
+  path: string,
+  resources?: CodexResourceReader,
+  allowEmpty = false,
+): Promise<unknown> {
+  const load = async () => {
+    const text = await optionalText(path)
+    return text === undefined || (allowEmpty && !text)
+      ? undefined
+      : JSON.parse(text)
+  }
+  return resources
+    ? resources.read(path, allowEmpty ? 'optional-json' : 'json', load)
+    : load()
+}
+
 /** Minimal execution-world filesystem used by project readers. */
 export type ProjectFileSystem = {
   resolve(path: string, options?: { signal?: AbortSignal }): Promise<any>
@@ -120,9 +228,16 @@ export async function readCodexConfig(
   cwd?: string,
   fs?: ProjectFileSystem,
   signal?: AbortSignal,
+  resources?: CodexResourceReader,
 ): Promise<JsonObject> {
-  const text = await optionalText(join(home, 'config.toml'))
-  let config = text === undefined ? {} : object(parse(text))
+  const path = join(home, 'config.toml')
+  const load = async () => {
+    const text = await optionalText(path)
+    return text === undefined ? {} : object(parse(text))
+  }
+  let config = object(
+    resources ? await resources.read(path, 'toml', load) : await load(),
+  )
   if (!cwd) return config
   const trust = Object.entries(object(config.projects))
     .filter(([path]) => {
@@ -239,12 +354,13 @@ async function directories(path: string): Promise<string[]> {
 
 async function manifestAt(
   root: string,
+  resources?: CodexResourceReader,
 ): Promise<
   { root: string; manifest: JsonObject; portable: boolean } | undefined
 > {
-  const text = await optionalText(join(root, 'plugin.json'))
-  if (text !== undefined) {
-    const manifest = object(JSON.parse(text))
+  const declared = await optionalJson(join(root, 'plugin.json'), resources)
+  if (declared !== undefined) {
+    const manifest = object(declared)
     if (
       manifest.$schema ===
       'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'
@@ -254,10 +370,9 @@ async function manifestAt(
         inline !== null && typeof inline === 'object' && !Array.isArray(inline)
           ? inline
           : object(
-              JSON.parse(
-                (await optionalText(
-                  join(root, '.codex-plugin', 'plugin.json'),
-                )) ?? '{}',
+              await optionalJson(
+                join(root, '.codex-plugin', 'plugin.json'),
+                resources,
               ),
             )
       return {
@@ -268,31 +383,41 @@ async function manifestAt(
     }
   }
   for (const name of ['.codex-plugin', '.claude-plugin']) {
-    const text = await optionalText(join(root, name, 'plugin.json'))
-    if (text !== undefined)
-      return { root, manifest: object(JSON.parse(text)), portable: false }
+    const declared = await optionalJson(
+      join(root, name, 'plugin.json'),
+      resources,
+    )
+    if (declared !== undefined)
+      return { root, manifest: object(declared), portable: false }
   }
   return undefined
 }
 
-async function resolvePlugin(home: string, id: string, config: JsonObject) {
+async function resolvePlugin(
+  home: string,
+  id: string,
+  config: JsonObject,
+  resources?: CodexResourceReader,
+) {
   const at = id.lastIndexOf('@')
   const name = at < 0 ? id : id.slice(0, at)
   const marketplace = at < 0 ? '' : id.slice(at + 1)
   const source = object(config.marketplaces?.[marketplace]).source
   if (typeof source === 'string' && !/^https?:/.test(source)) {
     for (const p of [join(source, 'plugins', name), join(source, name)]) {
-      const found = await manifestAt(p)
+      const found = await manifestAt(p, resources)
       if (found) return found
     }
   }
   const cache = join(home, 'plugins', 'cache', marketplace, name)
-  const versions = (await directories(cache)).sort((a, b) =>
-    b.localeCompare(a, undefined, { numeric: true }),
-  )
+  const versions = [
+    ...((resources
+      ? await resources.read(cache, 'directories', () => directories(cache))
+      : await directories(cache)) ?? []),
+  ].sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
   for (const version of versions) {
     for (const p of [version, join(version, 'plugins', name)]) {
-      const found = await manifestAt(p)
+      const found = await manifestAt(p, resources)
       if (found) return found
     }
   }
@@ -347,14 +472,19 @@ export async function discoverCodexSnapshot(
     fs?: ProjectFileSystem
     signal?: AbortSignal
     previous?: CodexSnapshot
+    resources?: CodexResourceReader
+    config?: JsonObject
   } = {},
 ): Promise<CodexSnapshot> {
-  const config = await readCodexConfig(
-    home,
-    context.cwd,
-    context.fs,
-    context.signal,
-  )
+  const config =
+    context.config ??
+    (await readCodexConfig(
+      home,
+      context.cwd,
+      context.fs,
+      context.signal,
+      context.resources,
+    ))
   const result: CodexSnapshot = {
     config,
     mcp: [],
@@ -432,7 +562,7 @@ export async function discoverCodexSnapshot(
         continue
       }
       try {
-        const plugin = await resolvePlugin(home, id, config)
+        const plugin = await resolvePlugin(home, id, config, context.resources)
         if (!plugin) {
           result.items.push({
             name: id,
@@ -456,15 +586,22 @@ export async function discoverCodexSnapshot(
         }
         let servers = manifest.mcpServers
         if (portable) {
-          const text = await optionalText(join(root, 'mcp.json'))
-          servers = text === undefined ? undefined : JSON.parse(text)
+          servers = await optionalJson(
+            join(root, 'mcp.json'),
+            context.resources,
+          )
         } else if (typeof servers === 'string') {
-          const text = await optionalText(resolve(root, servers))
-          if (text === undefined) throw new Error('missing-plugin-mcp-file')
-          servers = JSON.parse(text)
+          servers = await optionalJson(
+            resolve(root, servers),
+            context.resources,
+          )
+          if (servers === undefined) throw new Error('missing-plugin-mcp-file')
         } else if (!servers) {
-          const text = await optionalText(join(root, '.mcp.json'))
-          if (text) servers = JSON.parse(text)
+          servers = await optionalJson(
+            join(root, '.mcp.json'),
+            context.resources,
+            true,
+          )
         }
         const expanded = expandPlugin(
           object(servers).mcpServers ?? servers,

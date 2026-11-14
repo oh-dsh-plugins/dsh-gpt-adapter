@@ -36,6 +36,7 @@ export async function loadCodexInstructions(
   agentsHome = process.env.DSH_AGENTS_HOME || join(homedir(), '.agents'),
   fs?: ProjectFileSystem,
   signal?: AbortSignal,
+  knownDirectories?: string[],
 ): Promise<CodexInstructionFile[]> {
   const result: CodexInstructionFile[] = []
   const add = (file: CodexInstructionFile | undefined) => {
@@ -48,7 +49,8 @@ export async function loadCodexInstructions(
   add(await firstNonempty(dshHome, ['AGENTS.md']))
   add(await firstNonempty(agentsHome, ['AGENTS.md']))
   add(await firstNonempty(home, ['AGENTS.override.md', 'AGENTS.md']))
-  const directories = await projectDirectories(cwd, fs, signal)
+  const directories =
+    knownDirectories ?? (await projectDirectories(cwd, fs, signal))
   const read = (path: string) => projectText(path, fs, signal)
   const fallback = strings(config.project_doc_fallback_filenames)
   for (const directory of directories) {
@@ -88,14 +90,47 @@ export function renderCodexInstructions(
   return `<system-reminder>\n${intro}\n\n${content || 'No workspace instructions are currently active.'}\n</system-reminder>`
 }
 
-function lastBaseline(session: any) {
-  for (const seq of [...(session.surface?.nodes ?? [])].reverse()) {
-    const event = session.eventAt(seq)
-    if (
-      event?.type === 'user/message' &&
-      event.data.source?.kind === 'codex-compat'
-    )
-      return event.data.source
+function baselineReader() {
+  const sessions = new WeakMap<
+    object,
+    {
+      generation: unknown
+      length: number
+      tail: unknown
+      first: unknown
+      baseline: any
+    }
+  >()
+  return (session: any) => {
+    const surface = session.surface
+    const nodes = surface?.nodes ?? []
+    const previous = sessions.get(session)
+    const appendOnly =
+      previous &&
+      previous.generation === surface?.replaceGeneration &&
+      nodes.length >= previous.length &&
+      nodes[previous.length - 1] === previous.tail &&
+      nodes[0] === previous.first
+    let baseline = appendOnly ? previous.baseline : undefined
+    const start = appendOnly ? previous.length : 0
+    for (let index = nodes.length - 1; index >= start; index--) {
+      const event = session.eventAt(nodes[index])
+      if (
+        event?.type === 'user/message' &&
+        event.data.source?.kind === 'codex-compat'
+      ) {
+        baseline = event.data.source
+        break
+      }
+    }
+    sessions.set(session, {
+      generation: surface?.replaceGeneration,
+      length: nodes.length,
+      tail: nodes.at(-1),
+      first: nodes[0],
+      baseline,
+    })
+    return baseline
   }
 }
 
@@ -165,7 +200,13 @@ function retainNativeInstructionMessage(
 }
 
 /** A logged user-message baseline, never an unlogged mutation of LLM requests. */
-export function installCodexInstructions(ctx: any, home: string): void {
+export function installCodexInstructions(
+  ctx: any,
+  home: string,
+  readConfig = (cwd: string, fs: ProjectFileSystem, signal: AbortSignal) =>
+    readCodexConfig(home, cwd, fs, signal),
+): void {
+  const lastBaseline = baselineReader()
   ctx.on(
     'agent/pre-step',
     async ({ agent, messages, signal }: any, next: any) => {
@@ -177,7 +218,7 @@ export function installCodexInstructions(ctx: any, home: string): void {
         const cwd = await ctx.workingDirectory.ensure(agent, signal)
         const fs = agent.ctx?.get('fs') ?? ctx.get?.('fs')
         if (!fs) return decision
-        const config = await readCodexConfig(home, cwd, fs, signal)
+        const config = await readConfig(cwd, fs, signal)
         const directories = await projectDirectories(cwd, fs, signal)
         const files = await loadCodexInstructions(
           home,
@@ -187,6 +228,7 @@ export function installCodexInstructions(ctx: any, home: string): void {
           undefined,
           fs,
           signal,
+          directories,
         )
         const text = renderCodexInstructions(
           files,

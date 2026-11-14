@@ -25,7 +25,7 @@
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.7
+dsh plugin --profile web add dsh-gpt-adapter@0.2.8
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -38,7 +38,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.7.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.8.tgz
 ```
 
 ## 使用 GPT 模型
@@ -88,7 +88,9 @@ Codex 兼容默认开启。目录优先采用插件配置中的 `codexHome`，�
 
 支持标准输入输出（stdio）和流式 HTTP（Streamable HTTP）两种传输方式。可以复用已有配置中的命令、参数、工作目录、环境变量、请求头、令牌环境变量、超时，以及工具启用和禁用列表。
 
-每个会话代理独立持有导入的 MCP 连接，受信任项目的覆盖配置只在对应代理内生效。未显式配置 `cwd` 时，stdio 服务器使用代理的工作目录。配置变化后自动更新对应连接。
+MCP 连接在代理首次执行模型步骤前建立。每个代理独立持有连接，受信任项目的覆盖配置只在对应代理内生效。未显式配置 `cwd` 时，stdio 服务器使用代理的工作目录。代理空闲一分钟后释放连接，在下一步骤前重新连接。启用配置监听时，正在执行的代理自动更新连接；空闲代理在恢复执行时应用配置变化。
+
+可通过 `mcpIdleTimeoutMs` 调整空闲保留时间，设为 `0` 则保留连接直到代理销毁。重新连接可能重置服务器仅保存在内存中的状态；需要跨轮次保留这些状态的服务器应设为 `0`。
 
 认证所需环境变量需要存在于 DSH 宿主环境。依赖 Codex App 认证、浏览器扩展或其他本地服务的服务器，仍需要这些服务可用。适配器不会复现 Codex 的 OAuth、钥匙串会话、App 进程间通信服务、Hooks、专用命令和权限策略。审批与沙箱仍由 DSH 管理。
 
@@ -105,6 +107,7 @@ codexCompatibility:
   importMcpServers: true
   importPluginResources: true
   watch: true
+  mcpIdleTimeoutMs: 60000
   pollIntervalMs: 2000
   mcpAllowlist: []
 ```

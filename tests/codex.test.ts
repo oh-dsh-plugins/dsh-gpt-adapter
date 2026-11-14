@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createServer } from 'node:http'
+import { getEventListeners } from 'node:events'
 import { Client } from '@modelcontextprotocol/client'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
@@ -20,6 +21,7 @@ import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
 import ToolsService from '@deepseek-ai/dsh-tools'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import {
+  CodexResourceCache,
   discoverCodexSnapshot,
   normalizeCodexMcp,
   readCodexConfig,
@@ -105,7 +107,16 @@ async function attachAgent(ctx: Context, cwd: string) {
   const scope = createScope(ctx, agent)
   agent.ctx = scope.ctx
   await ctx.serial('agent/created', { agent, source: 'create' } as any)
+  await preStep(ctx, agent)
   return agent
+}
+async function preStep(ctx: Context, agent: any, signal?: AbortSignal) {
+  const admitted = await ctx.get('tools')!.resolve({
+    agent,
+    modelSelection: { provider: 'fixture', model: 'fixture' },
+    signal: signal ?? new AbortController().signal,
+  })
+  admitted?.dispose()
 }
 async function httpMcp() {
   const fixture = {
@@ -777,6 +788,235 @@ describe('Codex instruction context', () => {
 })
 
 describe('Codex runtime integration', () => {
+  it.each([true, false])(
+    'cancels an in-flight skill read and contains late results on disposal (cooperative=%s)',
+    async (cooperative) => {
+      const home = await directory()
+      const path = join(home, 'skills/example/SKILL.md')
+      const content =
+        '---\nname: example\ndescription: Fixture\n---\nSkill body'
+      await put(path, content)
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      let reading = false
+      let readSignal: AbortSignal | undefined
+      let release = () => {}
+      let entered!: () => void
+      const started = new Promise<void>((resolve) => (entered = resolve))
+      ctx.provide('fs', {
+        ...skillFs,
+        readText(target: any, signal?: AbortSignal) {
+          if (!reading || target.displayPath !== path)
+            return skillFs.readText(target)
+          readSignal = signal
+          entered()
+          return new Promise<string>((resolve, reject) => {
+            const abort = () => reject(signal!.reason)
+            release = () => {
+              signal?.removeEventListener('abort', abort)
+              resolve(content)
+            }
+            if (cooperative) {
+              signal?.addEventListener('abort', abort, { once: true })
+              if (signal?.aborted) abort()
+            }
+          })
+        },
+      } as any)
+      await ctx.plugin(SkillRegistry)
+      const registry = ctx.get('skills') as SkillRegistry
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importMcpServers: false,
+      })
+      cleanup.push(() => runtime.dispose())
+      await new Promise<void>((done) => setImmediate(done))
+      await runtime.refresh()
+      await registry.list({ cwd: home })
+      const caller = new AbortController()
+      const listeners = getEventListeners(caller.signal, 'abort').length
+      const reads = vi.spyOn(CodexResourceCache.prototype, 'read')
+      try {
+        reading = true
+        const result = registry
+          .get('example', { cwd: home, signal: caller.signal })
+          .then(
+            (value) => ({ value, error: undefined }),
+            (error) => ({ value: undefined, error }),
+          )
+        await started
+        await runtime.dispose()
+        const callsAfterDispose = reads.mock.calls.length
+        expect(readSignal?.aborted).toBe(true)
+        expect(caller.signal.aborted).toBe(false)
+        release()
+        const settled = await result
+        expect(settled.value).toBeUndefined()
+        expect(settled.error).toBeInstanceOf(Error)
+        expect(reads).toHaveBeenCalledTimes(callsAfterDispose)
+        expect(getEventListeners(caller.signal, 'abort')).toHaveLength(
+          listeners,
+        )
+      } finally {
+        release()
+        reads.mockRestore()
+      }
+    },
+  )
+
+  it('does not repopulate a scoped snapshot when disposal wins a project read', async () => {
+    const home = await directory(),
+      project = join(home, 'project')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await put(
+      join(home, 'config.toml'),
+      `[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
+    )
+    const path = join(project, '.codex/config.toml')
+    await put(path, '[skills.bundled]\nenabled=false\n')
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    let reading = false
+    let readSignal: AbortSignal | undefined
+    let release = () => {}
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => (entered = resolve))
+    ctx.provide('fs', {
+      ...skillFs,
+      readText(target: any, signal?: AbortSignal) {
+        if (!reading || target.displayPath !== path)
+          return skillFs.readText(target)
+        readSignal = signal
+        entered()
+        return new Promise<string>((resolve) => {
+          release = () => resolve('[skills.bundled]\nenabled=false\n')
+        })
+      },
+    } as any)
+    await ctx.plugin(SkillRegistry)
+    const registry = ctx.get('skills') as SkillRegistry
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importMcpServers: false,
+    })
+    cleanup.push(() => runtime.dispose())
+    await new Promise<void>((done) => setImmediate(done))
+    await runtime.refresh()
+    let snapshots: Map<string, unknown> | undefined
+    const originalSet = Map.prototype.set
+    const observer = vi
+      .spyOn(Map.prototype, 'set')
+      .mockImplementation(function (this: Map<any, any>, key: any, value: any) {
+        if (
+          String(key).endsWith(`:${project}`) &&
+          value?.skillRoots &&
+          value?.config &&
+          value?.items
+        )
+          snapshots = this
+        return originalSet.call(this, key, value)
+      })
+    try {
+      await registry.list({ cwd: project })
+      expect(snapshots?.size).toBe(1)
+      reading = true
+      const result = registry.list({ cwd: project }).then(
+        () => undefined,
+        (error) => error,
+      )
+      await started
+      await runtime.dispose()
+      expect(readSignal?.aborted).toBe(true)
+      expect(snapshots?.size).toBe(0)
+      release()
+      expect(await result).toBeInstanceOf(Error)
+      expect(snapshots?.size).toBe(0)
+    } finally {
+      release()
+      observer.mockRestore()
+    }
+  })
+
+  it('releases temporary skill-provider listeners across project lists and reads', async () => {
+    const home = await directory(),
+      project = join(home, 'project')
+    const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await put(
+      join(home, 'config.toml'),
+      `[plugins."active@sample"]\nenabled=false\n[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
+    )
+    await put(
+      join(project, '.codex/config.toml'),
+      '[plugins."active@sample"]\nenabled=true\n',
+    )
+    await put(
+      join(plugin, '.codex-plugin/plugin.json'),
+      JSON.stringify({ name: 'active', skills: './skills' }),
+    )
+    await put(
+      join(plugin, 'skills/example/SKILL.md'),
+      '---\nname: example\ndescription: Fixture\n---\nScoped skill',
+    )
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    ctx.provide('fs', skillFs as any)
+    const lifetime = new AbortController()
+    let provider: any
+    ctx.provide('skills', {
+      registerProvider(factory: any) {
+        provider = factory({ signal: lifetime.signal, invalidate() {} })
+        return () => lifetime.abort()
+      },
+      async list() {
+        return []
+      },
+      async snapshot() {
+        return { skills: [] }
+      },
+      async get() {
+        return undefined
+      },
+    } as any)
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      importInstructions: false,
+      importMcpServers: false,
+    })
+    await new Promise<void>((done) => setImmediate(done))
+    await runtime.refresh()
+    const before = getEventListeners(lifetime.signal, 'abort').length
+    expect(before).toBeGreaterThan(0)
+    let candidate: any
+    for (let index = 0; index < 25; index++) {
+      const call = { cwd: project, signal: new AbortController().signal }
+      const listed = await provider.list(call)
+      candidate = listed.candidates.find(
+        (skill: any) => skill.name === 'active-example',
+      )
+      expect((await provider.get(candidate, call)).content).toContain(
+        'Scoped skill',
+      )
+      expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(before)
+    }
+    const failure = vi
+      .spyOn(skillFs, 'readText')
+      .mockRejectedValueOnce(new Error('fixture read failed'))
+    try {
+      await provider.get(candidate, { cwd: project }).catch(() => undefined)
+      expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(before)
+    } finally {
+      failure.mockRestore()
+    }
+    await runtime.dispose()
+    expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(0)
+  })
+
   it('findings: starts stdio MCPs in each Agent project and updates cwd on a project switch', async () => {
     const home = await directory(),
       aDir = join(home, 'a'),
@@ -877,6 +1117,8 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
         if (fails) throw failure
       })
       const child: any = {
+        tools: { resolve: async () => ({ dispose() {} }) },
+        effect: (setup: any) => setup(),
         agents: { list: () => [] },
         workingDirectory: { ensure: async () => home },
         get: () => fixtureFs,
@@ -902,7 +1144,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
       })
       let shutdown: Promise<unknown> | undefined
       try {
-        await handlers.get('agent/created')!({ agent })
+        await child.tools.resolve({ agent })
         await runtime.refresh()
         const cleanup = handlers.get('agent/disposed')!({
           agent,
@@ -960,6 +1202,8 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
         release = resolve
       })
       const child: any = {
+        tools: { resolve: async () => ({ dispose() {} }) },
+        effect: (setup: any) => setup(),
         agents: { list: () => [] },
         workingDirectory: { ensure: async (agent: any) => agent.cwd },
         get: (name: string) => (name === 'fs' ? fixtureFs : undefined),
@@ -1004,7 +1248,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
       })
       let completion: Promise<unknown> | undefined
       try {
-        await handlers.get('agent/created')!({ agent })
+        await child.tools.resolve({ agent })
         await runtime.refresh()
         expect(index).toBe(3)
         completion = runtime.dispose().then(
@@ -1233,7 +1477,10 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     ctx.provide('fs', fixtureFs as any)
     ctx.provide('workingDirectory', { ensure } as any)
     ctx.provide('agents', { list: () => [] } as any)
-    ctx.provide('tools', { register: () => () => {} } as any)
+    ctx.provide('tools', {
+      register: () => () => {},
+      resolve: async () => ({ dispose() {} }),
+    } as any)
     const runtime = installCodexCompatibility(ctx, {
       ...options,
       codexHome: home,
@@ -1250,16 +1497,10 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
         }),
     )
     const abort = new AbortController()
-    const first = ctx.serial('agent/created', {
-      agent,
-      source: 'create',
-      signal: abort.signal,
-    } as any)
+    const first = preStep(ctx, agent, abort.signal)
     const canceled = expect(first).rejects.toThrow('caller canceled')
     await vi.waitFor(() => expect(ensure).toHaveBeenCalledTimes(1))
-    const queued = Array.from({ length: 20 }, () =>
-      ctx.serial('agent/created', { agent, source: 'create' } as any),
-    )
+    const queued = Array.from({ length: 20 }, () => preStep(ctx, agent))
     await Promise.resolve()
     expect(ensure).toHaveBeenCalledTimes(1)
     abort.abort(new Error('caller canceled'))
@@ -1306,7 +1547,12 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     const observer = vi
       .spyOn(Map.prototype, 'set')
       .mockImplementation(function (this: Map<any, any>, key: any, value: any) {
-        if (key === first && value?.skillRoots && value?.config && value?.items)
+        if (
+          String(key).endsWith(`:${first}`) &&
+          value?.skillRoots &&
+          value?.config &&
+          value?.items
+        )
           snapshots = this
         return originalSet.call(this, key, value)
       })
@@ -1316,7 +1562,9 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     for (let index = 0; index < 65; index++)
       await registry.list({ cwd: join(home, `scope-${index}`) } as any)
     expect(snapshots?.size).toBe(64)
-    expect(snapshots?.has(first)).toBe(false)
+    expect(
+      [...snapshots!.keys()].some((key) => key.endsWith(`:${first}`)),
+    ).toBe(false)
     await runtime.dispose()
     expect(snapshots?.size).toBe(0)
   })
@@ -1334,6 +1582,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     mcpHost(ctx)
     const tools = new Map<string, any>()
     ctx.provide('tools', {
+      resolve: async () => ({ dispose() {} }),
       register(tool: any) {
         tools.set(tool.name, tool)
         return () => tools.delete(tool.name)
@@ -1554,6 +1803,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     const tools = new Map<string, any>()
     mcpHost(ctx)
     ctx.provide('tools', {
+      resolve: async () => ({ dispose() {} }),
       register: (tool: any) => {
         tools.set(tool.name, tool)
         return () => tools.delete(tool.name)
@@ -1649,6 +1899,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     const tools = new Map<string, any>()
     mcpHost(ctx)
     ctx.provide('tools', {
+      resolve: async () => ({ dispose() {} }),
       register: (tool: any) => {
         tools.set(tool.name, tool)
         return () => tools.delete(tool.name)
@@ -1685,7 +1936,10 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     const ctx = new Context()
     cleanup.push(() => ctx.fiber.dispose())
     mcpHost(ctx)
-    ctx.provide('tools', { register: () => () => {} })
+    ctx.provide('tools', {
+      register: () => () => {},
+      resolve: async () => ({ dispose() {} }),
+    })
     const runtime = installCodexCompatibility(ctx, {
       ...options,
       codexHome: home,

@@ -106,6 +106,7 @@ export const Config: z<
       importPluginResources: z.boolean().default(true),
       watch: z.boolean().default(true),
       pollIntervalMs: z.number().min(250).max(60000).default(2000),
+      mcpIdleTimeoutMs: z.number().min(0).max(2147483647).default(60000),
       mcpAllowlist: z.array(String).default([]),
     })
     .default({}),

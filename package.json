@@ -1,6 +1,6 @@
 {
   "name": "dsh-gpt-adapter",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -91,6 +91,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-agent-loop": "0.2.2-rc.1",
     "@deepseek-ai/dsh-api-remotes": "0.2.2-rc.1",
     "@deepseek-ai/dsh-api-session-controller": "0.2.2-rc.1",
     "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
