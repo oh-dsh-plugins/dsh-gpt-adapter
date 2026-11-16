@@ -49,7 +49,11 @@ export type CodexCompatibilityRuntime = {
 const fingerprint = (v: unknown) =>
   createHash('sha256').update(JSON.stringify(v)).digest('hex')
 const skillRead = Symbol('codex skill read')
-type SkillRead = { fs: ProjectFileSystem | undefined; current(): CodexSnapshot }
+type SkillRead = {
+  fs: ProjectFileSystem | undefined
+  current(): CodexSnapshot
+  targets: Map<string, Promise<unknown>>
+}
 type PrepareSkills = <T>(
   options: any,
   action: (options: any) => Promise<T>,
@@ -68,9 +72,10 @@ const skillAllowed = (
   plugin: string | undefined,
   fs: ProjectFileSystem | undefined,
   signal?: AbortSignal,
+  targets?: Map<string, Promise<unknown>>,
 ) =>
   fs
-    ? skillEnabledWithFs(config, skill, plugin, fs, signal)
+    ? skillEnabledWithFs(config, skill, plugin, fs, signal, targets)
     : Promise.resolve(skillEnabled(config, skill, plugin))
 
 // Same public-name encoding as the pinned DSH MCP client (DeepSeek MIT).
@@ -96,7 +101,14 @@ function installSkillPolicy(ctx: any, prepare: PrepareSkills) {
     const read = options[skillRead] as SkillRead
     const config = read.current().config
     const fs = read.fs
-    return skillAllowed(config, skill, undefined, fs, options.signal)
+    return skillAllowed(
+      config,
+      skill,
+      undefined,
+      fs,
+      options.signal,
+      read.targets,
+    )
   }
   async function list(this: any, ...args: any[]) {
     return prepare(args[0], async (options) => {
@@ -186,7 +198,13 @@ export function installCodexCompatibility(
   }
   const agents = new Map<any, AgentState>()
   let skillDispose: (() => void) | undefined
-  let skills: FileSystemSkillProvider[] = []
+  let skills: Array<
+    | FileSystemSkillProvider
+    | {
+        provider: FileSystemSkillProvider
+        dispose(): Promise<void>
+      }
+  > = []
   let skillContext: any
   let mcpContext: any
   let skillsKey = ''
@@ -316,9 +334,9 @@ export function installCodexCompatibility(
         return current
       } catch {
         signal.throwIfAborted()
-        const retained = scopedSnapshots.get(key) ??
-          previous ??
-          fallback ?? { config: {}, mcp: [], skillRoots: [], items: [] }
+        const retained = scopedSnapshots.get(key)
+        if (!retained)
+          throw new Error('Codex skill policy is unavailable for this scope')
         observeSkillPolicy(key, retained)
         return retained
       } finally {
@@ -349,6 +367,7 @@ export function installCodexCompatibility(
       const read: SkillRead = {
         fs,
         current: () => scopedSnapshots.get(key) ?? snapshot,
+        targets: new Map(),
       }
       return action({
         ...options,
@@ -372,7 +391,7 @@ export function installCodexCompatibility(
       invalidateSkills = control.invalidate
       const temporary = (
         options: ConstructorParameters<typeof FileSystemSkillProvider>[2],
-        signal: AbortSignal,
+        signal?: AbortSignal,
       ) => {
         const lifetime = new AbortController()
         const provider = new CodexSkillFileSystem(
@@ -383,13 +402,13 @@ export function installCodexCompatibility(
           },
           options,
         )
-        const abort = () => lifetime.abort(signal.reason)
-        signal.addEventListener('abort', abort, { once: true })
-        if (signal.aborted) abort()
+        const abort = () => lifetime.abort(signal?.reason)
+        signal?.addEventListener('abort', abort, { once: true })
+        if (signal?.aborted) abort()
         return {
           provider,
           async dispose() {
-            signal.removeEventListener('abort', abort)
+            signal?.removeEventListener('abort', abort)
             lifetime.abort()
             await provider.dispose()
           },
@@ -404,7 +423,46 @@ export function installCodexCompatibility(
             watch: config.watch,
           }),
       )
-      skills = sources
+      skills = [...sources]
+      const watched = new Map<
+        string,
+        Map<string, ReturnType<typeof temporary>>
+      >()
+      const listSource = async (
+        options: ConstructorParameters<typeof FileSystemSkillProvider>[2],
+        signal: AbortSignal,
+        groupKey: string,
+      ) => {
+        if (!config.watch) return temporary(options, signal)
+        signal.throwIfAborted()
+        control.signal.throwIfAborted()
+        let group = watched.get(groupKey)
+        if (!group) group = new Map()
+        watched.delete(groupKey)
+        watched.set(groupKey, group)
+        const key = JSON.stringify(options?.customSkillDirs)
+        let source = group.get(key)
+        if (!source) {
+          // Runtime ownership closes these watchers on eviction, remount, or unload.
+          source = temporary({ ...options, watch: true })
+          group.set(key, source)
+          skills.push(source)
+        }
+        if (watched.size > 64) {
+          // Retain complete lookup working sets so a large project never evicts
+          // its own roots while the native catalog is being assembled.
+          control.invalidate()
+          const oldest = watched.keys().next().value!
+          const evicted = watched.get(oldest)!
+          watched.delete(oldest)
+          const providers = new Set<unknown>(evicted.values())
+          await Promise.all(
+            [...evicted.values()].map((entry) => entry.dispose()),
+          )
+          skills = skills.filter((entry) => !providers.has(entry))
+        }
+        return { provider: source.provider, dispose: async () => {} }
+      }
       const withOptions = <T>(
         options: any,
         action: (options: any) => Promise<T>,
@@ -426,21 +484,28 @@ export function installCodexCompatibility(
             const rootKey = (root: any) =>
               `${root.path}\0${root.plugin ?? ''}\0${root.pluginId ?? ''}`
             const activeRoots = new Set(activeSnapshot.skillRoots.map(rootKey))
+            const mountedRoots = new Set(snapshot.skillRoots.map(rootKey))
+            const scopedRoots = activeSnapshot.skillRoots.filter(
+              (root) => !mountedRoots.has(rootKey(root)),
+            )
+            const projectRoots = options.cwd
+              ? (await projectDirectories(options.cwd, fs, options.signal))
+                  .reverse()
+                  .map((path) => join(path, '.agents', 'skills'))
+              : []
+            const groupKey = JSON.stringify([
+              projectRoots,
+              scopedRoots.map((root) => root.path),
+            ])
             if (options.cwd) {
-              const roots = await projectDirectories(
-                options.cwd,
-                fs,
-                options.signal,
-              )
-              const project = temporary(
+              const project = await listSource(
                 {
                   includeDefaultRoots: false,
-                  customSkillDirs: roots
-                    .reverse()
-                    .map((path) => join(path, '.agents', 'skills')),
+                  customSkillDirs: projectRoots,
                   watch: false,
                 },
                 options.signal,
+                groupKey,
               )
               try {
                 const result = await project.provider.list(options)
@@ -456,6 +521,7 @@ export function installCodexCompatibility(
                       undefined,
                       fs,
                       options.signal,
+                      (options[skillRead] as SkillRead).targets,
                     ))
                   )
                     continue
@@ -490,6 +556,7 @@ export function installCodexCompatibility(
                     plugin,
                     fs,
                     options.signal,
+                    (options[skillRead] as SkillRead).targets,
                   ))
                 )
                   continue
@@ -508,14 +575,8 @@ export function installCodexCompatibility(
                 })
               }
             }
-            for (const root of activeSnapshot.skillRoots) {
-              if (
-                snapshot.skillRoots.some(
-                  (current) => rootKey(current) === rootKey(root),
-                )
-              )
-                continue
-              const scoped = temporary(
+            for (const root of scopedRoots) {
+              const scoped = await listSource(
                 {
                   providerName: `codex-scoped-${root.path}`,
                   includeDefaultRoots: false,
@@ -523,6 +584,7 @@ export function installCodexCompatibility(
                   watch: false,
                 },
                 options.signal,
+                groupKey,
               )
               try {
                 const result = await scoped.provider.list(options)
@@ -538,6 +600,7 @@ export function installCodexCompatibility(
                       root.plugin,
                       fs,
                       options.signal,
+                      (options[skillRead] as SkillRead).targets,
                     ))
                   )
                     continue
@@ -600,12 +663,15 @@ export function installCodexCompatibility(
                 locator.plugin,
                 (options[skillRead] as SkillRead).fs,
                 options.signal,
+                (options[skillRead] as SkillRead).targets,
               ))
             )
               return undefined
             return {
               ...result,
-              name: candidate.name,
+              name: locator.plugin
+                ? `${locator.plugin}-${result.name}`
+                : result.name,
               provider: 'codex-filesystem',
               source: candidate.source,
             }
@@ -1045,10 +1111,25 @@ export function installCodexCompatibility(
       if (closed) return
       if (config.importSkills) {
         skillContext = child
-        child.effect(() => () => {
+        child.on(
+          'fs/observed',
+          (target: any, _observation: any, actor: any) => {
+            if (actor?.name !== 'write' && actor?.name !== 'edit') return
+            for (const owned of skills) {
+              const provider = 'provider' in owned ? owned.provider : owned
+              provider.observeHostMutation(target.displayPath)
+            }
+          },
+        )
+        child.effect(() => async () => {
           if (skillContext === child) {
+            skillDispose?.()
+            skillDispose = undefined
+            const owned = skills
+            skills = []
             skillContext = undefined
             skillsKey = ''
+            await Promise.all(owned.map((provider) => provider.dispose()))
           }
         })
         installSkillPolicy(child, prepareSkills)

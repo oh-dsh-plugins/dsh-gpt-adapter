@@ -62,6 +62,25 @@ export function nativeContextSettingsSource(
     ),
     'ModelsSection',
   )
+  const editor = one(
+    nodes.filter(
+      (node) =>
+        ts.isFunctionDeclaration(node) && node.name?.text === 'ProviderEditor',
+    ),
+    'ProviderEditor',
+  )
+  const failure = one(
+    nodes.filter(
+      (node) =>
+        ts.isPropertyAssignment(node) &&
+        node.name.getText(ast) === 'children' &&
+        ts.isIdentifier(node.initializer) &&
+        node.initializer.text === 'failure' &&
+        node.pos > editor.pos &&
+        node.end < editor.end,
+    ),
+    'provider failure message',
+  ).initializer
   const input = one(
     nodes.filter(
       (node) =>
@@ -95,6 +114,11 @@ export function nativeContextSettingsSource(
   const eligible =
     'field === "contextWindow" && props.inputField === "input" && isGptModel(model)'
   const edits = [
+    {
+      start: failure.getStart(ast),
+      end: failure.end,
+      text: '(0, react_jsx_runtime.jsx)(OwnedErrorMessage, {message: failure})',
+    },
     {
       start: input.getStart(ast),
       end: input.end,

@@ -85,6 +85,39 @@ describe('automatic refresh lifecycle', () => {
     runner.dispose()
   })
 
+  it.each([[[]], [['flex']], [['unknown']]])(
+    'keeps the last usable snapshot when upstream tiers are unusable (%j)',
+    async (serviceTiers) => {
+      let invalid = false
+      const publish = vi.fn(async () => {})
+      const runner = new ModelSynchronizer(
+        async () => ({ ...config, capabilityCatalogUrl: '' }),
+        publish,
+        async () =>
+          reply({
+            data: [
+              {
+                id: 'gpt-fixture',
+                service_tiers: invalid ? serviceTiers : ['default', 'priority'],
+              },
+            ],
+          }),
+      )
+      try {
+        const before = await runner.refresh()
+        invalid = true
+        await expect(runner.refresh()).rejects.toThrow(
+          'no supported service tiers',
+        )
+        expect(runner.current()).toEqual(before)
+        expect(publish).toHaveBeenCalledTimes(1)
+        expect(runner.getStatus().state).toBe('error')
+      } finally {
+        runner.dispose()
+      }
+    },
+  )
+
   it('cancels an in-flight refresh and prevents publishing after disposal', async () => {
     const publish = vi.fn(async () => {})
     const runner = new ModelSynchronizer(
@@ -129,6 +162,47 @@ describe('automatic refresh lifecycle', () => {
     expect(runner.current()!.models[0]!.stale).toBe(true)
     await runner.removeStale(['gpt-6-astra'])
     expect(runner.current()!.models).toEqual([])
+    runner.dispose()
+  })
+
+  it('waits for stale cleanup before refreshing from its snapshot', async () => {
+    let absent = false,
+      pause = false
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>((done) => {
+      release = done
+    })
+    const started = new Promise<void>((done) => {
+      entered = done
+    })
+    let tail: Promise<void> = Promise.resolve()
+    const published: string[][] = []
+    const runner = new ModelSynchronizer(
+      async () => ({ ...config, capabilityCatalogUrl: '' }),
+      (snapshot) => {
+        const work = tail.then(async () => {
+          if (pause && !snapshot.models.length) {
+            entered()
+            await gate
+          }
+          published.push(snapshot.models.map((model) => model.id))
+        })
+        tail = work
+        return work
+      },
+      async () => reply({ data: absent ? [] : [{ id: 'gpt-review' }] }),
+    )
+    await runner.refresh()
+    absent = true
+    await runner.refresh()
+    pause = true
+    const cleanup = runner.removeStale(['gpt-review'])
+    await started
+    const refresh = runner.refresh()
+    release()
+    await Promise.all([cleanup, refresh])
+    expect(runner.current()!.models).toEqual([])
+    expect(published.at(-1)).toEqual([])
     runner.dispose()
   })
 

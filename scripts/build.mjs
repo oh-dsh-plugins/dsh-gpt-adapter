@@ -89,7 +89,7 @@ await build({
             import * as JSX from 'react/jsx-runtime';
             import * as Primitives from '@deepseek-ai/dsh-client-ui-primitives';
             import * as Store from '@deepseek-ai/dsh-client-store';
-            import { ContextWindowPreset } from ${JSON.stringify(fileURLToPath(new URL('../src/client/context-window-preset.tsx', import.meta.url)))};
+            import { ContextWindowPreset, OwnedErrorMessage } from ${JSON.stringify(fileURLToPath(new URL('../src/client/context-window-preset.tsx', import.meta.url)))};
             import { isGptModel } from ${JSON.stringify(fileURLToPath(new URL('../src/capabilities.ts', import.meta.url)))};
             import { validContextWindow } from ${JSON.stringify(fileURLToPath(new URL('../src/context-window.ts', import.meta.url)))};
             function nativeRequire(name) {

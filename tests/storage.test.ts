@@ -1,10 +1,41 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { JsonStorage } from '../src/storage.js'
 
 describe('route cache commit guard', () => {
+  it('treats invalid JSON and rejected cache shapes as misses, but preserves I/O errors', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-storage-test-'))
+    try {
+      const storage = new JsonStorage(directory)
+      const path = join(
+        directory,
+        createHash('sha256').update('cache').digest('hex') + '.json',
+      )
+      await writeFile(path, '{"truncated":')
+      await expect(storage.read('cache')).resolves.toBeUndefined()
+      await storage.write('cache', ['malformed'])
+      await expect(
+        storage.read(
+          'cache',
+          (value): value is Record<string, unknown> =>
+            value !== null &&
+            typeof value === 'object' &&
+            !Array.isArray(value),
+        ),
+      ).resolves.toBeUndefined()
+      await rm(path)
+      await mkdir(path)
+      await expect(storage.read('cache')).rejects.toMatchObject({
+        code: 'EISDIR',
+      })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('preserves the previous file and removes the temporary file when the publisher expires', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dsh-storage-test-'))
     try {

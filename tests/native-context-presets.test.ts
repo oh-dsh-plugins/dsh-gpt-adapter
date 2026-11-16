@@ -14,7 +14,10 @@ import { installSettingsOverlay } from '../src/settings-overlay.js'
 import {
   ContextWindowPreset,
   ContextWindowPresetScope,
+  OwnedErrorMessage,
 } from '../src/client/context-window-preset.js'
+import { nativeLocale, localeContext } from './client-locale-fixture.js'
+import { NS, dictionaries } from '../src/client/locales.js'
 
 const require = createRequire(import.meta.url)
 const { nativeContextSettingsSource } = await import(
@@ -83,8 +86,15 @@ function nativeComponents(adapted: NativeSource) {
     'ContextWindowPreset',
     'validContextWindow',
     'isGptModel',
+    'OwnedErrorMessage',
     adapted.body,
-  )(modules, ContextWindowPreset, validContextWindow, isGptModel)
+  )(
+    modules,
+    ContextWindowPreset,
+    validContextWindow,
+    isGptModel,
+    OwnedErrorMessage,
+  )
 }
 
 async function renderEditor(
@@ -94,6 +104,8 @@ async function renderEditor(
   enabled = true,
 ) {
   const native = nativeComponents(adapted)
+  const locale = nativeLocale(modules)
+  locale.register(NS, dictionaries)
   let draft = initial
   const onBusyChange = () => {}
   function Editor() {
@@ -101,7 +113,7 @@ async function renderEditor(
     draft = models
     return React.createElement(
       ContextWindowPresetScope.Provider,
-      { value: enabled },
+      { value: enabled ? locale.bind(NS) : undefined },
       React.createElement(native.ModelListEditor, {
         models,
         onChange: setModels,
@@ -165,6 +177,162 @@ describe.each(packages)('native context presets (%s)', (packageName) => {
   const adapted = nativeContextSettingsSource(packageName)
   const editor = (initial: any[], disabled = false, enabled = true) =>
     renderEditor(adapted, initial, disabled, enabled)
+  it('updates native context drafts and save errors through the real locale slot renderer', async () => {
+    let renderer: any, settings: any
+    const load = (source: string, capture: (value: any) => void) =>
+      new Function('window', source)({
+        __ModuleLoader__: {
+          load: (entry: any) => capture(entry.factory(modules)),
+        },
+      })
+    load(
+      readFileSync(
+        require.resolve('@deepseek-ai/dsh-client-ui-renderer/client'),
+        'utf8',
+      ),
+      (value) => {
+        renderer = value
+      },
+    )
+    load(
+      readFileSync(
+        require.resolve('@deepseek-ai/dsh-client-ui-settings/client'),
+        'utf8',
+      ).replace(
+        'exports.apply',
+        'exports.SettingsSchemaService = SettingsSchemaService; exports.apply',
+      ),
+      (value) => {
+        settings = value
+      },
+    )
+    const { Context } = require('@deepseek-ai/cordis')
+    const ctx = new Context()
+    const locale = nativeLocale(modules)
+    const release = locale.register(NS, dictionaries)
+    renderer.apply(ctx)
+    const slots = ctx.slots
+    slots.installLocale(locale)
+    const absent = { key: undefined, hooks: {}, keyedHooks: {}, props: {} }
+    const source = { getSnapshot: () => absent, subscribe: () => () => {} }
+    slots.installScope('session', {
+      current: source,
+      bindingSource: () => source,
+    })
+    const schema = new settings.SettingsSchemaService(ctx)
+    const native = nativeComponents(adapted)
+    const value = {
+      providers: {
+        fixture: {
+          api: 'openai-responses',
+          models: [{ id: 'gpt-example', contextWindow: 750000 }],
+        },
+      },
+    }
+    const namespace = {
+      ns: 'llm-pi-ai',
+      revision: 1,
+      value,
+      user: value,
+      base: {},
+      schema: Config.toJSON(),
+    }
+    let writes = 0
+    const operations = {
+      writeSettings: async () => {
+        writes++
+        return {
+          kind: 'rejected',
+          message: '上下文窗口必须大于当前最大输出和压缩预留的总和',
+        }
+      },
+    }
+    slots.register({ name: 'root', locale: NS }, ({ t }: any) =>
+      React.createElement(
+        ContextWindowPresetScope.Provider,
+        { value: t },
+        React.createElement(native.ProviderEditor, {
+          namespace,
+          schema,
+          settingsPath: ['providers', 'fixture'],
+          provider: 'fixture',
+          operations,
+          t: (key: string) => key,
+          onClose() {},
+          declared: true,
+        }),
+      ),
+    )
+    const container = document.createElement('div')
+    document.body.append(container)
+    let unmount: () => void = () => {}
+    try {
+      await act(async () => {
+        unmount = ctx.uiRenderer.mount(container)
+      })
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>(
+            'button[aria-label="modelAdvanced 1"]',
+          )!
+          .click(),
+      )
+      const select = container.querySelector<HTMLSelectElement>(
+        'select[aria-label="contextWindow 1"]',
+      )!
+      expect([...select.options].map((o) => o.textContent)).toEqual([
+        '默认',
+        '516K',
+        '1M',
+        '自定义',
+      ])
+      const input = container.querySelector<HTMLInputElement>(
+        'input[placeholder="输入上下文窗口"]',
+      )!
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          'value',
+        )!.set!.call(input, '760K')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () =>
+        [...container.querySelectorAll<HTMLButtonElement>('button')]
+          .find((b) => b.textContent === 'apply')!
+          .click(),
+      )
+      expect(writes).toBe(1)
+      expect(container.textContent).toContain(
+        '上下文窗口必须大于当前最大输出和压缩预留的总和',
+      )
+      await act(async () => locale.setLocale('en'))
+      expect([...select.options].map((o) => o.textContent)).toEqual([
+        'Default',
+        '516K',
+        '1M',
+        'Custom',
+      ])
+      expect(input.value).toBe('760K')
+      expect(input.placeholder).toBe('Enter context window')
+      expect(input.getAttribute('aria-label')).toBe(
+        'contextWindow 1 custom value',
+      )
+      expect(container.textContent).toContain(
+        'Context window must exceed the maximum output and compaction reserve combined',
+      )
+      expect(writes).toBe(1)
+      await act(async () => locale.setLocale('zh'))
+      expect(input.value).toBe('760K')
+      expect(container.textContent).toContain(
+        '上下文窗口必须大于当前最大输出和压缩预留的总和',
+      )
+    } finally {
+      await act(async () => unmount())
+      release()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('offers four choices at the original field and shows an input only for custom', async () => {
     const f = await editor([
       {
@@ -445,7 +613,10 @@ function client() {
     },
   })
   new Function(readFileSync('lib/client.js', 'utf8'))()
-  return result
+  const loaded = result
+  return {
+    apply: (ctx: any) => loaded.apply(localeContext(ctx, modules, cleanup)),
+  }
 }
 
 describe.each(packages)('native Models entry (%s)', (packageName) => {

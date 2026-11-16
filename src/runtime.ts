@@ -11,6 +11,7 @@ export type SyncStatus = {
 export class ModelSynchronizer {
   private snapshot: SyncSnapshot | undefined
   private pending: Promise<SyncSnapshot> | undefined
+  private pruning: Promise<SyncSnapshot> | undefined
   private timer: ReturnType<typeof setTimeout> | undefined
   private abort: AbortController | undefined
   private stopped = false
@@ -42,6 +43,11 @@ export class ModelSynchronizer {
 
   refresh(): Promise<SyncSnapshot> {
     if (this.stopped) return Promise.reject(new Error('synchronizer stopped'))
+    if (this.pruning)
+      return this.pruning.then(
+        () => this.refresh(),
+        () => this.refresh(),
+      )
     if (this.pending) return this.pending
     if (this.timer) clearTimeout(this.timer)
     this.status = { state: 'refreshing' }
@@ -106,15 +112,25 @@ export class ModelSynchronizer {
     return this.pending
   }
 
-  async removeStale(ids: readonly string[]): Promise<SyncSnapshot> {
-    if (this.stopped) throw new Error('synchronizer stopped')
-    if (this.pending) await this.pending
-    if (!this.snapshot) throw new Error('no model snapshot available')
-    const next = pruneStale(this.snapshot, ids)
-    await this.publish(next)
-    if (this.stopped) throw new Error('synchronizer stopped')
-    this.snapshot = next
-    return structuredClone(next)
+  removeStale(ids: readonly string[]): Promise<SyncSnapshot> {
+    if (this.stopped) return Promise.reject(new Error('synchronizer stopped'))
+    const preceding = this.pruning ?? this.pending
+    const work = (async () => {
+      await preceding
+      if (this.stopped) throw new Error('synchronizer stopped')
+      if (!this.snapshot) throw new Error('no model snapshot available')
+      const next = pruneStale(this.snapshot, ids)
+      await this.publish(next)
+      if (this.stopped) throw new Error('synchronizer stopped')
+      this.snapshot = next
+      return structuredClone(next)
+    })()
+    this.pruning = work
+    const finished = () => {
+      if (this.pruning === work) this.pruning = undefined
+    }
+    void work.then(finished, finished)
+    return work
   }
 
   dispose(): void {

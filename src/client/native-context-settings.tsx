@@ -3,10 +3,12 @@ import type { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
 import { nativeModelsRuntimes } from 'dsh-gpt-adapter/native-context-settings'
 import { ContextWindowPresetScope } from './context-window-preset.js'
+import type { Translator } from './locales.js'
 
 /** Keep the native entry, controller, stores, child slots, and save operations. */
 export function installNativeContextPresets(
   slots: Pick<SlotRegistry, 'entries' | 'subscribe' | 'provideRoot'>,
+  t: Translator,
 ) {
   let current:
     | {
@@ -43,13 +45,12 @@ export function installNativeContextPresets(
     const runtime = nativeModelsRuntimes.find(
       (candidate) => candidate.expectedModelsSectionSource === source,
     )
-    if (!runtime)
-      throw new Error('原生模型设置组件与已核验版本不一致，无法安装上下文预设')
+    if (!runtime) throw new Error(t('nativeMismatch'))
     const NativeModelsSection = runtime.getComponent()
     function ModelsWithContextPresets(props: Record<string, unknown>) {
       return (
         <ContextWindowPresetScope.Provider
-          value={props.gptContextPresetControls === true}
+          value={props.gptContextPresetControls === true ? t : undefined}
         >
           <NativeModelsSection {...props} />
         </ContextWindowPresetScope.Provider>

@@ -1,7 +1,15 @@
 import React, { createContext, useContext, useState } from 'react'
 import { validContextWindow } from '../context-window.js'
+import { translateOwnedError, type Translator } from './locales.js'
 
-export const ContextWindowPresetScope = createContext(false)
+export const ContextWindowPresetScope = createContext<Translator | undefined>(
+  undefined,
+)
+
+export function OwnedErrorMessage({ message }: { message: string }) {
+  const t = useContext(ContextWindowPresetScope)
+  return <>{t ? translateOwnedError(message, t) : message}</>
+}
 
 type Props = {
   inputProps: React.InputHTMLAttributes<HTMLInputElement>
@@ -17,9 +25,9 @@ export function ContextWindowPreset({
   onValueChange,
   onCustomValueChange,
 }: Props) {
-  const enabled = useContext(ContextWindowPresetScope)
+  const t = useContext(ContextWindowPresetScope)
   const [custom, setCustom] = useState(false)
-  if (!enabled) return <input {...inputProps} />
+  if (!t) return <input {...inputProps} />
   const mode = custom
     ? 'custom'
     : tokens === undefined
@@ -47,17 +55,19 @@ export function ContextWindowPreset({
           }
         }}
       >
-        <option value="default">默认</option>
+        <option value="default">{t('contextDefault')}</option>
         <option value="516k">516K</option>
         <option value="1m">1M</option>
-        <option value="custom">自定义</option>
+        <option value="custom">{t('contextCustom')}</option>
       </select>
       {mode === 'custom' && (
         <input
           {...inputProps}
-          aria-label={String(inputProps['aria-label']) + ' 自定义数值'}
+          aria-label={t('contextCustomLabel', {
+            label: inputProps['aria-label'] ?? '',
+          })}
           aria-invalid={!validContextWindow(tokens)}
-          placeholder="输入上下文窗口"
+          placeholder={t('contextInput')}
           onChange={(event) => {
             setCustom(true)
             onCustomValueChange(event.target.value)

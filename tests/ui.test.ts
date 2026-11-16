@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { resolveCapabilities } from '../src/capabilities.js'
 import { Config as NativeConfig } from '@deepseek-ai/dsh-llm-pi-ai'
 import { installSettingsOverlay } from '../src/settings-overlay.js'
+import { localeContext } from './client-locale-fixture.js'
 
 const require = createRequire(import.meta.url)
 const roots: Root[] = []
@@ -127,7 +128,14 @@ function loadClient() {
     },
   })
   new Function(source)()
-  return exports!
+  const loaded = exports!
+  return {
+    apply: (ctx: any) => {
+      const ready = localeContext(ctx, modules, disposers)
+      loaded.apply(ready)
+      return ready.locale
+    },
+  }
 }
 
 async function composerFixture(
@@ -166,7 +174,7 @@ async function composerFixture(
       signal?: AbortSignal,
     ) => handler(endpoint, payload.args, signal),
   )
-  loadClient().apply({
+  const locale = loadClient().apply({
     get: () => ({ directoryFor: () => ({ store }) }),
     on: subscribe,
     remote: { $on: subscribe },
@@ -198,6 +206,7 @@ async function composerFixture(
   })
   return {
     container,
+    locale,
     rpc,
     emit: (name: string, ...args: unknown[]) => {
       for (const fn of events.get(name) ?? []) fn(...args)
@@ -221,7 +230,393 @@ const modelMetadata = {
     .serviceTiers,
 }
 
+async function providerFixture(
+  control: {
+    initialIntervalMs?: number
+    read?(count: number, response: any): Promise<any> | any
+    written?(): Promise<void>
+  } = {},
+) {
+  const components = new Map<string, React.ComponentType<any>>()
+  const listeners = new Set<() => void>()
+  let revision = 1
+  let options = {
+    enabled: true,
+    refreshIntervalMs: control.initialIntervalMs ?? 1800000,
+    overridesJSON: '{}',
+    capabilityCatalogUrl: 'https://old.invalid/catalog',
+  }
+  const writes: Array<Record<string, unknown>> = []
+  let reads = 0
+  const locale = loadClient().apply({
+    get() {},
+    on: () => () => {},
+    remote: {
+      $on(name: string, listener: () => void) {
+        if (name === 'settings/document-updated') listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+    },
+    connection: {
+      rpc: {
+        call: async (
+          _channel: string,
+          endpoint: string,
+          payload: { args: Record<string, unknown> },
+        ) => {
+          if (endpoint.endsWith('/updateOptions')) {
+            writes.push(payload.args)
+            if (payload.args.expectedRevision !== revision)
+              return {
+                ok: false,
+                error: { message: 'settings changed since it was read' },
+              }
+            const next = {
+              ...options,
+              refreshIntervalMs: Number(payload.args.refreshIntervalMs),
+              capabilityCatalogUrl: String(payload.args.capabilityCatalogUrl),
+              overridesJSON: String(payload.args.overridesJSON),
+            }
+            if (JSON.stringify(next) !== JSON.stringify(options)) revision++
+            options = next
+            await control.written?.()
+            return { ok: true }
+          }
+          const response = {
+            ok: true,
+            value: {
+              enabled: true,
+              status: { state: 'ready' },
+              models: [],
+              options: { ...options },
+              optionsRevision: revision,
+            },
+          }
+          reads++
+          return control.read ? control.read(reads, response) : response
+        },
+      },
+    },
+    slots: {
+      entries: () => [],
+      subscribe: () => () => {},
+      provideRoot: () => () => {},
+      inject: (_name: string, action: () => void) => action(),
+      register: (
+        entry: { name: string },
+        component: React.ComponentType<any>,
+      ) => {
+        components.set(entry.name, component)
+        return () => {}
+      },
+    },
+  })
+  const container = document.createElement('div')
+  document.body.append(container)
+  const root = createRoot(container)
+  roots.push(root)
+  await act(async () =>
+    root.render(
+      React.createElement(components.get('settings.models.provider-card')!, {
+        provider: { provider: 'fixture' },
+        configured: true,
+      }),
+    ),
+  )
+  return {
+    container,
+    locale,
+    writes,
+    options: () => options,
+    async invalidate() {
+      await act(async () => {
+        for (const listener of listeners) listener()
+      })
+    },
+    async external(next: Partial<typeof options>) {
+      options = { ...options, ...next }
+      revision++
+      await act(async () => {
+        for (const listener of listeners) listener()
+      })
+    },
+    async type(selector: string, value: string) {
+      await act(async () => {
+        const input = container.querySelector<HTMLInputElement>(selector)!
+        Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          'value',
+        )!.set!.call(input, value)
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+    },
+    async save() {
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>('button[type=submit]')!
+          .click(),
+      )
+    },
+  }
+}
+
 describe('built client contributions', () => {
+  it.each([1500, 1001, 2147483647])(
+    'saves a URL-only edit with the valid initial %s millisecond interval',
+    async (initialIntervalMs) => {
+      const f = await providerFixture({ initialIntervalMs })
+      const interval =
+        f.container.querySelector<HTMLInputElement>('input[type=number]')!
+      expect(interval.value).toBe(String(initialIntervalMs / 1000))
+      expect(interval.checkValidity()).toBe(true)
+      await f.type('input[type=url]', 'https://new.invalid/catalog')
+      await f.save()
+      expect(f.writes).toHaveLength(1)
+      expect(f.writes[0]).toMatchObject({
+        expectedRevision: 1,
+        refreshIntervalMs: initialIntervalMs,
+        capabilityCatalogUrl: 'https://new.invalid/catalog',
+      })
+      expect(interval.disabled).toBe(false)
+      const nextIntervalMs = initialIntervalMs === 1001 ? 1500 : 1001
+      await f.type('input[type=number]', String(nextIntervalMs / 1000))
+      await f.save()
+      expect(f.writes.map((write) => write.expectedRevision)).toEqual([1, 2])
+      expect(f.options().refreshIntervalMs).toBe(nextIntervalMs)
+      expect(f.container.querySelector('[role=alert]')).toBeNull()
+    },
+  )
+
+  it.each(['', '0.999', '-1', '2147483.648', '1.0001', 'invalid'])(
+    'does not submit an invalid sync interval %j through the save button',
+    async (seconds) => {
+      const f = await providerFixture()
+      await f.type('input[type=number]', seconds)
+      const interval =
+        f.container.querySelector<HTMLInputElement>('input[type=number]')!
+      expect(interval.checkValidity()).toBe(false)
+      await f.save()
+      expect(f.writes).toEqual([])
+      expect(f.options().refreshIntervalMs).toBe(1800000)
+    },
+  )
+
+  it.each(['immediate', 'delayed'] as const)(
+    'adopts its saved revision before allowing another edit (%s readback)',
+    async (timing) => {
+      let release: () => void = () => {}
+      const f = await providerFixture({
+        read: (count, response) =>
+          timing === 'delayed' && count === 2
+            ? new Promise((resolve) => (release = () => resolve(response)))
+            : response,
+      })
+      await f.type('input[type=number]', '2')
+      await f.save()
+      if (timing === 'delayed') {
+        expect(
+          f.container.querySelector<HTMLButtonElement>('button[type=submit]')!
+            .disabled,
+        ).toBe(true)
+        expect(
+          f.container.querySelector<HTMLInputElement>('input[type=number]')!
+            .disabled,
+        ).toBe(true)
+        await act(async () => release())
+      }
+      expect(
+        f.container.querySelector<HTMLInputElement>('input[type=number]')!
+          .disabled,
+      ).toBe(false)
+      await f.type('input[type=number]', '3')
+      await f.save()
+      expect(f.writes.map((write) => write.expectedRevision)).toEqual([1, 2])
+      expect(f.options().refreshIntervalMs).toBe(3000)
+      expect(f.container.querySelector('[role=alert]')).toBeNull()
+    },
+  )
+
+  it('ignores a pre-save read that finishes before the write is acknowledged', async () => {
+    let releaseRead: () => void = () => {}
+    let releaseWrite: () => void = () => {}
+    let writes = 0
+    const f = await providerFixture({
+      read: (count, response) =>
+        count === 2
+          ? new Promise((resolve) => (releaseRead = () => resolve(response)))
+          : response,
+      written: () =>
+        ++writes === 1
+          ? new Promise<void>((resolve) => (releaseWrite = resolve))
+          : Promise.resolve(),
+    })
+    await f.type('input[type=number]', '2')
+    await f.invalidate()
+    await f.save()
+    await act(async () => releaseRead())
+    expect(
+      f.container.querySelector<HTMLButtonElement>('button[type=submit]')!
+        .disabled,
+    ).toBe(true)
+    await act(async () => releaseWrite())
+    await f.type('input[type=number]', '3')
+    await f.save()
+    expect(f.writes.map((write) => write.expectedRevision)).toEqual([1, 2])
+    expect(f.options().refreshIntervalMs).toBe(3000)
+    expect(f.container.querySelector('[role=alert]')).toBeNull()
+  })
+
+  it('finishes an unchanged save whose revision does not increase', async () => {
+    const f = await providerFixture()
+    await f.save()
+    expect(
+      f.container.querySelector<HTMLButtonElement>('button[type=submit]')!
+        .disabled,
+    ).toBe(false)
+    await f.type('input[type=number]', '2')
+    await f.save()
+    expect(f.writes.map((write) => write.expectedRevision)).toEqual([1, 1])
+    expect(f.options().refreshIntervalMs).toBe(2000)
+    expect(f.container.querySelector('[role=alert]')).toBeNull()
+  })
+
+  it('keeps edits locked after a failed save readback and recovers on a successful retry', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    const f = await providerFixture({
+      read: (count, response) =>
+        count === 2
+          ? { ok: false, error: { message: 'temporary readback failure' } }
+          : response,
+    })
+    await f.type('input[type=number]', '2')
+    await f.save()
+    expect(f.container.querySelector('[role=alert]')!.textContent).toContain(
+      'temporary readback failure',
+    )
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=number]')!
+        .disabled,
+    ).toBe(true)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=number]')!
+        .disabled,
+    ).toBe(false)
+    await f.type('input[type=number]', '3')
+    await f.save()
+    expect(f.writes.map((write) => write.expectedRevision)).toEqual([1, 2])
+    expect(f.options().refreshIntervalMs).toBe(3000)
+    expect(f.container.querySelector('[role=alert]')).toBeNull()
+  })
+
+  it('adopts externally updated sync options before editing and saves their revision', async () => {
+    const f = await providerFixture()
+    await f.external({
+      capabilityCatalogUrl: 'https://new.invalid/catalog',
+      overridesJSON: '{"gpt-custom":{"defaultServiceTier":"fast"}}',
+    })
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=url]')!.value,
+    ).toBe('https://new.invalid/catalog')
+    await f.type('input[type=number]', '5')
+    await f.save()
+    expect(f.writes[0]).toMatchObject({
+      expectedRevision: 2,
+      refreshIntervalMs: 5000,
+      capabilityCatalogUrl: 'https://new.invalid/catalog',
+      overridesJSON: '{"gpt-custom":{"defaultServiceTier":"fast"}}',
+    })
+    expect(f.options().refreshIntervalMs).toBe(5000)
+    await f.external({
+      capabilityCatalogUrl: 'https://after-save.invalid/catalog',
+    })
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=url]')!.value,
+    ).toBe('https://after-save.invalid/catalog')
+  })
+
+  it('preserves edited sync drafts but rejects stale submissions after external changes', async () => {
+    const f = await providerFixture()
+    await f.type('input[type=url]', 'https://unsaved.invalid/catalog')
+    await f.external({
+      overridesJSON: '{"gpt-custom":{"defaultServiceTier":"fast"}}',
+    })
+    await act(async () => f.locale.setLocale('en'))
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=url]')!.value,
+    ).toBe('https://unsaved.invalid/catalog')
+    await f.save()
+    expect(f.writes[0]!.expectedRevision).toBe(1)
+    expect(f.container.querySelector('[role=alert]')!.textContent).toContain(
+      'changed since it was read',
+    )
+    expect(f.options()).toMatchObject({
+      capabilityCatalogUrl: 'https://old.invalid/catalog',
+      overridesJSON: '{"gpt-custom":{"defaultServiceTier":"fast"}}',
+    })
+    await act(async () =>
+      [...f.container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((button) => button.textContent === 'Reload saved settings')!
+        .click(),
+    )
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=url]')!.value,
+    ).toBe('https://old.invalid/catalog')
+    await f.type('input[type=number]', '10')
+    await f.save()
+    expect(f.writes[1]).toMatchObject({
+      expectedRevision: 2,
+      refreshIntervalMs: 10000,
+      capabilityCatalogUrl: 'https://old.invalid/catalog',
+      overridesJSON: '{"gpt-custom":{"defaultServiceTier":"fast"}}',
+    })
+    expect(f.options().refreshIntervalMs).toBe(10000)
+  })
+
+  it('updates toolbar labels and an existing plugin error on language changes without refetching', async () => {
+    const f = await composerFixture(async (endpoint) => {
+      if (endpoint.endsWith('/modelStatus'))
+        return { ok: true, value: modelMetadata }
+      if (endpoint.endsWith('/setSpeed'))
+        return { ok: false, error: { message: '上下文窗口必须是正的安全整数' } }
+      return { ok: true, value: { selected: 'default', last: null } }
+    })
+    await act(async () =>
+      f.container
+        .querySelector<HTMLButtonElement>('[aria-haspopup=menu]')!
+        .click(),
+    )
+    await act(async () =>
+      [...f.container.querySelectorAll<HTMLButtonElement>('[role=menuitem]')]
+        .find((item) => item.textContent === 'Fast')!
+        .click(),
+    )
+    expect(f.container.querySelector('[role=alert]')!.textContent).toContain(
+      '上下文窗口必须是正的安全整数',
+    )
+    const calls = f.rpc.mock.calls.length
+    await act(async () => f.locale.setLocale('en'))
+    expect(
+      f.container
+        .querySelector('[aria-haspopup=menu]')!
+        .getAttribute('aria-label'),
+    ).toBe('GPT speed: Standard')
+    expect(f.container.querySelector('[role=alert]')!.textContent).toContain(
+      'Context window must be a positive safe integer',
+    )
+    expect(f.rpc).toHaveBeenCalledTimes(calls)
+    await act(async () => f.locale.setLocale('zh'))
+    expect(
+      f.container
+        .querySelector('[aria-haspopup=menu]')!
+        .getAttribute('aria-label'),
+    ).toBe('GPT 速度：Standard')
+    expect(f.rpc).toHaveBeenCalledTimes(calls)
+  })
+
   it('cancels a hung read on connection reset and fetches the new generation immediately', async () => {
     const pending: Array<{
       signal: AbortSignal | undefined
@@ -654,7 +1049,7 @@ describe('built client contributions', () => {
       },
       effect: (callback: () => () => void) => disposers.push(callback()),
     }
-    loadClient().apply(ctx)
+    const locale = loadClient().apply(ctx)
     const container = document.createElement('div')
     document.body.append(container)
     const root = createRoot(container)
@@ -690,6 +1085,12 @@ describe('built client contributions', () => {
       )!.set!.call(input, 'https://catalog.invalid/gpt.json')
       input.dispatchEvent(new Event('input', { bubbles: true }))
     })
+    await act(async () => locale.setLocale('en'))
+    expect(container.textContent).toContain('Save sync settings')
+    expect(
+      container.querySelector(`label[for="${input.id}"]`)!.textContent,
+    ).toBe('Capability catalog URL')
+    expect(input.value).toBe('https://catalog.invalid/gpt.json')
     await act(async () => {
       container
         .querySelector('form')!

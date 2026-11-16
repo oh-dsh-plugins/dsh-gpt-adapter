@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { open } from 'node:fs/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
-  optionalText,
   readCodexConfig,
   projectDirectories,
   projectText,
@@ -12,18 +13,69 @@ import {
   type ProjectFileSystem,
 } from './codex-config.js'
 
-export type CodexInstructionFile = { path: string; content: string }
+export type CodexInstructionFile = {
+  path: string
+  content: string
+  truncated?: boolean
+}
+type InstructionPrefix = { content: string; truncated: boolean }
+
+async function optionalPrefix(
+  path: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<InstructionPrefix | undefined> {
+  signal?.throwIfAborted()
+  let file
+  try {
+    file = await open(path, 'r')
+  } catch (error: any) {
+    signal?.throwIfAborted()
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return undefined
+    throw error
+  }
+  try {
+    const decoder = new StringDecoder('utf8')
+    const buffer = Buffer.allocUnsafe(Math.min(8192, limit))
+    const chunks: string[] = []
+    let bytes = 0
+    while (bytes < limit) {
+      signal?.throwIfAborted()
+      const length = Math.min(buffer.length, limit - bytes)
+      const result = await file.read(buffer, 0, length, null)
+      signal?.throwIfAborted()
+      if (!result.bytesRead) {
+        chunks.push(decoder.end())
+        return { content: chunks.join(''), truncated: false }
+      }
+      chunks.push(decoder.write(buffer.subarray(0, result.bytesRead)))
+      bytes += result.bytesRead
+    }
+    return { content: chunks.join(''), truncated: true }
+  } finally {
+    await file.close()
+  }
+}
 
 async function firstNonempty(
   directory: string,
   names: string[],
-  read = optionalText,
+  read: (path: string) => Promise<InstructionPrefix | undefined>,
 ) {
   for (const name of names) {
     if (name !== name.split(/[\\/]/).at(-1)) continue
     const path = join(directory, name)
-    const content = (await read(path))?.trim()
-    if (content) return { path, content }
+    const prefix = await read(path)
+    const content = prefix?.truncated
+      ? prefix.content.trimStart()
+      : prefix?.content.trim()
+    // An incomplete blank prefix cannot establish that an override is empty.
+    if (content || prefix?.truncated)
+      return {
+        path,
+        content: content ?? '',
+        ...(prefix?.truncated ? { truncated: true } : {}),
+      }
   }
   return undefined
 }
@@ -39,30 +91,75 @@ export async function loadCodexInstructions(
   knownDirectories?: string[],
 ): Promise<CodexInstructionFile[]> {
   const result: CodexInstructionFile[] = []
+  let remaining =
+    Number.isInteger(config.project_doc_max_bytes) &&
+    config.project_doc_max_bytes >= 0
+      ? config.project_doc_max_bytes
+      : 65536
+  if (!remaining) return result
+  const prefixLimit = (path: string) =>
+    Math.max(
+      4,
+      remaining -
+        Buffer.byteLength(`Instructions from: ${path}\n\n`) -
+        (result.length ? 2 : 0) +
+        1,
+    )
+  const hostRead = (path: string) =>
+    optionalPrefix(path, prefixLimit(path), signal)
+  const projectRead = async (path: string) => {
+    if (!fs) return hostRead(path)
+    const text = (await projectText(path, fs, signal))?.trim()
+    signal?.throwIfAborted()
+    if (text === undefined) return undefined
+    const limit = prefixLimit(path)
+    return {
+      content: truncateUtf8(text, limit),
+      truncated: Buffer.byteLength(text) > limit,
+    }
+  }
   const add = (file: CodexInstructionFile | undefined) => {
     if (
       file &&
-      !result.some((p) => p.path === file.path || p.content === file.content)
-    )
+      !result.some(
+        (p) =>
+          p.path === file.path ||
+          (!file.truncated && p.content === file.content),
+      )
+    ) {
+      const text = `Instructions from: ${file.path}\n\n${file.content}`
+      remaining = file.truncated
+        ? 0
+        : Math.max(
+            0,
+            remaining -
+              Buffer.byteLength(
+                text.replaceAll('</system-reminder>', '<\\/system-reminder>'),
+              ) -
+              (result.length ? 2 : 0),
+          )
       result.push(file)
+    }
   }
-  add(await firstNonempty(dshHome, ['AGENTS.md']))
-  add(await firstNonempty(agentsHome, ['AGENTS.md']))
-  add(await firstNonempty(home, ['AGENTS.override.md', 'AGENTS.md']))
+  const load = async (directory: string, names: string[], read = hostRead) => {
+    if (remaining > 0) add(await firstNonempty(directory, names, read))
+  }
+  await load(dshHome, ['AGENTS.md'])
+  await load(agentsHome, ['AGENTS.md'])
+  await load(home, ['AGENTS.override.md', 'AGENTS.md'])
+  if (!remaining) return result
   const directories =
     knownDirectories ?? (await projectDirectories(cwd, fs, signal))
-  const read = (path: string) => projectText(path, fs, signal)
   const fallback = strings(config.project_doc_fallback_filenames)
   for (const directory of directories) {
-    add(
-      await firstNonempty(
-        directory,
-        ['AGENTS.override.md', 'AGENTS.md', ...fallback],
-        read,
-      ),
+    if (!remaining) break
+    await load(
+      directory,
+      ['AGENTS.override.md', 'AGENTS.md', ...fallback],
+      projectRead,
     )
     for (const name of ['AGENTS.local.md', 'CLAUDE.local.md'])
-      add(await firstNonempty(directory, [name], read))
+      await load(directory, [name], projectRead)
   }
   return result
 }
@@ -85,7 +182,10 @@ export function renderCodexInstructions(
     .map((p) => `Instructions from: ${p.path}\n\n${p.content}`)
     .join('\n\n')
   content = content.replaceAll('</system-reminder>', '<\\/system-reminder>')
-  if (Buffer.byteLength(content) > maxBytes)
+  if (
+    Buffer.byteLength(content) > maxBytes ||
+    (maxBytes > 0 && files.some((file) => file.truncated))
+  )
     content = `${truncateUtf8(content, Math.max(0, maxBytes - 100))}\n[Instruction budget reached; remaining content omitted.]`
   return `<system-reminder>\n${intro}\n\n${content || 'No workspace instructions are currently active.'}\n</system-reminder>`
 }
@@ -209,9 +309,12 @@ export function installCodexInstructions(
   const lastBaseline = baselineReader()
   ctx.on(
     'agent/pre-step',
-    async ({ agent, messages, signal }: any, next: any) => {
+    async ({ agent, messages, signal, step }: any, next: any) => {
       const decision = await next()
-      if (decision.kind === 'reject' || decision.messages.length === 0)
+      if (
+        decision.kind === 'reject' ||
+        (decision.messages.length === 0 && !(step > 1))
+      )
         return decision
       signal.throwIfAborted()
       try {
@@ -219,24 +322,27 @@ export function installCodexInstructions(
         const fs = agent.ctx?.get('fs') ?? ctx.get?.('fs')
         if (!fs) return decision
         const config = await readConfig(cwd, fs, signal)
-        const directories = await projectDirectories(cwd, fs, signal)
-        const files = await loadCodexInstructions(
-          home,
-          cwd,
-          config,
-          undefined,
-          undefined,
-          fs,
-          signal,
-          directories,
-        )
-        const text = renderCodexInstructions(
-          files,
+        const maxBytes =
           Number.isInteger(config.project_doc_max_bytes) &&
-            config.project_doc_max_bytes >= 0
+          config.project_doc_max_bytes >= 0
             ? config.project_doc_max_bytes
-            : 65536,
-        )
+            : 65536
+        const directories = await projectDirectories(cwd, fs, signal)
+        const files =
+          maxBytes === 0
+            ? []
+            : await loadCodexInstructions(
+                home,
+                cwd,
+                config,
+                undefined,
+                undefined,
+                fs,
+                signal,
+                directories,
+              )
+        signal.throwIfAborted()
+        const text = renderCodexInstructions(files, maxBytes)
         const identity = createHash('sha256')
           .update(cwd)
           .update(text)
@@ -273,7 +379,7 @@ export function installCodexInstructions(
           )
         )
           return { ...decision, messages: entered }
-        if (!files.length && !previous) return decision
+        if (!files.length && !previous && maxBytes !== 0) return decision
         const message = createUserMessage({
           content: [{ type: 'text', text }],
           source: { kind: 'codex-compat', form: 'instructions', identity },

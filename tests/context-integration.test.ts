@@ -6,7 +6,7 @@ import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Config, type GptModels } from '../src/host.js'
+import { Config, GptModels } from '../src/host.js'
 import { JsonStorage } from '../src/storage.js'
 import { syncCacheKey, synchronize } from '../src/sync.js'
 import type { ModelOverride, SyncSnapshot } from '../src/types.js'
@@ -356,6 +356,40 @@ async function fixture(
 }
 
 describe('context settings and live model integration', () => {
+  it('orders session deletion after an in-flight startup speed read', async () => {
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    ctx.provide('settings', { describe: () => [] } as any)
+    const service = new GptModels(ctx, { routes: {} }, 'gpt-adapter')
+    const store = (service as any).store
+    let saved: any = {
+      [JSON.stringify(['removed', 'fixture', 'gpt-5.4'])]: 'fast',
+    }
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>((done) => {
+      release = done
+    })
+    const started = new Promise<void>((done) => {
+      entered = done
+    })
+    vi.spyOn(store, 'read').mockImplementation(async () => {
+      entered()
+      await gate
+      return structuredClone(saved)
+    })
+    vi.spyOn(store, 'write').mockImplementation(async (_key, value) => {
+      saved = value
+    })
+    const initializing = service.initialize()
+    await started
+    ctx.emit('api-session/removed', 'removed' as any)
+    release()
+    await initializing
+    await (service as any).speedWrites
+    expect((service as any).speeds.size).toBe(0)
+    expect(saved).toEqual({})
+  })
+
   it('discovers new models into an empty user layer without copying inherited provider options', async () => {
     const f = await fixture('openai-responses', false, 'empty-user')
     expect(f.raw()).toEqual({})
@@ -672,6 +706,9 @@ describe('context settings and live model integration', () => {
       await f.service.refresh('other')
       const storage = (f.service as any).store as JsonStorage
       const write = vi.spyOn(storage, 'write')
+      const previousConfigKey = (await storage.read<SyncSnapshot>(
+        'route:fixture',
+      ))!.configKey
       const originalResolve = f.credentials.resolve.bind(f.credentials)
       const request = vi.mocked(fetch).getMockImplementation()!
       vi.mocked(fetch).mockImplementation(async (url, init) =>
@@ -705,22 +742,18 @@ describe('context settings and live model integration', () => {
       })
       f.models([{ id: 'gpt-5.4', context_window: 720000 }])
       await expect(f.service.refresh('fixture')).rejects.toThrow(
-        'configuration changed',
+        /configuration changed|synchronizer stopped/,
       )
       await changed
-      expect(
-        write.mock.calls.filter(([key]) => key === 'route:fixture'),
-      ).toHaveLength(0)
-      expect(f.service.status('fixture').status.state).toBe('error')
-      expect(
-        f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens,
-      ).toBe(800000)
-      expect(
-        (await storage.read<SyncSnapshot>('route:fixture'))!.capabilities[
-          'gpt-5.4'
-        ]!.contextWindow,
-      ).toBe(800000)
       await f.service.refresh('fixture')
+      expect(
+        write.mock.calls
+          .filter(([key]) => key === 'route:fixture')
+          .some(
+            ([, value]) =>
+              (value as SyncSnapshot).configKey === previousConfigKey,
+          ),
+      ).toBe(false)
       expect(f.service.status('fixture').status.state).toBe('ready')
       expect(
         f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens,
@@ -768,7 +801,7 @@ describe('context settings and live model integration', () => {
     })
   })
 
-  it('rejects publication if route options change while its cache write is pending', async () => {
+  it('revokes a pending publication and automatically publishes the changed options', async () => {
     const f = await fixture()
     const storage = (f.service as any).store as JsonStorage
     const original = storage.write.bind(storage)
@@ -779,18 +812,24 @@ describe('context settings and live model integration', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
+    const committed: SyncSnapshot[] = []
     vi.spyOn(storage, 'write').mockImplementation(
       async (key, value, beforeCommit) => {
         if (key === 'route:fixture') {
           entered()
           await gate
         }
-        await original(key, value, beforeCommit)
+        await original(key, value, () => {
+          beforeCommit?.()
+          if (key === 'route:fixture') committed.push(value as SyncSnapshot)
+        })
       },
     )
     f.models([{ id: 'gpt-5.4', context_window: 128000 }])
     const pending = f.service.refresh('fixture')
-    const rejected = expect(pending).rejects.toThrow('configuration changed')
+    const rejected = expect(pending).rejects.toThrow(
+      /configuration changed|synchronizer stopped/,
+    )
     await started
     await f.service.updateOptions(
       'fixture',
@@ -800,13 +839,18 @@ describe('context settings and live model integration', () => {
     )
     release()
     await rejected
+    await f.service.refresh('fixture')
+    expect(committed).toHaveLength(1)
+    expect(committed[0]!.capabilities['gpt-5.4']!.defaultServiceTier).toBe(
+      'fast',
+    )
     expect(
       (await storage.read<SyncSnapshot>('route:fixture'))!.capabilities[
         'gpt-5.4'
       ]!.contextWindow,
-    ).toBe(800000)
+    ).toBe(128000)
     expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
-      800000,
+      128000,
     )
   })
 
@@ -1021,6 +1065,79 @@ describe('context settings and live model integration', () => {
     expect(results.size).toBe(0)
   })
 
+  it('removes local capability overrides immediately while offline and preserves captured requests', async () => {
+    const f = await fixture()
+    await f.legacy({
+      'gpt-5.4': {
+        displayName: 'Old override',
+        defaultReasoningId: 'ultra',
+        defaultServiceTier: 'fast',
+      },
+    })
+    await f.service.refresh('fixture')
+    const base = { provider: 'fixture', id: 'gpt-5.4', name: 'GPT' }
+    const captured = f.service.capture('fixture', 'gpt-5.4', base)!
+    f.fail()
+    await f.legacy({})
+    expect(f.service.capability('fixture', 'gpt-5.4')).toMatchObject({
+      displayName: 'gpt-5.4',
+      reasoning: { defaultId: 'medium' },
+      defaultServiceTier: 'default',
+    })
+    expect(
+      f.service.capture('fixture', 'gpt-5.4', base)!.prepare({}).payload,
+    ).toMatchObject({
+      reasoning: { effort: 'medium' },
+      service_tier: 'default',
+    })
+    expect(captured.prepare({}).payload).toMatchObject({
+      reasoning: { effort: 'ultra' },
+      service_tier: 'priority',
+    })
+  })
+
+  it('reports the effective speed default before a model refresh', async () => {
+    const f = await fixture()
+    await f.legacy({ 'gpt-5.4': { defaultServiceTier: 'fast' } })
+    expect(
+      f.service.speed('speed-session' as any, 'fixture', 'gpt-5.4').selected,
+    ).toBe('fast')
+    expect(
+      f.service
+        .capture('fixture', 'gpt-5.4', {
+          provider: 'fixture',
+          id: 'gpt-5.4',
+          name: 'GPT',
+        })!
+        .prepare({ sessionId: 'speed-session' }).payload.service_tier,
+    ).toBe('priority')
+  })
+
+  it('falls back from a removed saved speed without changing captured requests', async () => {
+    const f = await fixture()
+    await f.service.setSpeed(
+      'speed-session' as any,
+      'fixture',
+      'gpt-5.4',
+      'fast',
+    )
+    const base = { provider: 'fixture', id: 'gpt-5.4', name: 'GPT' }
+    const captured = f.service.capture('fixture', 'gpt-5.4', base)!
+    f.models([{ id: 'gpt-5.4', service_tiers: ['default'] }])
+    await f.service.refresh('fixture')
+    expect(
+      f.service.speed('speed-session' as any, 'fixture', 'gpt-5.4').selected,
+    ).toBe('default')
+    expect(
+      f.service
+        .capture('fixture', 'gpt-5.4', base)!
+        .prepare({ sessionId: 'speed-session' }).payload.service_tier,
+    ).toBe('default')
+    expect(
+      captured.prepare({ sessionId: 'speed-session' }).payload.service_tier,
+    ).toBe('priority')
+  })
+
   it('replaces speed snapshots only after a successful write and keeps previously captured calls stable', async () => {
     const f = await fixture()
     await f.service.setSpeed(
@@ -1066,6 +1183,75 @@ describe('context settings and live model integration', () => {
       next.prepare({ sessionId: 'speed-session' }).payload.service_tier,
     ).not.toBe('priority')
   })
+
+  it('removes deleted session speeds after pending writes without losing other sessions', async () => {
+    const f = await fixture()
+    await f.service.setSpeed('keep' as any, 'fixture', 'gpt-5.4', 'fast')
+    const store = (f.service as any).store as JsonStorage
+    const write = store.write.bind(store)
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>((done) => {
+      release = done
+    })
+    const started = new Promise<void>((done) => {
+      entered = done
+    })
+    vi.spyOn(store, 'write').mockImplementationOnce(async (...args) => {
+      entered()
+      await gate
+      await write(...args)
+    })
+    const pending = f.service.setSpeed(
+      'removed' as any,
+      'fixture',
+      'gpt-5.4',
+      'fast',
+    )
+    await started
+    f.ctx.emit('api-session/removed', 'removed' as any)
+    release()
+    await pending
+    await (f.service as any).speedWrites
+    expect([
+      ...((f.service as any).speeds as Map<string, unknown>).keys(),
+    ]).toEqual([JSON.stringify(['keep', 'fixture', 'gpt-5.4'])])
+    expect(await store.read('speeds')).toEqual({
+      [JSON.stringify(['keep', 'fixture', 'gpt-5.4'])]: 'fast',
+    })
+  })
+  it.each([
+    null,
+    { serviceTiers: {} },
+    { serviceTiers: [] },
+    { serviceTiers: [null] },
+    { reasoningChoices: 'high' },
+    { reasoningChoices: [{ id: 'high', label: 'High', wireValue: 1 }] },
+    { supportsReasoning: 'false' },
+    { inputModalities: 'image' },
+    { maxOutputTokens: -1 },
+  ])(
+    'rejects malformed capability overrides before saving (%j)',
+    async (override) => {
+      const f = await fixture()
+      const before = structuredClone(f.options())
+      await expect(
+        f.service.updateOptions(
+          'fixture',
+          1800000,
+          '',
+          JSON.stringify({ 'gpt-5.4': override }),
+        ),
+      ).rejects.toThrow()
+      expect(f.options()).toEqual(before)
+      expect(f.service.capability('fixture', 'gpt-5.4')!.reasoning.status).toBe(
+        'known',
+      )
+      await expect(
+        f.native().prepareCall('fixture', 'gpt-5.4'),
+      ).resolves.toBeDefined()
+    },
+  )
+
   it('preserves native catalog modelOverrides through initial sync, refresh and stale cleanup', async () => {
     const f = await fixture('openai-responses', true)
     expect(f.raw().providers.openai).not.toHaveProperty('models')
@@ -1121,6 +1307,8 @@ describe('context settings and live model integration', () => {
       'gpt-5.4': { contextWindow: 700000, defaultServiceTier: 'fast' },
       'gpt-new': { contextWindow: 550000 },
     })
+    // Drain the config-triggered request before changing its upstream fixture.
+    await f.service.refresh('fixture')
     f.models([
       { id: 'gpt-5.4', context_window: 900000 },
       { id: 'gpt-new', context_window: 600000 },
@@ -1158,11 +1346,60 @@ describe('context settings and live model integration', () => {
       mode: 'default',
       effectiveTokens: 900000,
     })
+    await f.service.refresh('fixture')
     f.fail()
     await expect(f.service.refresh('fixture')).rejects.toThrow('offline')
     expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
       900000,
     )
+  })
+
+  it('bounds stale cleanup membership work for a large catalog', async () => {
+    const f = await fixture()
+    const count = 1000
+    const prefix = 'gpt-cleanup-fixture-'
+    f.models([
+      { id: 'gpt-5.4', context_window: 900000 },
+      ...Array.from({ length: count }, (_, index) => ({
+        id: `${prefix}${index}`,
+      })),
+    ])
+    await f.service.refresh('fixture')
+    f.models([{ id: 'gpt-5.4', context_window: 950000 }])
+    await f.service.refresh('fixture')
+    const other = structuredClone(f.raw().providers.other)
+    let idReads = 0
+    const originalMap = Array.prototype.map
+    const trace = vi.spyOn(Array.prototype, 'map').mockImplementation(function (
+      this: any[],
+      callback: any,
+      thisArg?: any,
+    ) {
+      const result = originalMap.call(this, callback, thisArg)
+      if (result.length !== count || result[0] !== `${prefix}0`) return result
+      return new Proxy(result, {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) idReads++
+          return Reflect.get(target, key, receiver)
+        },
+      })
+    })
+    try {
+      await f.service.removeStale('fixture')
+    } finally {
+      trace.mockRestore()
+    }
+    expect(
+      f.raw().providers.fixture.models.map((model: any) => model.id),
+    ).toEqual(['gpt-5.4', 'gpt-4o'])
+    expect(f.service.status('fixture').models).toEqual([
+      { id: 'gpt-5.4', stale: false },
+    ])
+    expect(f.service.contextWindow('fixture', 'gpt-5.4').effectiveTokens).toBe(
+      950000,
+    )
+    expect(f.raw().providers.other).toEqual(other)
+    expect(idReads).toBeLessThan(count * 20)
   })
 
   it('preserves automatic and legacy capacities during stale model cleanup', async () => {
@@ -1175,8 +1412,13 @@ describe('context settings and live model integration', () => {
     await f.legacy({
       'gpt-5.4': { contextWindow: 700000, defaultServiceTier: 'fast' },
     })
+    await f.service.refresh('fixture')
     f.models([{ id: 'gpt-5.4', context_window: 950000 }])
     await f.service.refresh('fixture')
+    expect(f.service.status('fixture').models).toContainEqual({
+      id: 'gpt-new',
+      stale: true,
+    })
     await f.service.removeStale('fixture')
     expect(
       f.raw().providers.fixture.models.map((model: any) => model.id),

@@ -1,6 +1,6 @@
 {
   "name": "dsh-gpt-adapter",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -98,6 +98,7 @@
     "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
     "@deepseek-ai/dsh-brand": "0.2.2-rc.1",
     "@deepseek-ai/dsh-client-connection": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-locale": "0.2.2-rc.1",
     "@deepseek-ai/dsh-client-ui-model-selection": "0.2.2-rc.1",
     "@deepseek-ai/dsh-client-ui-primitives": "0.2.2-rc.1",
     "@deepseek-ai/dsh-client-ui-renderer": "0.2.2-rc.1",

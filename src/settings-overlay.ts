@@ -146,8 +146,11 @@ function nativeWrite(
             )
         if (!Array.isArray(models)) return [provider, profile]
         const previous: JsonObject[] = ownershipProfile.models ?? []
+        const previousById = new Map<string, JsonObject>()
+        for (const row of previous)
+          if (!previousById.has(row.id)) previousById.set(row.id, row)
         const savedModels = models.map((model: JsonObject) => {
-          const original = previous.find((row) => row.id === model.id)
+          const original = previousById.get(model.id)
           const capability = resolve(provider, model, ownershipProfile)
           if (!capability) return model
           const managed = projectModel(

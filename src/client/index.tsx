@@ -17,7 +17,11 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-models/client'
 import type {} from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type {} from '@deepseek-ai/dsh-client-connection/client'
-import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {
+  PropsRuntime,
+  PropsLocale,
+} from '@deepseek-ai/dsh-client-ui-slots'
 import type { GptModels } from '../host.js'
 import type { ServiceTier } from '../types.js'
 import type { ClientContext } from './compat-slots.js'
@@ -27,6 +31,12 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import styles from 'dsh-gpt-adapter/native-settings-styles'
 import { installNativeContextPresets } from './native-context-settings.js'
+import {
+  NS,
+  dictionaries,
+  translateOwnedError,
+  type Translator,
+} from './locales.js'
 
 type ProviderStatus = ReturnType<GptModels['status']>
 type SpeedStatus = ReturnType<GptModels['speed']>
@@ -37,9 +47,12 @@ export const inject = [
   'sessions',
   'modelDirectories',
   'remote',
+  'locale',
 ]
 
 export function apply(ctx: Context): void {
+  ctx.effect(() => ctx.locale.register(NS, dictionaries))
+  const translate = ctx.locale.bind(NS)
   async function call<T>(
     method: string,
     args: Record<string, unknown>,
@@ -66,6 +79,7 @@ export function apply(ctx: Context): void {
       invalidate(): void
       pause(): void
       resume(): void
+      resumeAndRead(): Promise<T | undefined>
     }>()
     const key = JSON.stringify(args)
     useEffect(() => {
@@ -83,6 +97,11 @@ export function apply(ctx: Context): void {
       let timer: ReturnType<typeof setTimeout> | undefined
       let request: AbortController | undefined
       let deadline: ReturnType<typeof setTimeout> | undefined
+      const readers = new Set<(value: T | undefined) => void>()
+      const completeReaders = (next: T | undefined) => {
+        for (const resolve of readers) resolve(next)
+        readers.clear()
+      }
       const clear = () => {
         clearTimeout(timer)
         timer = undefined
@@ -109,7 +128,7 @@ export function apply(ctx: Context): void {
         const controller = new AbortController()
         request = controller
         deadline = setTimeout(
-          () => controller.abort(new Error('读取 GPT 设置超时，请重试')),
+          () => controller.abort(new Error(dictionaries.en.readTimeout)),
           15000,
         )
         try {
@@ -119,12 +138,15 @@ export function apply(ctx: Context): void {
             failures = 0
             setValue({ key, value: next })
             setError('')
+            completeReaders(next)
           }
         } catch (failure) {
           if (active && sequence === generation) {
             failures++
             setError(
-              failure instanceof Error ? failure.message : '无法读取 GPT 设置',
+              failure instanceof Error
+                ? failure.message
+                : dictionaries.en.readFailed,
             )
           }
         } finally {
@@ -173,6 +195,13 @@ export function apply(ctx: Context): void {
           paused = false
           invalidate()
         },
+        resumeAndRead() {
+          return new Promise<T | undefined>((resolve) => {
+            readers.add(resolve)
+            paused = false
+            invalidate()
+          })
+        },
       }
       controls.current = controller
       const changedVisibility = () => {
@@ -201,6 +230,7 @@ export function apply(ctx: Context): void {
         document.removeEventListener('visibilitychange', changedVisibility)
         for (const dispose of disposers) dispose()
         if (controls.current === controller) controls.current = undefined
+        completeReaders(undefined)
       }
     }, [method, key, enabled, intervalMs])
     return {
@@ -209,6 +239,8 @@ export function apply(ctx: Context): void {
       refresh: () => controls.current?.invalidate(),
       pause: () => controls.current?.pause(),
       resume: () => controls.current?.resume(),
+      resumeAndRead: () =>
+        controls.current?.resumeAndRead() ?? Promise.resolve(undefined),
     }
   }
   function useProvider(provider: string) {
@@ -230,28 +262,41 @@ export function apply(ctx: Context): void {
         requests.current.sequence++
       }
     }, [provider])
-    async function act(method: string, args: Record<string, unknown>) {
+    async function act(
+      method: string,
+      args: Record<string, unknown>,
+      saved?: (status: ProviderStatus) => void,
+    ) {
       if (requests.current.writing) return
       requests.current.writing = true
       const sequence = ++requests.current.sequence
       query.pause()
       setBusy(true)
       setError('')
+      let reading = false
       try {
         await call(method, args)
         if (sequence !== requests.current.sequence) return false
+        if (saved) {
+          reading = true
+          const status = await query.resumeAndRead()
+          if (!status || sequence !== requests.current.sequence) return false
+          saved(status)
+        }
         return true
       } catch (failure) {
         if (sequence === requests.current.sequence)
           setError(
-            failure instanceof Error ? failure.message : '操作失败，请重试',
+            failure instanceof Error
+              ? failure.message
+              : dictionaries.en.actionFailed,
           )
         return false
       } finally {
         if (sequence === requests.current.sequence) {
           requests.current.writing = false
           setBusy(false)
-          query.resume()
+          if (!reading) query.resume()
         }
       }
     }
@@ -262,13 +307,16 @@ export function apply(ctx: Context): void {
     value,
     busy,
     act,
+    t,
   }: {
     provider: string
     value: ProviderStatus
     busy: boolean
+    t: Translator
     act(
       method: string,
       args: Record<string, unknown>,
+      saved?: (status: ProviderStatus) => void,
     ): Promise<boolean | undefined>
   }) {
     const id = useId()
@@ -277,24 +325,44 @@ export function apply(ctx: Context): void {
       String(value.options.refreshIntervalMs / 1000),
     )
     const [overrides, setOverrides] = useState(value.options.overridesJSON)
+    const dirty = useRef(false)
+    const revision = useRef(value.optionsRevision)
+    const adopt = (status: ProviderStatus) => {
+      setUrl(status.options.capabilityCatalogUrl ?? '')
+      setSeconds(String(status.options.refreshIntervalMs / 1000))
+      setOverrides(status.options.overridesJSON)
+      revision.current = status.optionsRevision
+      dirty.current = false
+    }
+    useEffect(() => {
+      if (dirty.current) return
+      adopt(value)
+    }, [value.options, value.optionsRevision])
     return (
       <details className={styles.customized}>
-        <summary className={styles.customizedSummary}>同步设置</summary>
+        <summary className={styles.customizedSummary}>
+          {t('syncSettings')}
+        </summary>
         <form
           className={styles.customizedBody}
           onSubmit={(event) => {
             event.preventDefault()
-            void act('updateOptions', {
-              provider,
-              refreshIntervalMs: Number(seconds) * 1000,
-              capabilityCatalogUrl: url.trim(),
-              overridesJSON: overrides,
-            })
+            void act(
+              'updateOptions',
+              {
+                provider,
+                refreshIntervalMs: Math.round(Number(seconds) * 1000),
+                capabilityCatalogUrl: url.trim(),
+                overridesJSON: overrides,
+                expectedRevision: revision.current,
+              },
+              adopt,
+            )
           }}
         >
           <div className={styles.field}>
             <label className={styles.fieldLabel} htmlFor={`${id}-catalog`}>
-              能力目录 URL
+              {t('catalogUrl')}
             </label>
             <Input
               id={`${id}-catalog`}
@@ -302,40 +370,62 @@ export function apply(ctx: Context): void {
               type="url"
               value={url}
               disabled={busy}
-              onChange={(event) => setUrl(event.target.value)}
+              onChange={(event) => {
+                dirty.current = true
+                setUrl(event.target.value)
+              }}
             />
           </div>
           <div className={styles.field}>
             <label className={styles.fieldLabel} htmlFor={`${id}-interval`}>
-              同步间隔（秒）
+              {t('interval')}
             </label>
             <Input
               id={`${id}-interval`}
               className={styles.input}
               type="number"
               min="1"
-              max="2147483"
+              max="2147483.647"
+              step="0.001"
+              required
               value={seconds}
               disabled={busy}
-              onChange={(event) => setSeconds(event.target.value)}
+              onChange={(event) => {
+                dirty.current = true
+                setSeconds(event.target.value)
+              }}
             />
           </div>
           <div className={styles.field}>
             <label className={styles.fieldLabel} htmlFor={`${id}-overrides`}>
-              模型能力覆盖（JSON）
+              {t('overrides')}
             </label>
             <Input
               id={`${id}-overrides`}
               className={styles.input}
               value={overrides}
               disabled={busy}
-              onChange={(event) => setOverrides(event.target.value)}
+              onChange={(event) => {
+                dirty.current = true
+                setOverrides(event.target.value)
+              }}
             />
           </div>
           <div className={styles.editorActions}>
             <Button type="submit" variant="primary" size="sm" disabled={busy}>
-              保存同步设置
+              {t('saveSync')}
             </Button>
+            {dirty.current && revision.current !== value.optionsRevision && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={busy}
+                onClick={() => adopt(value)}
+              >
+                {t('reloadSync')}
+              </Button>
+            )}
           </div>
         </form>
       </details>
@@ -344,13 +434,14 @@ export function apply(ctx: Context): void {
   function ProviderExtras({
     provider,
     configured,
-  }: PropsRuntime<'settings.models.provider-card'>) {
+    t,
+  }: PropsRuntime<'settings.models.provider-card'> & PropsLocale<typeof NS>) {
     const { value, error, busy, act } = useProvider(provider.provider)
     const stale = value?.models.filter((model) => model.stale).length ?? 0
     return (
-      <section className={styles.customized} aria-label="GPT 模型适配">
+      <section className={styles.customized} aria-label={t('title')}>
         <div className={styles.rowHead}>
-          <span className={styles.rowName}>GPT 自动适配</span>
+          <span className={styles.rowName}>{t('autoAdapt')}</span>
           <div className={styles.rowActions}>
             {value?.enabled && (
               <Button
@@ -362,11 +453,11 @@ export function apply(ctx: Context): void {
                   void act('refresh', { provider: provider.provider })
                 }}
               >
-                {value.status.state === 'refreshing' ? '正在同步…' : '立即同步'}
+                {t(value.status.state === 'refreshing' ? 'syncing' : 'syncNow')}
               </Button>
             )}
             <Switch
-              label="GPT 自动适配"
+              label={t('autoAdapt')}
               checked={value?.enabled ?? false}
               disabled={!configured || !value || busy}
               onChange={(enabled) => {
@@ -379,10 +470,10 @@ export function apply(ctx: Context): void {
           <div className={styles.customizedBody}>
             <p className={styles.advancedHint} role="status">
               {value.status.state === 'ready'
-                ? `已同步 ${value.models.length} 个模型 · GPT 六档预设已接管原生等级；停用自动适配可恢复`
+                ? t('synced', { count: value.models.length })
                 : value.status.state === 'error'
-                  ? value.status.error
-                  : '等待同步'}
+                  ? translateOwnedError(value.status.error, t)
+                  : t('waiting')}
             </p>
             {stale > 0 && (
               <div className={styles.rowActions}>
@@ -395,26 +486,24 @@ export function apply(ctx: Context): void {
                     void act('removeStale', { provider: provider.provider })
                   }}
                 >
-                  移除上游未列出的模型（{stale}）
+                  {t('removeStale', { count: stale })}
                 </Button>
               </div>
             )}
-            <p className={styles.advancedHint}>
-              在「自定义设置 → 模型目录」的上下文窗口中选择预设；
-              选择“自定义”后可输入数值，选择“默认”恢复自动解析。
-            </p>
+            <p className={styles.advancedHint}>{t('contextHint')}</p>
             <AdvancedSettings
               key={provider.provider}
               provider={provider.provider}
               value={value}
               busy={busy}
               act={act}
+              t={t}
             />
           </div>
         )}
         {error && (
           <p className={styles.error} role="alert">
-            {error}
+            {translateOwnedError(error, t)}
           </p>
         )}
       </section>
@@ -422,7 +511,8 @@ export function apply(ctx: Context): void {
   }
   function SpeedOptions({
     sessionId,
-  }: PropsRuntime<'conversation.input.left'>) {
+    t,
+  }: PropsRuntime<'conversation.input.left'> & PropsLocale<typeof NS>) {
     const directory = (
       ctx.get('modelDirectories') as ModelDirectoryResolver
     ).directoryFor(sessionId).store
@@ -471,7 +561,11 @@ export function apply(ctx: Context): void {
         setOpen(false)
       } catch (failure) {
         if (sequence === action.current)
-          setError(failure instanceof Error ? failure.message : '设置速度失败')
+          setError(
+            failure instanceof Error
+              ? failure.message
+              : dictionaries.en.speedFailed,
+          )
       } finally {
         if (sequence === action.current) {
           setBusy(false)
@@ -505,13 +599,13 @@ export function apply(ctx: Context): void {
               variant="toolbar"
               size="sm"
               disabled={busy}
-              aria-label={`GPT 速度：${label}`}
+              aria-label={t('speedLabel', { label })}
               aria-haspopup="menu"
               aria-expanded={open}
               title={
                 speed.last?.actual
-                  ? `实际速度：${speed.last.actual}`
-                  : 'GPT 请求速度'
+                  ? t('actualSpeed', { tier: speed.last.actual })
+                  : t('requestSpeed')
               }
               onClick={() => setOpen(!open)}
             >
@@ -522,17 +616,20 @@ export function apply(ctx: Context): void {
         />
         {(error || metadata.error || speedQuery.error) && (
           <span className={styles.error} role="alert">
-            {error || metadata.error || speedQuery.error}
+            {translateOwnedError(
+              error || metadata.error || speedQuery.error,
+              t,
+            )}
           </span>
         )}
       </>
     )
   }
   ctx.slots.inject('settings.models.provider-card', () => {
-    const restore = installNativeContextPresets(ctx.slots)
+    const restore = installNativeContextPresets(ctx.slots, translate)
     try {
       const dispose = ctx.slots.register(
-        { name: 'settings.models.provider-card', key: 'llm-pi-ai' },
+        { name: 'settings.models.provider-card', key: 'llm-pi-ai', locale: NS },
         ProviderExtras,
       )
       return () => {
@@ -546,7 +643,12 @@ export function apply(ctx: Context): void {
   })
   ctx.slots.inject('conversation.input.left', () =>
     ctx.slots.register(
-      { name: 'conversation.input.left', id: 'gpt-speed', order: 20 },
+      {
+        name: 'conversation.input.left',
+        id: 'gpt-speed',
+        order: 20,
+        locale: NS,
+      },
       SpeedOptions,
     ),
   )

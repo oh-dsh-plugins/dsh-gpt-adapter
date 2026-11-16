@@ -13,13 +13,25 @@ export class JsonStorage {
     )
   }
 
-  async read<T>(key: string): Promise<T | undefined> {
+  async read<T>(
+    key: string,
+    validate?: (value: unknown) => value is T,
+  ): Promise<T | undefined> {
+    let source: string
     try {
-      return JSON.parse(await readFile(this.path(key), 'utf8')) as T
+      source = await readFile(this.path(key), 'utf8')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw error
     }
+    let value: unknown
+    try {
+      value = JSON.parse(source)
+    } catch (error) {
+      if (error instanceof SyntaxError) return undefined
+      throw error
+    }
+    return !validate || validate(value) ? (value as T) : undefined
   }
 
   async write(

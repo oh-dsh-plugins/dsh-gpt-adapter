@@ -85,6 +85,40 @@ function schemaLevels(json: any) {
 }
 
 describe('plugin-owned reasoning on the native Models page', () => {
+  it('keeps prior-model matching linear when saving a large model list', async () => {
+    const count = 1000
+    let idReads = 0
+    const models = Array.from({ length: count }, (_, index) => ({
+      get id() {
+        idReads++
+        return `gpt-${index}`
+      },
+    }))
+    let raw: any = { providers: { gateway: { models } } }
+    const settings = {
+      describe: () => [{ ns: 'llm-pi-ai', value: raw, user: raw, base: {} }],
+      async write(
+        _ns: string,
+        change: (current: any, base: any, schema: any) => any,
+      ) {
+        raw = change(raw, {}, Config)
+      },
+    }
+    const capability = resolveCapabilities({ id: 'gpt-example' }, 'test')
+    const dispose = installSettingsOverlay(settings, () => capability)
+    try {
+      await settings.write('llm-pi-ai', (current) => {
+        current.providers.gateway.name = 'Renamed'
+        return current
+      })
+      expect(raw.providers.gateway.models).toHaveLength(count)
+      expect(raw.providers.gateway.models[0]).toEqual({ id: 'gpt-0' })
+      expect(idReads).toBeLessThan(count * 10)
+    } finally {
+      dispose()
+    }
+  })
+
   it('rejects a stale native model draft after metadata changes without freezing its old capacity', async () => {
     let raw: any = {
       providers: {

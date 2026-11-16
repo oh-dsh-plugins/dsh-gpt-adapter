@@ -31,6 +31,18 @@ describe('plugin packaging and compatible composition', () => {
       'customTokens',
       'expectedRevision',
     ])
+    expect(
+      host
+        .match(/async updateOptions\(([^)]*)\)/)![1]!
+        .split(',')
+        .map((name) => name.trim()),
+    ).toEqual([
+      'provider',
+      'refreshIntervalMs',
+      'capabilityCatalogUrl',
+      'overridesJSON',
+      'expectedRevision',
+    ])
   })
   it('exports every built entry and an additive valid bundle', async () => {
     const manifest = JSON.parse(await readFile('package.json', 'utf8'))

@@ -9,6 +9,107 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import ToolsService from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { installCodexCompatibility } from '../src/codex.js'
+import { installCodexInstructions } from '../src/codex-instructions.js'
+
+it('refreshes Codex instructions on a real tool continuation without additional messages', async () => {
+  const require = createRequire(import.meta.url)
+  const native = createRequire(require.resolve('@deepseek-ai/dsh-agent-loop'))
+  const [
+    { default: Agents },
+    { default: Sessions },
+    { default: SystemPrompt },
+    { default: Projections },
+  ] = await Promise.all(
+    [
+      '@deepseek-ai/dsh-agent',
+      '@deepseek-ai/dsh-session',
+      '@deepseek-ai/dsh-system-prompt',
+      '@deepseek-ai/dsh-session-projection',
+    ].map((name) => import(pathToFileURL(native.resolve(name)).href)),
+  )
+  const ctx = new Context()
+  const requests: any[] = []
+  const cwd = '/__dsh_instruction_fixture__/project'
+  let version = 'VERSION_ONE'
+  vi.stubEnv('DSH_HOME', '/__dsh_instruction_fixture__/dsh')
+  vi.stubEnv('DSH_AGENTS_HOME', '/__dsh_instruction_fixture__/agents')
+  try {
+    ctx.provide('llm', {
+      prepareCall: async (config: any) => ({
+        config,
+        async *stream(request: any) {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield {
+              type: 'block-end',
+              index: 0,
+              block: {
+                type: 'tool-call',
+                id: 'call_fixture',
+                name: 'fixture',
+                arguments: '{}',
+              },
+            }
+            yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          } else {
+            yield { type: 'text-delta', index: 0, text: 'OK' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          }
+        },
+      }),
+    } as any)
+    await ctx.plugin(Sessions)
+    await ctx.plugin(Agents)
+    await ctx.plugin(Projections)
+    await ctx.plugin(SystemPrompt, {
+      includeHarnessIdentity: false,
+      includeRuntimeContext: false,
+    })
+    await ctx.plugin(ToolsService)
+    ctx.get('tools')!.setExecutor({
+      describe: () => ({ schemas: [] }),
+      execute: async () => {
+        version = 'VERSION_TWO'
+        return { concluded: false, additionalContexts: [] }
+      },
+    } as any)
+    ctx.provide('fs', {
+      resolve: async (path: string) => path,
+      stat: async (path: string) =>
+        [join(cwd, '.git'), join(cwd, 'AGENTS.md')].includes(path)
+          ? {}
+          : undefined,
+      readText: async (path: string) =>
+        path === join(cwd, 'AGENTS.md') ? version : '',
+    } as any)
+    ctx.provide('workingDirectory', { ensure: async () => cwd } as any)
+    installCodexInstructions(
+      ctx,
+      '/__dsh_instruction_fixture__/codex',
+      async () => ({}),
+    )
+    await ctx.plugin(AgentLoop, { agents: [] })
+    const agent = await (ctx.get('agentLoop') as any).create(
+      'instruction-fixture',
+      { provider: 'fixture', model: 'fixture' },
+    )
+    agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'Fixture' }],
+        source: { kind: 'fixture' },
+      } as any),
+    )
+    await vi.waitFor(() => {
+      expect(requests).toHaveLength(2)
+      expect(agent.status).toBe('idle')
+    })
+    expect(JSON.stringify(requests[0].messages)).toContain('VERSION_ONE')
+    expect(JSON.stringify(requests[1].messages)).toContain('VERSION_TWO')
+  } finally {
+    await ctx.fiber.dispose()
+    vi.unstubAllEnvs()
+  }
+})
 
 it('admits MCP tools in actual AgentLoop requests on first use and after idle reconnect', async () => {
   const require = createRequire(import.meta.url)

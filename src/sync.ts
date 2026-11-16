@@ -26,6 +26,7 @@ export type SyncResult = {
 async function readBounded(response: Response): Promise<string> {
   const length = Number(response.headers.get('content-length') ?? Number.NaN)
   if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {
+    void response.body?.cancel().catch(() => undefined)
     throw new Error(`model list exceeds ${MAX_RESPONSE_BYTES} bytes`)
   }
   if (!response.body) return response.text()
@@ -57,6 +58,94 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined
+}
+
+function validCachedHints(value: unknown): boolean {
+  const hints = record(value)
+  if (!hints) return false
+  if (
+    hints.supportsReasoning !== undefined &&
+    typeof hints.supportsReasoning !== 'boolean'
+  )
+    return false
+  if (
+    hints.defaultReasoningId !== undefined &&
+    typeof hints.defaultReasoningId !== 'string'
+  )
+    return false
+  if (
+    hints.contextWindow !== undefined &&
+    !validContextWindow(hints.contextWindow)
+  )
+    return false
+  if (
+    hints.maxOutputTokens !== undefined &&
+    (typeof hints.maxOutputTokens !== 'number' ||
+      !Number.isFinite(hints.maxOutputTokens) ||
+      hints.maxOutputTokens <= 0)
+  )
+    return false
+  if (
+    hints.defaultServiceTier !== undefined &&
+    (typeof hints.defaultServiceTier !== 'string' ||
+      !['default', 'fast', 'ultrafast'].includes(hints.defaultServiceTier))
+  )
+    return false
+  if (
+    hints.inputModalities !== undefined &&
+    (!Array.isArray(hints.inputModalities) ||
+      hints.inputModalities.some((item) => item !== 'text' && item !== 'image'))
+  )
+    return false
+  for (const field of ['reasoningChoices', 'serviceTiers']) {
+    const choices = hints[field]
+    if (choices === undefined) continue
+    if (
+      !Array.isArray(choices) ||
+      (field === 'serviceTiers' && !choices.length)
+    )
+      return false
+    for (const item of choices) {
+      const choice = record(item)
+      if (
+        !choice ||
+        typeof choice.id !== 'string' ||
+        !choice.id ||
+        typeof choice.label !== 'string' ||
+        (choice.wireValue !== null && typeof choice.wireValue !== 'string')
+      )
+        return false
+      if (
+        field === 'serviceTiers' &&
+        (!['default', 'fast', 'ultrafast'].includes(choice.id) ||
+          !['default', 'fast', 'ultrafast', 'priority'].includes(
+            String(choice.wireValue),
+          ))
+      )
+        return false
+    }
+  }
+  return true
+}
+
+function validCachedModels(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every((item) => {
+      const model = record(item)
+      return (
+        model !== undefined &&
+        typeof model.id === 'string' &&
+        model.id.length > 0 &&
+        (model.displayName === undefined ||
+          (typeof model.displayName === 'string' &&
+            model.displayName.trim().length > 0)) &&
+        (model.stale === undefined || typeof model.stale === 'boolean') &&
+        (model.capabilities === undefined ||
+          validCachedHints(model.capabilities))
+      )
+    })
+  )
 }
 
 function firstDefined(
@@ -216,6 +305,8 @@ function parseCapabilityHints(
       source: 'upstream',
     })
   }
+  if (!tiers.length)
+    throw new Error(`model ${modelId} declares no supported service tiers`)
   const defaultTier =
     typeof rawDefaultTier === 'string' ? serviceTier(rawDefaultTier) : undefined
   const contextWindow = firstDefined(sources, [
@@ -228,7 +319,11 @@ function parseCapabilityHints(
     'max_tokens',
   ])
   const hints: CapabilityHints = {
-    ...(typeof supportsReasoning === 'boolean' ? { supportsReasoning } : {}),
+    ...(typeof supportsReasoning === 'boolean'
+      ? { supportsReasoning }
+      : reasoning
+        ? { supportsReasoning: reasoning.length > 0 }
+        : {}),
     ...(reasoning ? { reasoningChoices: reasoning } : {}),
     ...(typeof defaultReasoningValue === 'string'
       ? { defaultReasoningId: defaultReasoningValue }
@@ -259,7 +354,7 @@ function parseModelList(payload: unknown): UpstreamModel[] {
     return [
       {
         id: row.id,
-        ...(typeof row.display_name === 'string'
+        ...(typeof row.display_name === 'string' && row.display_name.trim()
           ? { displayName: row.display_name }
           : {}),
         ...(typeof row.created === 'number' ? { created: row.created } : {}),
@@ -407,8 +502,10 @@ export async function fetchModels(
       notModified: true,
       ...(etag === undefined ? {} : { etag }),
     }
-  if (!response.ok)
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined)
     throw new Error(`model list request failed with HTTP ${response.status}`)
+  }
   const models = parseModelList(JSON.parse(await readBounded(response)))
   const nextEtag = response.headers.get('etag') ?? undefined
   return {
@@ -463,6 +560,26 @@ export function restoreSnapshot(
   config: SyncConfig,
   cached: SyncSnapshot,
 ): SyncSnapshot | undefined {
+  if (
+    !record(cached) ||
+    typeof cached.fetchedAt !== 'string' ||
+    !validCachedModels(cached.models) ||
+    (cached.upstreamModels !== undefined &&
+      !validCachedModels(cached.upstreamModels)) ||
+    (cached.etag !== undefined && typeof cached.etag !== 'string')
+  )
+    return undefined
+  if (cached.catalog !== undefined) {
+    const catalog = record(cached.catalog)
+    const models = record(catalog?.models)
+    if (
+      !catalog ||
+      typeof catalog.version !== 'string' ||
+      !models ||
+      !Object.values(models).every(validCachedHints)
+    )
+      return undefined
+  }
   if (cached.cacheKey !== syncCacheKey(config)) return undefined
   const catalog =
     config.catalog ??
@@ -471,10 +588,16 @@ export function restoreSnapshot(
       ? cached.catalog
       : undefined)
   const effectiveConfig = { ...config, ...(catalog ? { catalog } : {}) }
+  // Raw metadata can contain models excluded by the previous filter. Preserve
+  // the cached view's metadata and stale flags when rebuilding the current view.
+  const models = dedupeModels([
+    ...(cached.upstreamModels ?? []),
+    ...cached.models,
+  ]).filter(config.includeModel ?? isGptModel)
   const next = buildSnapshot(
-    cached.models,
+    models,
     effectiveConfig,
-    revisionFor(cached.models, effectiveConfig),
+    revisionFor(models, effectiveConfig),
     cached,
     cached.cacheKey,
   )
@@ -573,10 +696,12 @@ export async function fetchCapabilityCatalog(
     headers: { accept: 'application/json' },
     ...(signal ? { signal } : {}),
   })
-  if (!response.ok)
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined)
     throw new Error(
       `capability catalog request failed with HTTP ${response.status}`,
     )
+  }
   const value: unknown = JSON.parse(await readBounded(response))
   const root = record(value)
   const models = record(root?.models)

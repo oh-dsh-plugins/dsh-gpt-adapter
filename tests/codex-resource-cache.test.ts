@@ -29,6 +29,131 @@ async function put(path: string, value: unknown) {
 }
 
 describe('Codex Host resource reuse', () => {
+  it('keeps admission bounded and reclaims a working set after it stops being read', async () => {
+    const home = await fs.mkdtemp(join(tmpdir(), 'dsh-codex-resources-'))
+    directories.push(home)
+    const paths = Array.from({ length: 257 }, (_, index) =>
+      join(home, `${index}.json`),
+    )
+    await Promise.all(paths.map((path) => put(path, {})))
+    const resources = new CodexResourceCache()
+    const load = vi.fn(async () => ({}))
+    try {
+      for (let round = 0; round < 2; round++) {
+        const observation = resources.observe()
+        for (const path of paths) await observation.read(path, 'fixture', load)
+      }
+      // The overflow resource is read twice; the retained 256 are loaded once.
+      expect(load).toHaveBeenCalledTimes(258)
+      const overflow = paths.at(-1)!
+      await resources.observe().read(overflow, 'fixture', load)
+      await resources.observe().read(overflow, 'fixture', load)
+      await resources.observe().read(overflow, 'fixture', load)
+      const admitted = load.mock.calls.length
+      await resources.observe().read(overflow, 'fixture', load)
+      expect(load).toHaveBeenCalledTimes(admitted)
+      await resources.read(paths[0]!, 'fixture', load)
+      expect(load).toHaveBeenCalledTimes(admitted + 1)
+    } finally {
+      resources.dispose()
+    }
+  })
+
+  it('preserves in-flight observations while new observations evict and reload resources', async () => {
+    const home = await fs.mkdtemp(join(tmpdir(), 'dsh-codex-resources-'))
+    directories.push(home)
+    const path = join(home, 'fixture.json')
+    await put(path, {})
+    const resources = new CodexResourceCache()
+    const previous = resources.observe()
+    let release!: (value: string) => void
+    const load = vi.fn(
+      () => new Promise<string>((resolve) => (release = resolve)),
+    )
+    const oldRead = previous.read(path, 'fixture', load)
+    try {
+      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(1))
+      resources.observe()
+      const current = resources.observe()
+      await expect(
+        current.read(path, 'fixture', async () => 'current'),
+      ).resolves.toBe('current')
+      release('previous')
+      await expect(oldRead).resolves.toBe('previous')
+      await expect(
+        previous.read(path, 'fixture', async () => 'unexpected'),
+      ).resolves.toBe('previous')
+
+      const failed = resources.observe()
+      await expect(
+        failed.read(path, 'failed', async () => {
+          throw new Error('temporary read failure')
+        }),
+      ).rejects.toThrow('temporary read failure')
+      await expect(
+        failed.read(path, 'failed', async () => 'retried'),
+      ).resolves.toBe('retried')
+      await fs.rm(path)
+      const missingLoad = vi.fn(async () => 'unexpected')
+      await expect(
+        resources.observe().read(path, 'fixture', missingLoad),
+      ).resolves.toBeUndefined()
+      expect(missingLoad).not.toHaveBeenCalled()
+      await put(path, {})
+      await expect(
+        resources.observe().read(path, 'fixture', async () => 'recreated'),
+      ).resolves.toBe('recreated')
+    } finally {
+      release?.('previous')
+      await oldRead.catch(() => {})
+      resources.dispose()
+    }
+  })
+
+  it('reuses its bounded working set when a scan contains 90 plugins', async () => {
+    const home = await fs.mkdtemp(join(tmpdir(), 'dsh-codex-resources-'))
+    directories.push(home)
+    await put(
+      join(home, 'config.toml'),
+      Array.from(
+        { length: 90 },
+        (_, index) => `[plugins."plugin${index}@fixture"]\nenabled=true\n`,
+      ).join(''),
+    )
+    for (let index = 0; index < 90; index++) {
+      const root = join(home, `plugins/cache/fixture/plugin${index}/1.0.0`)
+      await put(join(root, '.codex-plugin/plugin.json'), {
+        name: `plugin${index}`,
+        mcpServers: './.mcp.json',
+      })
+      await put(join(root, '.mcp.json'), {})
+    }
+    const resources = new CodexResourceCache()
+    const read = vi.spyOn(fs, 'readFile')
+    const listing = vi.spyOn(fs, 'readdir')
+    syncBuiltinESMExports()
+    try {
+      const scan = () =>
+        discoverCodexSnapshot(home, options, {
+          resources: resources.observe(),
+        })
+      expect((await scan()).skillRoots).toHaveLength(92)
+      read.mockClear()
+      listing.mockClear()
+      expect((await scan()).skillRoots).toHaveLength(92)
+      expect(read.mock.calls.length).toBeLessThan(20)
+      expect(listing.mock.calls.length).toBeLessThan(10)
+      const changed = join(
+        home,
+        'plugins/cache/fixture/plugin0/1.0.0/.mcp.json',
+      )
+      await put(changed, { fixture: { command: 'updated-fixture' } })
+      expect((await scan()).mcp[0]?.command).toBe('updated-fixture')
+    } finally {
+      resources.dispose()
+    }
+  })
+
   it('rejects closed reads, including loads and metadata checks already in flight', async () => {
     const home = await fs.mkdtemp(join(tmpdir(), 'dsh-codex-resources-'))
     directories.push(home)

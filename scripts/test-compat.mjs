@@ -61,6 +61,7 @@ for (const version of versions) {
       'tests',
       'lib',
       'dist',
+      '.github',
       'tsconfig.json',
       'vitest.config.ts',
       'cordis.patch.yml',

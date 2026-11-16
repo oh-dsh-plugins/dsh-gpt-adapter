@@ -18,6 +18,8 @@ A third-party plugin for DeepSeek Harness (DSH) that adapts GPT models and reuse
 
 Reasoning levels, speed tiers, and context limits depend on the configured model gateway. Local presets do not increase upstream capabilities.
 
+Plugin UI text, context presets, configuration descriptions, and plugin-owned validation errors follow DSH's native language setting, with Simplified Chinese and English dictionaries. Other native languages fall back to English. Switching languages preserves editor drafts. Model/skill names, custom labels, protocol identifiers, and upstream error text remain verbatim.
+
 ## Installation
 
 Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`, or `0.2.2-rc.3`.
@@ -118,7 +120,7 @@ An empty `mcpAllowlist` imports all enabled declared servers. A nonempty list fi
 
 Model snapshots and saved speed choices are stored under `$DSH_HOME/storages/gpt-adapter`. Codex source files and imported MCP credentials are not copied there.
 
-Disabling GPT adaptation restores native model controls. Disabling or removing the plugin withdraws its runtime registrations without changing Codex source files or deleting DSH conversation history.
+Disabling GPT adaptation restores native reasoning-level controls. Context window presets remain available and save through DSH's native settings. Disabling or removing the plugin withdraws its runtime registrations without changing Codex source files or deleting DSH conversation history.
 
 ## License
 

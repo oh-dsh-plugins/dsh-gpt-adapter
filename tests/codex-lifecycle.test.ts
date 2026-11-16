@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
+import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import { installCodexCompatibility } from '../src/codex.js'
 import { installCodexInstructions } from '../src/codex-instructions.js'
@@ -114,6 +115,295 @@ const step = (
   })
 
 describe('Codex operation ownership', () => {
+  it.each([65, 260])(
+    'rejects unknown project policy after %s scopes evict its last-good snapshot',
+    async (count) => {
+      const home = await directory(),
+        project = join(home, 'restricted')
+      await fs.mkdir(join(project, '.git'), { recursive: true })
+      await put(
+        join(home, 'config.toml'),
+        `[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
+      )
+      const config = join(project, '.codex/config.toml')
+      const policy = '[[skills.config]]\nname="secret"\nenabled=false\n'
+      await put(config, policy)
+      await put(join(home, 'skills/secret/SKILL.md'), body('secret'))
+      const { registry } = await skills(home)
+      expect(await registry.list({ cwd: project })).toEqual([])
+      for (let index = 0; index < count; index++)
+        await registry.list({ cwd: join(home, `scope-${index}`) })
+      await put(config, 'broken = [')
+      await expect(registry.list({ cwd: project })).rejects.toThrow()
+      await expect(registry.get('secret', { cwd: project })).rejects.toThrow()
+      await put(config, policy)
+      expect(await registry.list({ cwd: project })).toEqual([])
+      expect(await registry.get('secret', { cwd: project })).toBeUndefined()
+    },
+  )
+
+  it('keeps a complete warm catalog for a project with 64 plugin roots', async () => {
+    const home = await directory(),
+      project = join(home, 'project')
+    await fs.mkdir(join(project, '.git'), { recursive: true })
+    let global = `[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`
+    let local = ''
+    for (let index = 0; index < 64; index++) {
+      global += `[plugins."plugin${index}@fixture"]\nenabled=false\n`
+      local += `[plugins."plugin${index}@fixture"]\nenabled=true\n`
+      const root = join(home, `plugins/cache/fixture/plugin${index}/1.0.0`)
+      await put(
+        join(root, '.codex-plugin/plugin.json'),
+        JSON.stringify({ name: `plugin${index}`, mcpServers: {} }),
+      )
+      await put(join(root, 'skills/example/SKILL.md'), body('example'))
+    }
+    await put(join(home, 'config.toml'), global)
+    await put(join(project, '.codex/config.toml'), local)
+    const readText = vi.fn(filesystem.readText)
+    const { registry, runtime } = await skills(
+      home,
+      { ...filesystem, readText },
+      { watch: true, pollIntervalMs: 60000 },
+    )
+    const disposed = vi.spyOn(FileSystemSkillProvider.prototype, 'dispose')
+    const initial = await registry.snapshot({ cwd: project })
+    expect(initial.complete).toBe(true)
+    expect(initial.skills).toHaveLength(64)
+    expect(disposed).not.toHaveBeenCalled()
+    readText.mockClear()
+    const [first, second] = await Promise.all([
+      registry.snapshot({ cwd: project }),
+      registry.snapshot({ cwd: project }),
+    ])
+    expect(first).toEqual(initial)
+    expect(second).toEqual(initial)
+    expect(
+      readText.mock.calls.filter(([target]) =>
+        target.displayPath.endsWith('/SKILL.md'),
+      ),
+    ).toHaveLength(0)
+    expect(disposed).not.toHaveBeenCalled()
+    await runtime.dispose()
+    // Two global sources, one project source, and all 64 scoped plugin sources.
+    expect(new Set(disposed.mock.contexts).size).toBe(67)
+  })
+
+  it('retries a transient policy path failure in the enclosing list filter', async () => {
+    const home = await directory()
+    const path = join(home, 'secret.md')
+    await put(
+      join(home, 'config.toml'),
+      `[[skills.config]]\npath=${JSON.stringify(path)}\nenabled=false\n`,
+    )
+    let fail = true
+    const { registry } = await skills(home, {
+      ...filesystem,
+      resolve: async (value: string) => {
+        if (value === path && fail) {
+          fail = false
+          throw new Error('temporary resolution failure')
+        }
+        return filesystem.resolve(value)
+      },
+    })
+    registry.register({
+      name: 'secret',
+      description: 'Secret',
+      source: 'runtime',
+      content: 'Secret',
+      path,
+    })
+    expect((await registry.list()).map((entry) => entry.name)).not.toContain(
+      'secret',
+    )
+  })
+
+  it.each(['policy', 'skill'] as const)(
+    'does not expose a disabled skill when its %s path keeps failing resolution',
+    async (failing) => {
+      const home = await directory()
+      const path = join(home, 'secret.md'),
+        selector = join(home, 'secret-alias.md')
+      await put(
+        join(home, 'config.toml'),
+        `[[skills.config]]\npath=${JSON.stringify(selector)}\nenabled=false\n`,
+      )
+      const failure = new Error('persistent policy resolution failure')
+      let failures = 0,
+        broken = true
+      const { registry } = await skills(home, {
+        ...filesystem,
+        resolve: async (value: string) => {
+          if (broken && value === (failing === 'policy' ? selector : path)) {
+            failures++
+            throw failure
+          }
+          const target = await filesystem.resolve(value)
+          return value === selector ? { ...target, targetKey: path } : target
+        },
+      })
+      registry.register({
+        name: 'secret',
+        description: 'Secret',
+        source: 'runtime',
+        content: 'DISABLED_SECRET_CONTENT',
+        path,
+      })
+      await expect(registry.list()).rejects.toBe(failure)
+      expect(failures).toBe(2)
+      await expect(registry.get('secret')).rejects.toBe(failure)
+      expect(failures).toBe(4)
+      broken = false
+      expect(await registry.list()).toEqual([])
+      expect(await registry.get('secret')).toBeUndefined()
+    },
+  )
+
+  it.each(['reject', 'resolve'] as const)(
+    'does not continue policy resolution after cancellation (%s)',
+    async (outcome) => {
+      const home = await directory()
+      const path = join(home, 'secret.md'),
+        selector = join(home, 'secret-alias.md')
+      await put(
+        join(home, 'config.toml'),
+        `[[skills.config]]\npath=${JSON.stringify(selector)}\nenabled=false\n`,
+      )
+      const abort = new AbortController()
+      const canceled = new Error('policy caller canceled')
+      let resolutions = 0,
+        candidateResolutions = 0
+      const { registry } = await skills(home, {
+        ...filesystem,
+        resolve: async (value: string) => {
+          if (value === selector) {
+            resolutions++
+            abort.abort(canceled)
+            if (outcome === 'reject') throw canceled
+            return { targetKey: path, displayPath: value }
+          }
+          if (value === path) candidateResolutions++
+          return filesystem.resolve(value)
+        },
+      })
+      registry.register({
+        name: 'secret',
+        description: 'Secret',
+        source: 'runtime',
+        content: 'DISABLED_SECRET_CONTENT',
+        path,
+      })
+      await expect(registry.list({ signal: abort.signal })).rejects.toBe(
+        canceled,
+      )
+      expect(resolutions).toBe(1)
+      expect(candidateResolutions).toBe(0)
+      await expect(
+        registry.get('secret', { signal: abort.signal }),
+      ).rejects.toBe(canceled)
+      expect(resolutions).toBe(1)
+    },
+  )
+
+  it('resolves each skill policy path once per warm catalog read', async () => {
+    const home = await directory()
+    const paths = Array.from({ length: 20 }, (_, index) =>
+      join(home, 'skills', `skill-${index}`, 'SKILL.md'),
+    )
+    for (const [index, path] of paths.entries())
+      await put(path, body(`skill-${index}`))
+    await put(
+      join(home, 'config.toml'),
+      paths
+        .map(
+          (path) =>
+            `[[skills.config]]\npath=${JSON.stringify(path)}\nenabled=true\n`,
+        )
+        .join(''),
+    )
+    const resolvePath = vi.fn(filesystem.resolve)
+    const { registry } = await skills(home, {
+      ...filesystem,
+      resolve: resolvePath,
+    })
+    await registry.list()
+    resolvePath.mockClear()
+    expect(await registry.list()).toHaveLength(paths.length)
+    for (const path of paths)
+      expect(
+        resolvePath.mock.calls.filter(([value]) => value === path),
+      ).toHaveLength(1)
+  })
+
+  it('closes scoped skill watchers when the injected skills service unloads', async () => {
+    const home = await directory(),
+      cwd = join(home, 'project')
+    await fs.mkdir(join(cwd, '.git'), { recursive: true })
+    await put(join(cwd, '.agents/skills/example/SKILL.md'), body('example'))
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    ctx.provide('fs', filesystem as any)
+    const skillFiber = ctx.plugin(SkillRegistry)
+    await skillFiber
+    const runtime = installCodexCompatibility(ctx, {
+      ...options,
+      codexHome: home,
+      watch: true,
+    })
+    cleanup.push(() => runtime.dispose())
+    await new Promise<void>((done) => setImmediate(done))
+    await runtime.refresh()
+    const disposed = vi.spyOn(FileSystemSkillProvider.prototype, 'dispose')
+    expect(
+      (await ctx.get('skills')!.list({ cwd })).map((s) => s.name),
+    ).toContain('example')
+    await skillFiber.dispose()
+    expect(new Set(disposed.mock.contexts).size).toBe(3)
+    await ctx.plugin(SkillRegistry)
+    await runtime.refresh()
+    expect(
+      (await ctx.get('skills')!.list({ cwd })).map((s) => s.name),
+    ).toContain('example')
+  })
+
+  it('evicts scoped skill watchers at capacity and closes retained watchers on unload', async () => {
+    const home = await directory()
+    const project = join(home, 'with-plugin')
+    await fs.mkdir(join(project, '.git'), { recursive: true })
+    await put(
+      join(home, 'config.toml'),
+      `[plugins."active@fixture"]\nenabled=false\n[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
+    )
+    await put(
+      join(project, '.codex/config.toml'),
+      '[plugins."active@fixture"]\nenabled=true\n',
+    )
+    const plugin = join(home, 'plugins/cache/fixture/active/1.0.0')
+    await put(
+      join(plugin, '.codex-plugin/plugin.json'),
+      JSON.stringify({ name: 'active', mcpServers: {} }),
+    )
+    await put(join(plugin, 'skills/example/SKILL.md'), body('example'))
+    const disposed = vi.spyOn(FileSystemSkillProvider.prototype, 'dispose')
+    const { registry, runtime } = await skills(home, filesystem, {
+      watch: true,
+    })
+    expect(
+      (await registry.list({ cwd: project })).map((entry) => entry.name),
+    ).toContain('active-example')
+    for (let index = 0; index < 66; index++) {
+      const cwd = join(home, `project-${index}`)
+      await fs.mkdir(join(cwd, '.git'), { recursive: true })
+      await registry.list({ cwd })
+    }
+    // Evict both sources in the first group and then two one-source groups.
+    expect(new Set(disposed.mock.contexts).size).toBe(4)
+    await runtime.dispose()
+    // Two globals, the two-source group, and 66 later project sources.
+    expect(new Set(disposed.mock.contexts).size).toBe(70)
+  })
+
   it('preserves another Agent catalog when a new unchanged scope is observed', async () => {
     const home = await directory()
     await fs.mkdir(join(home, '.git'))
@@ -430,9 +720,9 @@ describe('Codex operation ownership', () => {
       (await registry.get('active-example', { cwd: project, scope: a }))
         ?.content,
     ).toContain('WORLD_A')
-    expect(
-      await registry.get('active-example', { cwd: project, scope: b }),
-    ).toBeUndefined()
+    await expect(
+      registry.get('active-example', { cwd: project, scope: b }),
+    ).rejects.toThrow('Codex skill policy is unavailable for this scope')
     broken = false
     expect(
       (await registry.get('active-example', { cwd: project, scope: b }))

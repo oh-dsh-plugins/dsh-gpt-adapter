@@ -181,6 +181,70 @@ const options: CodexCompatibilityConfig = {
 }
 
 describe('Codex config and plugin resources', () => {
+  it.each([false, true])(
+    'does not restore an unrelated same-name MCP after a plugin error (conflict=%s)',
+    async (conflict) => {
+      const home = await directory()
+      const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+      await put(
+        join(home, 'config.toml'),
+        '[mcp_servers.active-backend]\ncommand="previous-root"\n',
+      )
+      const previous = await discoverCodexSnapshot(home, options)
+      await put(
+        join(home, 'config.toml'),
+        `[mcp_servers.active-backend]\n${conflict ? 'command="current-root"' : 'enabled=false'}\n` +
+          '[plugins."active@sample"]\nenabled=true\n',
+      )
+      await put(
+        join(plugin, '.codex-plugin/plugin.json'),
+        JSON.stringify({
+          name: 'active',
+          mcpServers: { backend: conflict ? { command: 'plugin' } : {} },
+        }),
+      )
+      const snapshot = await discoverCodexSnapshot(home, options, { previous })
+      expect(
+        snapshot.mcp.map((entry) => [entry.serverName, entry.command]),
+      ).toEqual(conflict ? [['active-backend', 'current-root']] : [])
+    },
+  )
+
+  it.each(['allowlist', 'conflict'] as const)(
+    'applies current %s constraints when retaining a broken plugin',
+    async (mode) => {
+      const home = await directory()
+      const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+      await put(
+        join(home, 'config.toml'),
+        '[plugins."active@sample"]\nenabled=true\n',
+      )
+      await put(
+        join(plugin, '.codex-plugin/plugin.json'),
+        JSON.stringify({ name: 'active', mcpServers: './.mcp.json' }),
+      )
+      await put(
+        join(plugin, '.mcp.json'),
+        JSON.stringify({ backend: { command: 'plugin' } }),
+      )
+      const previous = await discoverCodexSnapshot(home, options)
+      await put(join(plugin, '.mcp.json'), 'invalid-json')
+      if (mode === 'conflict')
+        await put(
+          join(home, 'config.toml'),
+          '[plugins."active@sample"]\nenabled=true\n[mcp_servers.active-backend]\ncommand="current-root"\n',
+        )
+      const snapshot = await discoverCodexSnapshot(
+        home,
+        { ...options, mcpAllowlist: mode === 'allowlist' ? ['other'] : [] },
+        { previous },
+      )
+      expect(
+        snapshot.mcp.map((entry) => [entry.serverName, entry.command]),
+      ).toEqual(mode === 'conflict' ? [['active-backend', 'current-root']] : [])
+    },
+  )
+
   it('findings: honors plugin server policies even when retaining a broken plugin snapshot', async () => {
     const home = await directory()
     const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
@@ -302,6 +366,31 @@ describe('Codex config and plugin resources', () => {
       ).toBe(!inline)
     },
   )
+
+  it('overrides HTTP headers without retaining differently cased credentials', () => {
+    const http = normalizeCodexMcp(
+      'remote',
+      {
+        url: 'https://fixture.invalid/mcp',
+        http_headers: {
+          authorization: 'stale-token',
+          'x-test': 'stale-value',
+          'X-Other': 'first',
+          'x-other': 'last',
+        },
+        env_http_headers: { AUTHORIZATION: 'AUTH', 'X-Test': 'HEADER' },
+        bearer_token_env_var: 'TOKEN',
+      },
+      'test',
+      '/tmp',
+      { AUTH: 'env-token', HEADER: 'env-value', TOKEN: 'bearer-token' },
+    )!
+    const headers = new Headers(http.headers)
+    expect(headers.get('authorization')).toBe('Bearer bearer-token')
+    expect(headers.get('x-test')).toBe('env-value')
+    expect(headers.get('x-other')).toBe('last')
+    expect(Object.keys(http.headers!)).toHaveLength(3)
+  })
 
   it('maps HTTP authentication, inherited stdio env, filters, cwd and timeouts without persisting credentials', () => {
     const http = normalizeCodexMcp(
@@ -526,6 +615,40 @@ describe('Codex config and plugin resources', () => {
 })
 
 describe('Codex instruction context', () => {
+  it.each([
+    [1, 'enter'],
+    [undefined, 'enter'],
+    [2, 'reject'],
+  ] as const)(
+    'does not refresh instructions for an inactive or rejected step (%s, %s)',
+    async (step, kind) => {
+      let gate: any
+      const ensure = vi.fn()
+      installCodexInstructions(
+        {
+          on: (_: string, handler: any) => {
+            gate = handler
+          },
+          workingDirectory: { ensure },
+        },
+        '/__dsh_instruction_fixture__/codex',
+      )
+      const decision = { kind, messages: [] }
+      expect(
+        await gate(
+          {
+            agent: {},
+            step,
+            messages: [],
+            signal: new AbortController().signal,
+          },
+          async () => decision,
+        ),
+      ).toBe(decision)
+      expect(ensure).not.toHaveBeenCalled()
+    },
+  )
+
   it('serializes the fresh-session instruction baseline through the official DSH Responses adapter', async () => {
     const home = await directory(),
       project = join(home, 'project')
@@ -942,81 +1065,85 @@ describe('Codex runtime integration', () => {
     }
   })
 
-  it('releases temporary skill-provider listeners across project lists and reads', async () => {
-    const home = await directory(),
-      project = join(home, 'project')
-    const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
-    await mkdir(join(project, '.git'), { recursive: true })
-    await put(
-      join(home, 'config.toml'),
-      `[plugins."active@sample"]\nenabled=false\n[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
-    )
-    await put(
-      join(project, '.codex/config.toml'),
-      '[plugins."active@sample"]\nenabled=true\n',
-    )
-    await put(
-      join(plugin, '.codex-plugin/plugin.json'),
-      JSON.stringify({ name: 'active', skills: './skills' }),
-    )
-    await put(
-      join(plugin, 'skills/example/SKILL.md'),
-      '---\nname: example\ndescription: Fixture\n---\nScoped skill',
-    )
-    const ctx = new Context()
-    cleanup.push(() => ctx.fiber.dispose())
-    ctx.provide('fs', skillFs as any)
-    const lifetime = new AbortController()
-    let provider: any
-    ctx.provide('skills', {
-      registerProvider(factory: any) {
-        provider = factory({ signal: lifetime.signal, invalidate() {} })
-        return () => lifetime.abort()
-      },
-      async list() {
-        return []
-      },
-      async snapshot() {
-        return { skills: [] }
-      },
-      async get() {
-        return undefined
-      },
-    } as any)
-    const runtime = installCodexCompatibility(ctx, {
-      ...options,
-      codexHome: home,
-      importInstructions: false,
-      importMcpServers: false,
-    })
-    await new Promise<void>((done) => setImmediate(done))
-    await runtime.refresh()
-    const before = getEventListeners(lifetime.signal, 'abort').length
-    expect(before).toBeGreaterThan(0)
-    let candidate: any
-    for (let index = 0; index < 25; index++) {
-      const call = { cwd: project, signal: new AbortController().signal }
-      const listed = await provider.list(call)
-      candidate = listed.candidates.find(
-        (skill: any) => skill.name === 'active-example',
+  it.each([false, true])(
+    'releases skill-provider listeners across project lists and reads (watch=%s)',
+    async (watch) => {
+      const home = await directory(),
+        project = join(home, 'project')
+      const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+      await mkdir(join(project, '.git'), { recursive: true })
+      await put(
+        join(home, 'config.toml'),
+        `[plugins."active@sample"]\nenabled=false\n[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
       )
-      expect((await provider.get(candidate, call)).content).toContain(
-        'Scoped skill',
+      await put(
+        join(project, '.codex/config.toml'),
+        '[plugins."active@sample"]\nenabled=true\n',
       )
-      expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(before)
-    }
-    const failure = vi
-      .spyOn(skillFs, 'readText')
-      .mockRejectedValueOnce(new Error('fixture read failed'))
-    try {
-      await provider.get(candidate, { cwd: project }).catch(() => undefined)
-      expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(before)
-    } finally {
-      failure.mockRestore()
-    }
-    await runtime.dispose()
-    expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(0)
-  })
+      await put(
+        join(plugin, '.codex-plugin/plugin.json'),
+        JSON.stringify({ name: 'active', skills: './skills' }),
+      )
+      await put(
+        join(plugin, 'skills/example/SKILL.md'),
+        '---\nname: example\ndescription: Fixture\n---\nScoped skill',
+      )
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      ctx.provide('fs', skillFs as any)
+      const lifetime = new AbortController()
+      let provider: any
+      ctx.provide('skills', {
+        registerProvider(factory: any) {
+          provider = factory({ signal: lifetime.signal, invalidate() {} })
+          return () => lifetime.abort()
+        },
+        async list() {
+          return []
+        },
+        async snapshot() {
+          return { skills: [] }
+        },
+        async get() {
+          return undefined
+        },
+      } as any)
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importMcpServers: false,
+        watch,
+      })
+      await new Promise<void>((done) => setImmediate(done))
+      await runtime.refresh()
+      const before = getEventListeners(lifetime.signal, 'abort').length
+      expect(before).toBeGreaterThan(0)
+      let candidate: any
+      for (let index = 0; index < 25; index++) {
+        const call = { cwd: project, signal: new AbortController().signal }
+        const listed = await provider.list(call)
+        candidate = listed.candidates.find(
+          (skill: any) => skill.name === 'active-example',
+        )
+        expect((await provider.get(candidate, call)).content).toContain(
+          'Scoped skill',
+        )
+        expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(before)
+      }
+      const failure = vi
+        .spyOn(skillFs, 'readText')
+        .mockRejectedValueOnce(new Error('fixture read failed'))
+      try {
+        await provider.get(candidate, { cwd: project }).catch(() => undefined)
+        expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(before)
+      } finally {
+        failure.mockRestore()
+      }
+      await runtime.dispose()
+      expect(getEventListeners(lifetime.signal, 'abort')).toHaveLength(0)
+    },
+  )
 
   it('findings: starts stdio MCPs in each Agent project and updates cwd on a project switch', async () => {
     const home = await directory(),
@@ -1695,6 +1822,144 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     expect((await registry.list()).map((s) => s.name)).toContain('native')
     expect((await registry.list()).map((s) => s.name)).not.toContain('example')
   })
+
+  it.each([false, true])(
+    'rejects a renamed skill loaded through its old name (plugin=%s)',
+    async (plugin) => {
+      const home = await directory()
+      const root = plugin
+        ? join(home, 'plugins/cache/sample/active/1.0.0')
+        : home
+      if (plugin) {
+        await put(
+          join(home, 'config.toml'),
+          '[plugins."active@sample"]\nenabled=true\n',
+        )
+        await put(
+          join(root, '.codex-plugin/plugin.json'),
+          JSON.stringify({ name: 'active' }),
+        )
+      }
+      const path = join(root, 'skills/example/SKILL.md')
+      await put(path, '---\nname: first\ndescription: First\n---\nFirst body')
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      await ctx.plugin(SkillRegistry)
+      const registry = ctx.get('skills') as SkillRegistry
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importMcpServers: false,
+      })
+      cleanup.push(() => runtime.dispose())
+      await new Promise<void>((done) => setImmediate(done))
+      await runtime.refresh()
+      const name = (value: string) => (plugin ? `active-${value}` : value)
+      expect((await registry.list()).map((s) => s.name)).toContain(
+        name('first'),
+      )
+      await put(
+        path,
+        '---\nname: second\ndescription: Second\n---\nSecond body',
+      )
+      expect(await registry.get(name('first'))).toBeUndefined()
+      expect((await registry.list()).map((s) => s.name)).toContain(
+        name('second'),
+      )
+      expect((await registry.get(name('second')))?.content).toBe('Second body')
+    },
+  )
+
+  it.each(['plugin', 'project'] as const)(
+    'invalidates scoped %s skills on native filesystem mutation notifications',
+    async (kind) => {
+      const home = await directory(),
+        project = join(home, 'project'),
+        cwd = join(project, 'child'),
+        plugin = join(home, 'plugins/cache/sample/active/1.0.0')
+      await mkdir(join(project, '.git'), { recursive: true })
+      await mkdir(cwd, { recursive: true })
+      await put(
+        join(home, 'config.toml'),
+        `[plugins."active@sample"]\nenabled=false\n[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n`,
+      )
+      await put(
+        join(project, '.codex/config.toml'),
+        '[plugins."active@sample"]\nenabled=true\n',
+      )
+      await put(
+        join(plugin, '.codex-plugin/plugin.json'),
+        JSON.stringify({ name: 'active' }),
+      )
+      const root =
+        kind === 'plugin' ? join(plugin, 'skills') : join(cwd, '.agents/skills')
+      const name = (value: string) =>
+        kind === 'plugin' ? `active-${value}` : value
+      await put(
+        join(root, 'first/SKILL.md'),
+        '---\nname: first\ndescription: First\n---\nFirst',
+      )
+      // Watch an established directory so this tests catalog invalidation,
+      // independently of the native watcher's new-directory startup race.
+      await mkdir(join(root, 'second'), { recursive: true })
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      ctx.provide('fs', skillFs as any)
+      await ctx.plugin(SkillRegistry)
+      const registry = ctx.get('skills') as SkillRegistry
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importMcpServers: false,
+        watch: true,
+      })
+      cleanup.push(() => runtime.dispose())
+      await new Promise<void>((done) => setImmediate(done))
+      await runtime.refresh()
+      expect((await registry.list({ cwd })).map((s) => s.name)).toContain(
+        name('first'),
+      )
+      await put(
+        join(root, 'second/SKILL.md'),
+        '---\nname: second\ndescription: Second\n---\nSecond',
+      )
+      ctx.emit(
+        'fs/observed',
+        { displayPath: join(root, 'second/SKILL.md') } as any,
+        undefined as any,
+        { name: 'write' } as any,
+      )
+      await vi.waitFor(
+        async () => {
+          expect((await registry.list({ cwd })).map((s) => s.name)).toContain(
+            name('second'),
+          )
+        },
+        { timeout: 2000, interval: 50 },
+      )
+      await rm(join(root, 'first'), { recursive: true })
+      ctx.emit(
+        'fs/observed',
+        { displayPath: join(root, 'first/SKILL.md') } as any,
+        undefined as any,
+        { name: 'edit' } as any,
+      )
+      await vi.waitFor(
+        async () => {
+          expect(
+            (await registry.list({ cwd })).map((s) => s.name),
+          ).not.toContain(name('first'))
+        },
+        { timeout: 2000, interval: 50 },
+      )
+      await runtime.dispose()
+      expect((await registry.list({ cwd })).map((s) => s.name)).not.toContain(
+        name('second'),
+      )
+    },
+  )
 
   it('discovers nested project skills with nearer-directory precedence through the official registry', async () => {
     const home = await directory(),

@@ -26,7 +26,6 @@ import { installNativeAdapterBridge } from './native-adapter.js'
 import {
   isGptModel,
   GPT_REASONING_LEVELS,
-  mergeCapabilities,
   resolveCapabilities,
 } from './capabilities.js'
 import {
@@ -56,6 +55,126 @@ type RouteOptions = {
   capabilityCatalogUrl?: string
   overridesJSON: string
 }
+
+/** Validate the free-form JSON before it can reach native model projection. */
+function parseModelOverrides(text: string): Record<string, ModelOverride> {
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    throw new Error('模型覆盖需要是有效的 JSON')
+  }
+  const object = (entry: unknown): entry is Record<string, any> =>
+    entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+  const nonempty = (entry: unknown): entry is string =>
+    typeof entry === 'string' && entry.trim().length > 0
+  if (!object(value)) throw new Error('模型覆盖需要是 JSON 对象')
+  for (const [model, entry] of Object.entries(value)) {
+    if (!object(entry)) throw new Error(`模型 ${model} 的覆盖需要是 JSON 对象`)
+    const invalid = (field: string): never => {
+      throw new Error(`模型 ${model} 的 ${field} 格式无效`)
+    }
+    if ('displayName' in entry && !nonempty(entry.displayName))
+      invalid('displayName')
+    if (
+      'defaultReasoningId' in entry &&
+      typeof entry.defaultReasoningId !== 'string'
+    )
+      invalid('defaultReasoningId')
+    if (
+      'supportsReasoning' in entry &&
+      typeof entry.supportsReasoning !== 'boolean'
+    )
+      invalid('supportsReasoning')
+    if ('contextWindow' in entry && !validContextWindow(entry.contextWindow))
+      throw new Error('上下文窗口必须是正的安全整数')
+    if (
+      'maxOutputTokens' in entry &&
+      !validContextWindow(entry.maxOutputTokens)
+    )
+      invalid('maxOutputTokens')
+    if (
+      'defaultServiceTier' in entry &&
+      !['default', 'fast', 'ultrafast'].includes(entry.defaultServiceTier)
+    )
+      invalid('defaultServiceTier')
+    if (
+      'inputModalities' in entry &&
+      (!Array.isArray(entry.inputModalities) ||
+        entry.inputModalities.some(
+          (v: unknown) => v !== 'text' && v !== 'image',
+        ))
+    )
+      invalid('inputModalities')
+    for (const field of ['reasoningChoices', 'serviceTiers']) {
+      if (!(field in entry)) continue
+      const choices = entry[field]
+      if (
+        !Array.isArray(choices) ||
+        (field === 'serviceTiers' && !choices.length)
+      )
+        invalid(field)
+      const ids = new Set<string>()
+      for (const choice of choices) {
+        if (
+          !object(choice) ||
+          !nonempty(choice.id) ||
+          !nonempty(choice.label) ||
+          ids.has(choice.id)
+        )
+          invalid(field)
+        ids.add(choice.id)
+        if (
+          'source' in choice &&
+          !['user', 'upstream', 'catalog'].includes(choice.source)
+        )
+          invalid(field)
+        if (field === 'serviceTiers') {
+          if (
+            !['default', 'fast', 'ultrafast'].includes(choice.id) ||
+            !['default', 'fast', 'ultrafast', 'priority'].includes(
+              choice.wireValue,
+            )
+          )
+            invalid(field)
+        } else if (
+          !(choice.wireValue === null || nonempty(choice.wireValue)) ||
+          (choice.id === 'off' && choice.wireValue === null)
+        ) {
+          invalid(field)
+        }
+      }
+    }
+  }
+  return value as Record<string, ModelOverride>
+}
+
+function effectiveSpeed(
+  capability: ModelCapabilities | undefined,
+  saved: ServiceTier | undefined,
+): ServiceTier {
+  return saved && capability?.serviceTiers.some((tier) => tier.id === saved)
+    ? saved
+    : (capability?.defaultServiceTier ?? 'default')
+}
+
+function validSpeedCache(value: unknown): value is Record<string, ServiceTier> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.entries(value).every(([key, tier]) => {
+    if (!['default', 'fast', 'ultrafast'].includes(tier)) return false
+    try {
+      const parts: unknown = JSON.parse(key)
+      return (
+        Array.isArray(parts) &&
+        parts.length === 3 &&
+        parts.every((part) => typeof part === 'string')
+      )
+    } catch {
+      return false
+    }
+  })
+}
+
 type SettingsRead = {
   rows: any[]
   descriptor: any
@@ -80,37 +199,90 @@ export const Config: z<
     routes: { get(): PluginConfig['routes'] }
     codexCompatibility: CodexCompatibilityConfig
   }
-> = z.object({
-  routes: z
-    .dict(
-      z.object({
-        enabled: z.boolean().default(false),
-        refreshIntervalMs: z
-          .number()
-          .min(1000)
-          .max(2147483647)
-          .default(1800000),
-        capabilityCatalogUrl: z.string(),
-        overridesJSON: z.string().default('{}'),
-      }),
-    )
-    .default({})
-    .volatile(),
-  codexCompatibility: z
-    .object({
-      enabled: z.boolean().default(true),
-      codexHome: z.string(),
-      importInstructions: z.boolean().default(true),
-      importSkills: z.boolean().default(true),
-      importMcpServers: z.boolean().default(true),
-      importPluginResources: z.boolean().default(true),
-      watch: z.boolean().default(true),
-      pollIntervalMs: z.number().min(250).max(60000).default(2000),
-      mcpIdleTimeoutMs: z.number().min(0).max(2147483647).default(60000),
-      mcpAllowlist: z.array(String).default([]),
-    })
-    .default({}),
-})
+> = z
+  .object({
+    routes: z
+      .dict(
+        z.object({
+          enabled: z.boolean().default(false),
+          refreshIntervalMs: z
+            .number()
+            .min(1000)
+            .max(2147483647)
+            .default(1800000),
+          capabilityCatalogUrl: z.string(),
+          overridesJSON: z.string().default('{}'),
+        }),
+      )
+      .default({})
+      .volatile(),
+    codexCompatibility: z
+      .object({
+        enabled: z.boolean().default(true),
+        codexHome: z.string(),
+        importInstructions: z.boolean().default(true),
+        importSkills: z.boolean().default(true),
+        importMcpServers: z.boolean().default(true),
+        importPluginResources: z.boolean().default(true),
+        watch: z.boolean().default(true),
+        pollIntervalMs: z.number().min(250).max(60000).default(2000),
+        mcpIdleTimeoutMs: z.number().min(0).max(2147483647).default(60000),
+        mcpAllowlist: z.array(String).default([]),
+      })
+      .default({}),
+  })
+  .i18n({
+    en: {
+      routes: {
+        $description: 'GPT adaptation routes',
+        $value: {
+          enabled: 'Enable GPT adaptation',
+          refreshIntervalMs: 'Sync interval (milliseconds)',
+          capabilityCatalogUrl: 'Capability catalog URL',
+          overridesJSON: 'Model capability overrides (JSON)',
+        },
+      },
+      codexCompatibility: {
+        $description: 'Codex compatibility',
+        enabled: 'Enable Codex compatibility',
+        codexHome: 'Codex home directory',
+        importInstructions: 'Import instructions',
+        importSkills: 'Import skills',
+        importMcpServers: 'Import MCP servers',
+        importPluginResources: 'Import enabled plugin resources',
+        watch: 'Watch for configuration and resource changes',
+        pollIntervalMs: 'Configuration poll interval (milliseconds)',
+        mcpIdleTimeoutMs:
+          'MCP idle retention (milliseconds; 0 keeps connections)',
+        mcpAllowlist:
+          'MCP server allowlist (empty imports all enabled servers)',
+      },
+    },
+    zh: {
+      routes: {
+        $description: 'GPT 适配路由',
+        $value: {
+          enabled: '启用 GPT 自动适配',
+          refreshIntervalMs: '同步间隔（毫秒）',
+          capabilityCatalogUrl: '能力目录 URL',
+          overridesJSON: '模型能力覆盖（JSON）',
+        },
+      },
+      codexCompatibility: {
+        $description: 'Codex 兼容',
+        enabled: '启用 Codex 兼容',
+        codexHome: 'Codex 主目录',
+        importInstructions: '导入指令',
+        importSkills: '导入技能',
+        importMcpServers: '导入 MCP 服务器',
+        importPluginResources: '导入已启用插件的资源',
+        watch: '监听配置和资源变化',
+        pollIntervalMs: '配置轮询间隔（毫秒）',
+        mcpIdleTimeoutMs: 'MCP 空闲保留时间（毫秒；0 表示保持连接）',
+        mcpAllowlist: 'MCP 服务器允许名单（空列表导入所有已启用服务器）',
+      },
+    },
+  })
 
 type BaseModelInfo = {
   provider: string
@@ -142,6 +314,10 @@ export class GptModels extends Service {
   modelRevision: ((rows: any[]) => number) | undefined
   readonly typertRemote: ReturnType<typeof bindTypertRemote>
   private readonly runners = new Map<string, ModelSynchronizer>()
+  private readonly runnerStates = new Map<
+    string,
+    { configuration: string; identity: string }
+  >()
   private readonly snapshots = new Map<string, SyncSnapshot>()
   private readonly publications = new Map<string, Promise<void>>()
   private speeds = new Map<string, ServiceTier>()
@@ -188,26 +364,46 @@ export class GptModels extends Service {
       }
     })
     ctx.on('api-session/removed', (sessionId) => {
+      const prefix = JSON.stringify([sessionId]).slice(0, -1) + ','
       for (const key of this.results.keys())
-        if (JSON.parse(key)[0] === sessionId) this.results.delete(key)
+        if (key.startsWith(prefix)) this.results.delete(key)
+      void this.writeSpeeds((next) => {
+        for (const key of next.keys())
+          if (key.startsWith(prefix)) next.delete(key)
+      }).catch((error) =>
+        this.ctx.logger.warn('Session speed cleanup failed', error),
+      )
     })
     ctx.effect(() => async () => {
       this.closed = true
       for (const runner of this.runners.values()) runner.dispose()
       this.nativeRead = undefined
       this.results.clear()
-      await Promise.allSettled(this.publications.values())
+      await Promise.allSettled([
+        ...this.publications.values(),
+        this.speedWrites,
+      ])
     })
   }
 
   async initialize(): Promise<void> {
-    const savedSpeeds =
-      await this.store.read<Record<string, ServiceTier>>('speeds')
-    for (const [key, value] of Object.entries(savedSpeeds ?? {})) {
-      if (value === 'default' || value === 'fast' || value === 'ultrafast')
-        this.speeds.set(key, value)
-    }
+    const loading = this.speedWrites.then(async () => {
+      const savedSpeeds = await this.store.read('speeds', validSpeedCache)
+      if (this.closed) return
+      for (const [key, value] of Object.entries(savedSpeeds ?? {})) {
+        if (value === 'default' || value === 'fast' || value === 'ultrafast')
+          this.speeds.set(key, value)
+      }
+    })
+    this.speedWrites = loading.catch(() => undefined)
+    await loading
     for (const provider of this.enabledProviders()) {
+      const before = this.readSettings()
+      const profile = this.configuredProfiles(before)[provider]
+      if (!profile || !this.routeOptions(provider, profile, before)?.enabled)
+        continue
+      const state = this.routeState(provider, before)
+      const identity = this.routeIdentity(provider, before)
       let initial = await this.store.read<SyncSnapshot>(`route:${provider}`)
       if (initial) {
         try {
@@ -219,13 +415,64 @@ export class GptModels extends Service {
       if (this.closed) return
       // A credential event may have replaced this route while cache I/O waited.
       if (this.runners.has(provider)) continue
+      const current = this.readSettings()
+      const currentProfile = this.configuredProfiles(current)[provider]
+      if (
+        !currentProfile ||
+        !this.routeOptions(provider, currentProfile, current)?.enabled
+      )
+        continue
+      if (
+        this.routeState(provider, current) !== state ||
+        this.routeIdentity(provider, current) !== identity
+      )
+        initial = undefined
       if (initial) {
         this.snapshots.set(provider, structuredClone(initial))
         this.nativeRead = undefined
       }
-      this.startRunner(provider, initial)
+      this.startRunner(provider, initial, current)
     }
     let scheduled = false
+    const reconcile = () => {
+      if (this.closed) return
+      const read = this.readSettings()
+      const profiles = this.configuredProfiles(read)
+      const enabled = new Set(this.enabledProviders(read))
+      const affected = new Set([...this.runners.keys(), ...enabled])
+      for (const [provider, runner] of this.runners)
+        if (!enabled.has(provider)) {
+          runner.dispose()
+          this.runners.delete(provider)
+        }
+      for (const provider of new Set([
+        ...this.runnerStates.keys(),
+        ...this.snapshots.keys(),
+      ]))
+        if (!Object.hasOwn(profiles, provider)) {
+          this.runnerStates.delete(provider)
+          this.snapshots.delete(provider)
+        }
+      for (const provider of enabled) {
+        const previous = this.runnerStates.get(provider)
+        const identity = this.routeIdentity(provider, read)
+        if (previous && previous.identity !== identity) {
+          this.snapshots.delete(provider)
+          this.nativeRead = undefined
+        }
+        if (
+          this.runners.has(provider) &&
+          previous?.configuration !== this.routeState(provider, read)
+        ) {
+          this.runners.get(provider)!.dispose()
+          this.runners.delete(provider)
+        }
+        if (!this.runners.has(provider))
+          this.startRunner(provider, this.snapshots.get(provider), read)
+      }
+      for (const provider of affected)
+        this.ctx.emit('llm/models-updated', provider)
+    }
     this.ctx.on('settings/document-updated', (ns) => {
       if (
         (ns !== 'llm-pi-ai' && ns !== this.settingsNs) ||
@@ -236,20 +483,11 @@ export class GptModels extends Service {
       scheduled = true
       queueMicrotask(() => {
         scheduled = false
-        if (this.closed) return
-        const enabled = new Set(this.enabledProviders())
-        const affected = new Set([...this.runners.keys(), ...enabled])
-        for (const [provider, runner] of this.runners)
-          if (!enabled.has(provider)) {
-            runner.dispose()
-            this.runners.delete(provider)
-          }
-        for (const provider of enabled)
-          if (!this.runners.has(provider)) this.startRunner(provider)
-        for (const provider of affected)
-          this.ctx.emit('llm/models-updated', provider)
+        reconcile()
       })
     })
+    // Settings events emitted during awaited cache work predate this listener.
+    reconcile()
   }
 
   private readSettings(rows = this.nativeDescribe()): SettingsRead {
@@ -293,10 +531,23 @@ export class GptModels extends Service {
     return index.get(modelId)
   }
 
+  private upstreamModel(read: SettingsRead, provider: string, modelId: string) {
+    let index = read.upstream.get(provider)
+    if (!index) {
+      index = new Map(
+        read.snapshots
+          .get(provider)
+          ?.models.map((model) => [model.id, model]) ?? [],
+      )
+      read.upstream.set(provider, index)
+    }
+    return index.get(modelId)
+  }
+
   private modelOverrides(read: SettingsRead, provider: string, profile: any) {
     let overrides = read.overrides.get(provider)
     if (!overrides) {
-      overrides = JSON.parse(
+      overrides = parseModelOverrides(
         this.routeOptions(provider, profile, read)?.overridesJSON ?? '{}',
       )
       read.overrides.set(provider, overrides!)
@@ -323,22 +574,27 @@ export class GptModels extends Service {
     return { enabled: true, refreshIntervalMs: 1800000, overridesJSON: '{}' }
   }
 
-  enabledProviders(): string[] {
-    const profiles = this.configuredProfiles()
+  enabledProviders(read = this.readSettings()): string[] {
+    const profiles = this.configuredProfiles(read)
     return [
-      ...new Set([
-        ...Object.keys(profiles),
-        ...Object.keys(this.options.routes),
-      ]),
+      ...new Set([...Object.keys(profiles), ...Object.keys(read.routes)]),
     ].filter(
       (provider) =>
-        this.routeOptions(provider, profiles[provider])?.enabled &&
+        this.routeOptions(provider, profiles[provider], read)?.enabled &&
         profiles[provider],
     )
   }
 
-  private startRunner(provider: string, initial?: SyncSnapshot): void {
+  private startRunner(
+    provider: string,
+    initial?: SyncSnapshot,
+    read = this.readSettings(),
+  ): void {
     if (this.closed || this.runners.has(provider)) return
+    this.runnerStates.set(provider, {
+      configuration: this.routeState(provider, read),
+      identity: this.routeIdentity(provider, read),
+    })
     const runner = new ModelSynchronizer(
       () => this.routeConfig(provider),
       async (snapshot) => {
@@ -405,9 +661,7 @@ export class GptModels extends Service {
       .find((entry: { provider: string }) => entry.provider === provider)
     const baseUrl = profile.baseURL ?? defaults?.defaultBaseURL
     if (!baseUrl) throw new Error('Set the provider base URL')
-    const overrides: unknown = JSON.parse(options.overridesJSON)
-    if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides))
-      throw new Error('Model overrides must be an object')
+    const overrides = parseModelOverrides(options.overridesJSON)
     return {
       baseUrl,
       apiKey: credential.value,
@@ -417,7 +671,7 @@ export class GptModels extends Service {
       ...(options.capabilityCatalogUrl
         ? { capabilityCatalogUrl: options.capabilityCatalogUrl }
         : {}),
-      overrides: overrides as Record<string, ModelOverride>,
+      overrides,
     }
   }
 
@@ -428,6 +682,20 @@ export class GptModels extends Service {
       profile.baseURL,
       profile.apiKeyEnv,
       this.routeOptions(provider, profile, read),
+    ])
+  }
+
+  private routeIdentity(provider: string, read: SettingsRead): string {
+    const { profile } = this.profile(provider, read)
+    return JSON.stringify([
+      profile.api ?? 'openai-responses',
+      profile.baseURL ??
+        this.ctx.llm
+          .listConfigurableProviders()
+          .find((entry: { provider: string }) => entry.provider === provider)
+          ?.defaultBaseURL,
+      this.apiKeyRef(provider, profile),
+      this.routeOptions(provider, profile, read)?.capabilityCatalogUrl ?? '',
     ])
   }
 
@@ -559,6 +827,8 @@ export class GptModels extends Service {
       capabilities,
       contextWindows,
       contextRevision: this.modelsRevision(read),
+      optionsRevision: read.rows.find((row) => row.ns === this.settingsNs)
+        ?.revision as number | undefined,
       options: options ?? {
         enabled: false,
         refreshIntervalMs: 1800000,
@@ -607,6 +877,7 @@ export class GptModels extends Service {
     refreshIntervalMs: number,
     capabilityCatalogUrl: string,
     overridesJSON: string,
+    expectedRevision?: number,
   ): Promise<void> {
     const read = this.readSettings()
     const { profile } = this.profile(provider, read)
@@ -617,22 +888,16 @@ export class GptModels extends Service {
     )
       throw new Error('同步间隔必须在 1 秒到 2147483647 毫秒之间')
     if (capabilityCatalogUrl) {
-      const url = new URL(capabilityCatalogUrl)
+      let url: URL
+      try {
+        url = new URL(capabilityCatalogUrl)
+      } catch {
+        throw new Error('能力目录地址需要使用 HTTP 或 HTTPS')
+      }
       if (!['http:', 'https:'].includes(url.protocol))
         throw new Error('能力目录地址需要使用 HTTP 或 HTTPS')
     }
-    const overrides: unknown = JSON.parse(overridesJSON)
-    if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides))
-      throw new Error('模型覆盖需要是 JSON 对象')
-    for (const entry of Object.values(overrides)) {
-      if (
-        entry &&
-        typeof entry === 'object' &&
-        'contextWindow' in entry &&
-        !validContextWindow(entry.contextWindow)
-      )
-        throw new Error('上下文窗口必须是正的安全整数')
-    }
+    parseModelOverrides(overridesJSON)
     const descriptor = read.rows.find((entry) => entry.ns === this.settingsNs)
     if (!descriptor) throw new Error('GPT plugin settings unavailable')
     await this.ctx.settings.mutate(
@@ -651,7 +916,7 @@ export class GptModels extends Service {
           },
         },
       ],
-      descriptor.revision,
+      expectedRevision ?? descriptor.revision,
     )
   }
 
@@ -697,8 +962,9 @@ export class GptModels extends Service {
     if (snapshot?.configKey !== syncConfigKey(config))
       throw new Error('configuration changed during cleanup; refresh first')
     const { profile } = this.profile(provider, read)
+    const staleIdSet = new Set(staleIds)
     const nextModels = profile.models?.filter(
-      (model) => !staleIds.includes(model.id),
+      (model) => !staleIdSet.has(model.id),
     )
     if (nextModels) {
       const models = nextModels.map((model) =>
@@ -790,14 +1056,7 @@ export class GptModels extends Service {
       ? this.modelIndex(read, profile).get(modelId)
       : profile.modelOverrides?.[modelId]
     const snapshot = read.snapshots.get(provider)
-    let upstream = read.upstream.get(provider)
-    if (!upstream) {
-      upstream = new Map(
-        snapshot?.models.map((model) => [model.id, model]) ?? [],
-      )
-      read.upstream.set(provider, upstream)
-    }
-    const raw = upstream.get(modelId)
+    const raw = this.upstreamModel(read, provider, modelId)
     const userProfile =
       profileOverride ?? (descriptor.user as any)?.providers?.[provider]
     // Drafts replace the user layer; absent fields fall back to the inherited
@@ -902,14 +1161,12 @@ export class GptModels extends Service {
     for (const provider of new Set(edits.map((edit) => edit.provider))) {
       const text = this.options.routes[provider]?.overridesJSON
       if (!text) continue
-      const overrides = JSON.parse(text)
+      const overrides = parseModelOverrides(text)
       let changed = false
       for (const edit of edits.filter((entry) => entry.provider === provider)) {
-        if (
-          overrides[edit.modelId] &&
-          Object.hasOwn(overrides[edit.modelId], 'contextWindow')
-        ) {
-          delete overrides[edit.modelId].contextWindow
+        const override = overrides[edit.modelId]
+        if (override && Object.hasOwn(override, 'contextWindow')) {
+          delete override.contextWindow
           changed = true
         }
       }
@@ -961,24 +1218,34 @@ export class GptModels extends Service {
     if (!capability?.serviceTiers.some((choice) => choice.id === tier))
       throw new Error('This speed is unavailable for the selected model')
     const key = JSON.stringify([sessionId, provider, modelId])
+    await this.writeSpeeds((next) => next.set(key, tier))
+  }
+
+  private writeSpeeds(
+    change: (next: Map<string, ServiceTier>) => void,
+  ): Promise<void> {
     const write = this.speedWrites.then(async () => {
       const next = new Map(this.speeds)
-      next.set(key, tier)
+      change(next)
+      if (
+        next.size === this.speeds.size &&
+        [...next].every(([key, value]) => this.speeds.get(key) === value)
+      )
+        return
       await this.store.write('speeds', Object.fromEntries(next))
       this.speeds = next
     })
     this.speedWrites = write.catch(() => undefined)
-    await write
+    return write
   }
 
   @Remote({ resources: { session: (sessionId: SessionId) => sessionId } })
   speed(sessionId: SessionId, provider: string, modelId: string) {
     return {
-      selected:
-        this.speeds.get(JSON.stringify([sessionId, provider, modelId])) ??
-        this.snapshots.get(provider)?.capabilities[modelId]
-          ?.defaultServiceTier ??
-        'default',
+      selected: effectiveSpeed(
+        this.capability(provider, modelId),
+        this.speeds.get(JSON.stringify([sessionId, provider, modelId])),
+      ),
       last:
         this.results.get(JSON.stringify([sessionId, provider, modelId])) ??
         null,
@@ -1011,14 +1278,30 @@ export class GptModels extends Service {
         : {}),
       ...overrides[modelId],
     }
-    const current = read.snapshots.get(provider)?.capabilities[modelId]
-    const result = current
-      ? mergeCapabilities(current, override, current.capabilityRevision)
-      : resolveCapabilities(
-          { id: modelId, ...(displayName ? { displayName } : {}) },
-          'gpt-preset',
-          override,
-        )
+    const snapshot = read.snapshots.get(provider)
+    const raw = this.upstreamModel(read, provider, modelId)
+    const catalog = snapshot?.catalog?.models[modelId]
+    // Cached capabilities already contain old local overrides. Rebuild from
+    // raw metadata so removing an override takes effect without a network refresh.
+    const result = resolveCapabilities(
+      {
+        ...(raw ?? { id: modelId, ...(displayName ? { displayName } : {}) }),
+        capabilities: {
+          ...catalog,
+          ...(catalog?.reasoningChoices
+            ? {
+                reasoningChoices: catalog.reasoningChoices.map((choice) => ({
+                  ...choice,
+                  source: 'catalog' as const,
+                })),
+              }
+            : {}),
+          ...raw?.capabilities,
+        },
+      },
+      snapshot?.capabilities[modelId]?.capabilityRevision ?? 'gpt-preset',
+      override,
+    )
     return {
       ...result,
       contextWindow: this.contextWindow(
@@ -1106,7 +1389,7 @@ export class GptModels extends Service {
             : options.reasoningEffort
               ? { reasoningId: options.reasoningEffort }
               : {}),
-          ...(speeds.has(key) ? { serviceTier: speeds.get(key)! } : {}),
+          serviceTier: effectiveSpeed(capabilities, speeds.get(key)),
         })
         const result: { requested: string; actual?: string } = {
           requested: String(payload.service_tier ?? 'default'),

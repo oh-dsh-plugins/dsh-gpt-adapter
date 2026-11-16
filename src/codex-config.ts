@@ -72,8 +72,9 @@ export type CodexResourceObservation = CodexResourceReader & { clear(): void }
 export class CodexResourceCache implements CodexResourceReader {
   private readonly entries = new Map<
     string,
-    { stamp: string; value: Promise<unknown> }
+    { stamp: string; value: Promise<unknown>; observed: number }
   >()
+  private observation = 0
   private closed = false
 
   private assertOpen(): void {
@@ -82,6 +83,9 @@ export class CodexResourceCache implements CodexResourceReader {
 
   /** One observation validates each public resource once, across all consumers. */
   observe(): CodexResourceObservation {
+    const previous = this.observation++
+    for (const [key, entry] of this.entries)
+      if (entry.observed < previous) this.entries.delete(key)
     const reads = new Map<string, Promise<unknown>>()
     return {
       read: async <T>(path: string, kind: string, load: () => Promise<T>) => {
@@ -127,13 +131,13 @@ export class CodexResourceCache implements CodexResourceReader {
     const stamp = `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
     let entry = this.entries.get(key)
     if (entry?.stamp === stamp) {
-      this.entries.delete(key)
-      this.entries.set(key, entry)
+      entry.observed = this.observation
     } else {
-      entry = { stamp, value: load() }
-      this.entries.set(key, entry)
-      if (this.entries.size > 256)
-        this.entries.delete(this.entries.keys().next().value!)
+      entry = { stamp, value: load(), observed: this.observation }
+      // Keep a stable bounded working set instead of evicting it during every
+      // oversized scan. A later observation reclaims resources no longer read.
+      if (this.entries.has(key) || this.entries.size < 256)
+        this.entries.set(key, entry)
     }
     try {
       const value = (await entry.value) as T
@@ -276,17 +280,27 @@ export function normalizeCodexMcp(
 ): CodexMcpConfig | undefined {
   const raw = object(value)
   if (raw.enabled === false) return undefined
-  const headers = record(raw.http_headers ?? raw.headers)
+  const headers: Record<string, string> = {}
+  const setHeader = (name: string, value: string) => {
+    for (const previous of Object.keys(headers))
+      if (previous.toLowerCase() === name.toLowerCase())
+        delete headers[previous]
+    headers[name] = value
+  }
+  for (const [header, value] of Object.entries(
+    record(raw.http_headers ?? raw.headers),
+  ))
+    setHeader(header, value)
   for (const [header, variable] of Object.entries(
     record(raw.env_http_headers),
   )) {
     if (!environment[variable]) throw new Error('missing-environment')
-    headers[header] = environment[variable]!
+    setHeader(header, environment[variable]!)
   }
   if (typeof raw.bearer_token_env_var === 'string') {
     const token = environment[raw.bearer_token_env_var]
     if (!token) throw new Error('missing-environment')
-    headers.Authorization = `Bearer ${token}`
+    setHeader('Authorization', `Bearer ${token}`)
   }
   if (raw.type && !['stdio', 'http', 'streamable-http'].includes(raw.type))
     throw new Error('unsupported-transport')
@@ -495,6 +509,18 @@ export async function discoverCodexSnapshot(
     items: [],
   }
   const names = new Set<string>()
+  const retainServer = (entry: CodexMcpConfig, policy: JsonObject) => {
+    if (
+      names.has(entry.serverName) ||
+      (options.mcpAllowlist.length &&
+        !options.mcpAllowlist.includes(entry.originalName ?? ''))
+    )
+      return
+    const retained = restrictMcpFallback(entry, policy)
+    if (!retained) return
+    names.add(retained.serverName)
+    result.mcp.push(retained)
+  }
   const addServers = (
     servers: JsonObject,
     source: string,
@@ -533,10 +559,12 @@ export async function discoverCodexSnapshot(
         result.mcp.push({ ...value, originalName: name })
       } catch (error: any) {
         const previous = context.previous?.mcp.find(
-          (entry) => entry.serverName === serverName(publicName),
+          (entry) =>
+            entry.serverName === serverName(publicName) &&
+            entry.source === source &&
+            entry.originalName === name,
         )
-        const retained = previous && restrictMcpFallback(previous, raw)
-        if (retained) result.mcp.push(retained)
+        if (previous) retainServer(previous, raw)
         const reason = [
           'missing-environment',
           'unsupported-transport',
@@ -631,11 +659,7 @@ export async function discoverCodexSnapshot(
         for (const entry of context.previous?.mcp ?? []) {
           if (entry.source !== `plugin:${id}`) continue
           if (!entry.originalName && Object.keys(policies).length) continue
-          const retained = restrictMcpFallback(
-            entry,
-            object(policies[entry.originalName ?? '']),
-          )
-          if (retained) result.mcp.push(retained)
+          retainServer(entry, object(policies[entry.originalName ?? '']))
         }
         result.skillRoots.push(
           ...(context.previous?.skillRoots.filter(
@@ -685,15 +709,28 @@ export async function skillEnabledWithFs(
   plugin: string | undefined,
   fs: ProjectFileSystem,
   signal?: AbortSignal,
+  targets = new Map<string, Promise<unknown>>(),
 ): Promise<boolean> {
-  const targets = new Map<string, unknown>()
-  const targetKey = async (path: string) => {
+  signal?.throwIfAborted()
+  const targetKey = (path: string) => {
+    signal?.throwIfAborted()
     if (!targets.has(path)) {
-      const target = await fs.resolve(path, signal ? { signal } : {})
-      targets.set(
-        path,
-        target?.targetKey ?? target?.displayPath ?? resolve(path),
-      )
+      const pending = (async () => {
+        let target
+        try {
+          target = await fs.resolve(path, signal ? { signal } : {})
+        } catch {
+          // Retry one transient lookup inside this read; unknown policy cannot allow a skill.
+          signal?.throwIfAborted()
+          target = await fs.resolve(path, signal ? { signal } : {})
+        }
+        signal?.throwIfAborted()
+        return target?.targetKey ?? target?.displayPath ?? resolve(path)
+      })()
+      targets.set(path, pending)
+      void pending.catch(() => {
+        if (targets.get(path) === pending) targets.delete(path)
+      })
     }
     return targets.get(path)
   }
@@ -703,12 +740,8 @@ export async function skillEnabledWithFs(
     : []) {
     let pathMatch = false
     if (typeof selector.path === 'string' && skill.path) {
-      try {
-        pathMatch =
-          (await targetKey(selector.path)) === (await targetKey(skill.path))
-      } catch {
-        pathMatch = false
-      }
+      pathMatch =
+        (await targetKey(selector.path)) === (await targetKey(skill.path))
     }
     if (
       pathMatch ||
