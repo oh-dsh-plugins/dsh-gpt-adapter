@@ -27,6 +27,7 @@ async function fixture(
     overrides?: Record<string, ModelOverride>
     rotateWhileResolving?: boolean
   },
+  savedSpeeds?: Record<string, string>,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-context-test-'))
   cleanup.push(() => rm(directory, { recursive: true, force: true }))
@@ -131,7 +132,9 @@ async function fixture(
         raw = next
       } else {
         options = next
-        liveOptions.routes = Config(options).routes
+        const updated = Config(options)
+        liveOptions.routes = updated.routes
+        liveOptions.manualUltrafast = updated.manualUltrafast
       }
       revisions[ns]!++
       ctx.emit('settings/document-updated', ns as any, revisions[ns]!)
@@ -278,6 +281,11 @@ async function fixture(
       )
     }),
   )
+  if (savedSpeeds)
+    await new JsonStorage(join(directory, 'storages/gpt-adapter')).write(
+      'speeds',
+      savedSpeeds,
+    )
   await plugin.apply(ctx, liveOptions)
   const service = ctx.get('gptModels') as GptModels
   await service.refresh('fixture').catch((error) => {
@@ -1113,22 +1121,20 @@ describe('context settings and live model integration', () => {
     ).toBe('priority')
   })
 
-  it('persists manual Ultrafast only for GPT-6.2 Sol with unknown upstream support', async () => {
+  it('keeps manual Ultrafast independent of model and metadata while preserving advertised selections', async () => {
     const f = await fixture()
-    const modelId = 'gpt-6.2-sol'
+    const modelId = 'gpt-6.2-astra'
+    const otherManual = 'gateway-model-v2'
+    const advertised = 'gpt-6.1-sol'
     const session = 'ultrafast-session' as Parameters<GptModels['setSpeed']>[0]
     const model = { id: modelId }
     const status = () => f.service.status('fixture')
     const tiers = (id = modelId) =>
       f.service.modelStatus('fixture', id).serviceTiers.map((tier) => tier.id)
     const speed = () => f.service.speed(session, 'fixture', modelId).selected
-    const requestedTier = () =>
+    const requestedTier = (id = modelId) =>
       f.service
-        .capture('fixture', modelId, {
-          provider: 'fixture',
-          id: modelId,
-          name: 'GPT-6.2 Sol',
-        })!
+        .capture('fixture', id, { provider: 'fixture', id, name: id })!
         .prepare({ sessionId: session }).payload.service_tier
     const toggle = (enabled: boolean) =>
       f.service.setUltrafastFallback(
@@ -1137,20 +1143,42 @@ describe('context settings and live model integration', () => {
         status().optionsRevision,
       )
     const selectUltrafast = () =>
-      f.service.setSpeed(session, 'fixture', modelId, 'ultrafast')
-    f.models([{ id: 'gpt-5.4' }, model])
+      f.service.setSpeed(session, 'fixture', modelId, 'manual-ultrafast')
+    const advertisedModel = { id: advertised, supports_ultrafast: true }
+    await f.settings.mutate('llm-pi-ai', [
+      {
+        op: 'set',
+        path: ['providers', 'fixture', 'models'],
+        value: [model, { id: otherManual }, advertisedModel],
+      },
+    ])
+    f.models([model, { id: otherManual }, advertisedModel])
     await f.service.refresh('fixture')
     expect(status().canConfigureUltrafastFallback).toBe(true)
     expect(tiers()).toEqual(['default', 'fast'])
     await expect(selectUltrafast()).rejects.toThrow('This speed is unavailable')
 
     await toggle(true)
-    expect(f.options().routes.fixture.allowUnadvertisedUltrafast).toBe(true)
-    expect(tiers()).toEqual(['default', 'fast', 'ultrafast'])
-    expect(tiers('gpt-5.4')).toEqual(['default', 'fast'])
+    expect(f.options().manualUltrafast.fixture).toBe(true)
+    expect(status().options.allowUnadvertisedUltrafast).toBe(true)
+    expect(f.options().routes.fixture).not.toHaveProperty(
+      'allowUnadvertisedUltrafast',
+    )
+    expect(tiers()).toEqual(['default', 'fast', 'manual-ultrafast'])
+    expect(tiers(otherManual)).toEqual(['default', 'manual-ultrafast'])
+    expect(requestedTier(otherManual)).toBeUndefined()
+    await f.service.setSpeed(
+      session,
+      'fixture',
+      otherManual,
+      'manual-ultrafast',
+    )
+    expect(requestedTier(otherManual)).toBe('ultrafast')
+    await f.service.setSpeed(session, 'fixture', advertised, 'ultrafast')
+    expect(requestedTier(advertised)).toBe('ultrafast')
     expect(speed()).toBe('default')
     await selectUltrafast()
-    expect(speed()).toBe('ultrafast')
+    expect(speed()).toBe('manual-ultrafast')
     expect(requestedTier()).toBe('ultrafast')
     const fastSession = 'fast-session' as typeof session
     await f.service.setSpeed(fastSession, 'fixture', modelId, 'fast')
@@ -1160,10 +1188,14 @@ describe('context settings and live model integration', () => {
       'This speed is unavailable',
     )
     await Promise.all([disable, racedSelection])
-    expect(tiers()).not.toContain('ultrafast')
+    expect(tiers()).not.toContain('manual-ultrafast')
+    expect(tiers(otherManual)).toEqual([])
+    expect(requestedTier(advertised)).toBe('ultrafast')
     expect(speed()).toBe('default')
     await toggle(true)
-    expect(tiers()).toContain('ultrafast')
+    expect(tiers()).toContain('manual-ultrafast')
+    expect(requestedTier(otherManual)).toBeUndefined()
+    expect(requestedTier(advertised)).toBe('ultrafast')
     expect(speed()).toBe('default')
     expect(requestedTier()).toBe('default')
     expect(f.service.speed(fastSession, 'fixture', modelId).selected).toBe(
@@ -1176,14 +1208,17 @@ describe('context settings and live model integration', () => {
         service_tiers: ['default', 'priority', 'ultrafast'],
         supports_ultrafast: false,
       },
+      advertisedModel,
     ])
     await f.service.refresh('fixture')
-    expect(status().canConfigureUltrafastFallback).toBe(false)
-    expect(tiers()).not.toContain('ultrafast')
-    expect(speed()).toBe('default')
-    await expect(toggle(true)).rejects.toThrow(
-      'Ultrafast fallback is unavailable',
-    )
+    expect(status().canConfigureUltrafastFallback).toBe(true)
+    expect(tiers()).toContain('manual-ultrafast')
+    expect(requestedTier()).toBe('default')
+    await selectUltrafast()
+    expect(requestedTier()).toBe('ultrafast')
+
+    await toggle(false)
+    expect(tiers()).not.toContain('manual-ultrafast')
     await expect(selectUltrafast()).rejects.toThrow('This speed is unavailable')
     expect(requestedTier()).toBe('default')
 
@@ -1206,6 +1241,216 @@ describe('context settings and live model integration', () => {
     expect(requestedTier()).toBe('default')
   })
 
+  it('keeps existing default and saved wire mappings until Ultrafast is explicitly selected', async () => {
+    const f = await fixture()
+    const provider = 'fixture'
+    const id = 'gpt-5.4'
+    const base = { provider, id, name: id }
+    const session = 'legacy-tier' as Parameters<GptModels['setSpeed']>[0]
+    const status = () => f.service.status(provider)
+    const toggle = (enabled: boolean) =>
+      f.service.setUltrafastFallback(
+        provider,
+        enabled,
+        status().optionsRevision,
+      )
+    const tier = (sessionId?: string) =>
+      f.service
+        .capture(provider, id, base)!
+        .prepare(sessionId ? { sessionId } : {}).payload.service_tier
+    await f.service.updateOptions(
+      provider,
+      1800000,
+      '',
+      JSON.stringify({
+        [id]: {
+          defaultServiceTier: 'ultrafast',
+          serviceTiers: [
+            {
+              id: 'ultrafast',
+              label: 'Legacy priority',
+              wireValue: 'priority',
+            },
+          ],
+        },
+      }),
+      status().optionsRevision,
+    )
+    expect(tier()).toBe('priority')
+    await f.service.setSpeed(session, provider, id, 'ultrafast')
+    expect(tier(session)).toBe('priority')
+
+    await toggle(true)
+    expect(tier()).toBe('priority')
+    expect(tier(session)).toBe('priority')
+    expect(f.service.modelStatus(provider, id).serviceTiers).toEqual([
+      expect.objectContaining({
+        id: 'ultrafast',
+        label: 'Legacy priority',
+        wireValue: 'priority',
+      }),
+      expect.objectContaining({
+        id: 'manual-ultrafast',
+        label: 'Ultrafast (manual)',
+        wireValue: 'ultrafast',
+      }),
+    ])
+    const manual = 'explicit-manual' as typeof session
+    await f.service.setSpeed(manual, provider, id, 'manual-ultrafast')
+    expect(tier(manual)).toBe('ultrafast')
+    await f.service.updateOptions(
+      provider,
+      1800000,
+      '',
+      '{}',
+      status().optionsRevision,
+    )
+    expect(tier(session)).toBe('default')
+    expect(tier(manual)).toBe('ultrafast')
+    expect(f.service.speed(session, provider, id).selected).toBe('default')
+    await toggle(false)
+    expect(tier(manual)).toBe('default')
+    await toggle(true)
+    expect(tier(manual)).toBe('default')
+  })
+
+  it('restores stored manual selections without treating legacy automatic ones as manual', async () => {
+    const provider = 'fixture'
+    const id = 'gpt-5.4'
+    const manual = 'saved-manual' as Parameters<GptModels['speed']>[0]
+    const legacy = 'saved-automatic' as typeof manual
+    const key = (session: string) => JSON.stringify([session, provider, id])
+    const f = await fixture(undefined, false, false, undefined, {
+      [key(manual)]: 'manual-ultrafast',
+      [key(legacy)]: 'ultrafast',
+    })
+    const tier = (sessionId: string) =>
+      f.service
+        .capture(provider, id, { provider, id, name: id })!
+        .prepare({ sessionId }).payload.service_tier
+    expect(tier(manual)).toBe('default')
+    await f.settings.mutate('gpt-adapter', [
+      { op: 'set', path: ['manualUltrafast', provider], value: true },
+    ])
+    expect(f.service.speed(manual, provider, id).selected).toBe(
+      'manual-ultrafast',
+    )
+    expect(tier(manual)).toBe('ultrafast')
+    expect(f.service.speed(legacy, provider, id).selected).toBe('default')
+    expect(tier(legacy)).toBe('default')
+  })
+
+  it('does not turn inferred GPT adaptation into an explicit route when toggling Ultrafast', async () => {
+    const f = await fixture()
+    const provider = 'other'
+    const status = () => f.service.status(provider)
+    const models = (id: string) =>
+      f.settings.mutate('llm-pi-ai', [
+        {
+          op: 'set',
+          path: ['providers', provider, 'models'],
+          value: [{ id }],
+        },
+      ])
+    const toggle = (enabled: boolean) =>
+      f.service.setUltrafastFallback(
+        provider,
+        enabled,
+        status().optionsRevision,
+      )
+
+    await models('gateway-model-v2')
+    expect(status().enabled).toBe(false)
+    await toggle(true)
+    expect(status().options.allowUnadvertisedUltrafast).toBe(true)
+    expect(status().enabled).toBe(false)
+    expect(f.options().routes).not.toHaveProperty(provider)
+
+    await models('gpt-5.4')
+    expect(status().enabled).toBe(true)
+    await toggle(false)
+    expect(status().options.allowUnadvertisedUltrafast).toBe(false)
+    expect(status().enabled).toBe(true)
+    expect(f.options().routes).not.toHaveProperty(provider)
+    await models('gateway-model-v2')
+    expect(status().enabled).toBe(false)
+  })
+
+  it('does not revive manual tier results after the provider switch is re-enabled', async () => {
+    const f = await fixture()
+    const provider = 'other'
+    const id = 'gateway-model-v2'
+    const sessionId = 'manual-results' as Parameters<GptModels['speed']>[0]
+    const model = { provider, id, name: id }
+    const toggle = (enabled: boolean) =>
+      f.service.setUltrafastFallback(
+        provider,
+        enabled,
+        f.service.status(provider).optionsRevision,
+      )
+    await f.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', provider, 'models'], value: [{ id }] },
+    ])
+    await toggle(true)
+    await f.service.setSpeed(sessionId, provider, id, 'manual-ultrafast')
+    const manual = f.service
+      .capture(provider, id, model)!
+      .prepare({ sessionId })
+    const delayed = f.service.capture(provider, id, model)!
+    manual.observe({ service_tier: 'ultrafast' })
+    expect(f.service.speed(sessionId, provider, id).last).toEqual({
+      requested: 'ultrafast',
+      actual: 'ultrafast',
+    })
+
+    const auto = f.service
+      .capture('fixture', 'gpt-5.4', {
+        provider: 'fixture',
+        id: 'gpt-5.4',
+        name: 'GPT',
+      })!
+      .prepare({ sessionId })
+    auto.observe({ service_tier: 'default' })
+
+    await toggle(false)
+    expect(f.service.capture(provider, id, model)).toBeUndefined()
+    manual.observe({ service_tier: 'ultrafast' })
+    await toggle(true)
+    expect(f.service.speed(sessionId, provider, id)).toEqual({
+      selected: 'default',
+      last: null,
+    })
+    const delayedRequest = delayed.prepare({ sessionId })
+    expect(delayedRequest.payload).not.toHaveProperty('service_tier')
+    delayedRequest.observe({ service_tier: 'ultrafast' })
+    expect(f.service.speed(sessionId, provider, id).last).toBeNull()
+    expect(f.service.speed(sessionId, 'fixture', 'gpt-5.4').last).toEqual({
+      requested: 'default',
+      actual: 'default',
+    })
+  })
+
+  it('reads a legacy route switch until separately overridden', async () => {
+    const f = await fixture()
+    await f.settings.mutate('gpt-adapter', [
+      {
+        op: 'set',
+        path: ['routes', 'fixture', 'allowUnadvertisedUltrafast'],
+        value: true,
+      },
+    ])
+    const status = () => f.service.status('fixture')
+    expect(status().options.allowUnadvertisedUltrafast).toBe(true)
+    await f.service.setUltrafastFallback(
+      'fixture',
+      false,
+      status().optionsRevision,
+    )
+    expect(f.options().routes.fixture.allowUnadvertisedUltrafast).toBe(true)
+    expect(status().options.allowUnadvertisedUltrafast).toBe(false)
+    expect(status().enabled).toBe(true)
+  })
+
   it('offers manual Ultrafast when the only positive advertisement is stale', async () => {
     const f = await fixture()
     const id = 'gpt-6.2-sol'
@@ -1214,7 +1459,7 @@ describe('context settings and live model integration', () => {
       f.service.modelStatus('fixture', id).serviceTiers.map((tier) => tier.id)
     f.models([{ id, service_tiers: [{ id: 'priority' }, { id: 'ultrafast' }] }])
     await f.service.refresh('fixture')
-    expect(status().canConfigureUltrafastFallback).toBe(false)
+    expect(status().canConfigureUltrafastFallback).toBe(true)
     expect(tiers()).toContain('ultrafast')
 
     f.models([{ id: 'gpt-5.4' }])
@@ -1226,7 +1471,35 @@ describe('context settings and live model integration', () => {
       true,
       status().optionsRevision,
     )
-    expect(tiers()).toContain('ultrafast')
+    expect(tiers()).toContain('manual-ultrafast')
+  })
+
+  it('allows manual Ultrafast when the omitted API inherits Responses from the catalog', async () => {
+    const f = await fixture()
+    const provider = 'openai'
+    const id = 'gateway-model-v2'
+    const sessionId = 'implicit-responses' as Parameters<
+      GptModels['setSpeed']
+    >[0]
+    await f.settings.mutate('llm-pi-ai', [
+      {
+        op: 'set',
+        path: ['providers', provider],
+        value: {
+          baseURL: 'https://fixture.invalid/v1',
+          apiKeyEnv: 'TEST_KEY',
+          models: [{ id }],
+        },
+      },
+    ])
+    const status = f.service.status(provider)
+    expect(status.canConfigureUltrafastFallback).toBe(true)
+    await f.service.setUltrafastFallback(provider, true, status.optionsRevision)
+    await f.service.setSpeed(sessionId, provider, id, 'manual-ultrafast')
+    const capture = f.service.capture(provider, id, { provider, id, name: id })
+    expect(capture!.prepare({ sessionId }).payload).toEqual({
+      service_tier: 'ultrafast',
+    })
   })
 
   it('does not offer the Ultrafast fallback for Chat Completions', async () => {

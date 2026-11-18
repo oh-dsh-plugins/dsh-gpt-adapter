@@ -233,6 +233,7 @@ const modelMetadata = {
 async function providerFixture(
   control: {
     initialIntervalMs?: number
+    initialAdaptationEnabled?: boolean
     canConfigureUltrafastFallback?: boolean
     read?(count: number, response: any): Promise<any> | any
     written?(): Promise<void>
@@ -242,7 +243,7 @@ async function providerFixture(
   const listeners = new Set<() => void>()
   let revision = 1
   let options = {
-    enabled: true,
+    enabled: control.initialAdaptationEnabled ?? true,
     refreshIntervalMs: control.initialIntervalMs ?? 1800000,
     overridesJSON: '{}',
     allowUnadvertisedUltrafast: false,
@@ -298,7 +299,7 @@ async function providerFixture(
           const response = {
             ok: true,
             value: {
-              enabled: true,
+              enabled: options.enabled,
               status: { state: 'ready' },
               models: [],
               options: { ...options },
@@ -381,26 +382,45 @@ describe('built client contributions', () => {
       container.querySelector<HTMLButtonElement>(
         `[role="switch"][aria-label="${label}"]`,
       )
-    const zhLabel = '允许手动选择 GPT-6.2 Sol 的 Ultrafast'
+    const zhLabel = '允许手动选择 Ultrafast'
     const unavailable = await providerFixture()
     expect(find(unavailable.container, zhLabel)).toBeNull()
-    const f = await providerFixture({ canConfigureUltrafastFallback: true })
+    const f = await providerFixture({
+      canConfigureUltrafastFallback: true,
+      initialAdaptationEnabled: false,
+    })
+    expect(
+      find(f.container, 'GPT 自动适配')?.getAttribute('aria-checked'),
+    ).toBe('false')
     expect(find(f.container, zhLabel)?.getAttribute('aria-checked')).toBe(
       'false',
     )
-    expect(f.container.textContent).toContain(
-      '能否正常使用取决于上游及当前账号是否支持。',
-    )
+    for (const text of [
+      '上游模型元数据决定是否自动提供 Ultrafast。',
+      '此 Responses 提供商开关独立于模型和订阅套餐；开启仅允许手动选择，不会改变当前速度或授予权限。',
+      '选择 Ultrafast（手动）后发送 service_tier: "ultrafast"，是否接受取决于上游及当前账号。',
+    ]) {
+      expect(f.container.textContent).toContain(text)
+    }
     await act(async () => f.locale.setLocale('en'))
-    expect(f.container.textContent).toContain(
-      'It works only if your upstream and account support it.',
-    )
-    const toggle = find(f.container, 'Allow manual Ultrafast for GPT-6.2 Sol')!
+    for (const text of [
+      'Upstream model metadata controls automatic Ultrafast availability.',
+      'This Responses provider switch is independent of model and subscription; turning it on only permits manual selection and does not change the current speed or grant access.',
+      'Selecting Ultrafast (manual) sends service_tier: "ultrafast". Whether it is accepted depends on your upstream and account.',
+    ]) {
+      expect(f.container.textContent).toContain(text)
+    }
+    const toggle = find(f.container, 'Allow manual Ultrafast')!
     await act(async () => toggle.click())
     expect(f.writes).toEqual([
       { provider: 'fixture', enabled: true, expectedRevision: 1 },
     ])
     expect(toggle.getAttribute('aria-checked')).toBe('true')
+    expect(
+      find(f.container, 'Automatic GPT adaptation')?.getAttribute(
+        'aria-checked',
+      ),
+    ).toBe('false')
   })
 
   it('preserves a dirty sync draft and rebases its revision after toggling Ultrafast', async () => {
@@ -420,7 +440,7 @@ describe('built client contributions', () => {
     await act(async () =>
       f.container
         .querySelector<HTMLButtonElement>(
-          '[role="switch"][aria-label="Allow manual Ultrafast for GPT-6.2 Sol"]',
+          '[role="switch"][aria-label="Allow manual Ultrafast"]',
         )!
         .click(),
     )
@@ -473,7 +493,7 @@ describe('built client contributions', () => {
       await act(async () =>
         f.container
           .querySelector<HTMLButtonElement>(
-            '[role="switch"][aria-label="Allow manual Ultrafast for GPT-6.2 Sol"]',
+            '[role="switch"][aria-label="Allow manual Ultrafast"]',
           )!
           .click(),
       )
@@ -973,6 +993,11 @@ describe('built client contributions', () => {
         .click()
     })
     expect(reads).toBe(1)
+    const trigger = f.container.querySelector<HTMLButtonElement>(
+      '[aria-haspopup=menu]',
+    )!
+    expect(trigger.disabled).toBe(false)
+    expect(trigger.getAttribute('aria-label')).toBe('GPT 速度：Fast')
     await act(async () => {
       finish({ ok: true, value: { selected: 'default', last: null } })
     })
@@ -1300,13 +1325,20 @@ describe('built client contributions', () => {
     const components = new Map<string, React.ComponentType<any>>()
     let selected = 'default'
     const calls: string[] = []
-    const modelId = 'gpt-6.2-sol'
+    const speedWrites: Array<Record<string, unknown>> = []
+    const modelId = 'gpt-6.2-astra'
     const capability = resolveCapabilities({ id: modelId }, 'fixture')
     const serviceTiers = [
       ...capability.serviceTiers,
       {
         id: 'ultrafast',
-        label: 'Ultrafast',
+        label: 'Legacy priority label',
+        wireValue: 'priority',
+        source: 'user',
+      },
+      {
+        id: 'manual-ultrafast',
+        label: 'Ultrafast (manual)',
         wireValue: 'ultrafast',
         source: 'user',
       },
@@ -1338,6 +1370,7 @@ describe('built client contributions', () => {
           ) => {
             calls.push(endpoint)
             if (endpoint === 'gptModels/setSpeed') {
+              speedWrites.push(payload.args)
               selected = String(payload.args.tier)
               return { ok: true, value: undefined }
             }
@@ -1368,7 +1401,7 @@ describe('built client contributions', () => {
         },
       },
     }
-    loadClient().apply(ctx)
+    const locale = loadClient().apply(ctx)
     expect(components.has('conversation.input.model')).toBe(false)
     expect(components.has('conversation.input.left')).toBe(true)
     const container = document.createElement('div')
@@ -1402,10 +1435,38 @@ describe('built client contributions', () => {
     await act(async () => trigger.click())
     const ultrafast = Array.from(
       container.querySelectorAll<HTMLButtonElement>('[role=menuitem]'),
-    ).find((button) => button.textContent === 'Ultrafast')!
+    ).find((button) => button.textContent === 'Legacy priority label')!
     await act(async () => ultrafast.click())
     expect(selected).toBe('ultrafast')
-    expect(trigger.getAttribute('aria-label')).toBe('GPT 速度：Ultrafast')
+    expect(trigger.getAttribute('aria-label')).toBe(
+      'GPT 速度：Legacy priority label',
+    )
+    await act(async () => trigger.click())
+    const manual = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[role=menuitem]'),
+    ).find((button) => button.textContent === 'Ultrafast（手动）')!
+    await act(async () => manual.click())
+    expect(selected).toBe('manual-ultrafast')
+    expect(trigger.getAttribute('aria-label')).toBe(
+      'GPT 速度：Ultrafast（手动）',
+    )
+    await act(async () => locale.setLocale('en'))
+    expect(trigger.getAttribute('aria-label')).toBe(
+      'GPT speed: Ultrafast (manual)',
+    )
+    await act(async () => trigger.click())
+    expect(
+      Array.from(container.querySelectorAll('[role=menuitem]')).map(
+        (item) => item.textContent,
+      ),
+    ).toEqual([
+      'Standard',
+      'Fast',
+      'Legacy priority label',
+      'Ultrafast (manual)',
+    ])
+    await act(async () => trigger.click())
+    await act(async () => locale.setLocale('zh'))
     await act(async () => {
       trigger.click()
     })
@@ -1416,5 +1477,13 @@ describe('built client contributions', () => {
       standard.click()
     })
     expect(trigger.getAttribute('aria-label')).toBe('GPT 速度：Standard')
+    expect(speedWrites).toEqual(
+      ['fast', 'ultrafast', 'manual-ultrafast', 'default'].map((tier) => ({
+        sessionId: 'fixture-session',
+        provider: 'fixture',
+        modelId,
+        tier,
+      })),
+    )
   })
 })

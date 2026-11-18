@@ -13,6 +13,7 @@ export type ReasoningChoice = {
 }
 
 export type ServiceTier = 'default' | 'fast' | 'ultrafast'
+export type SpeedSelection = ServiceTier | 'manual-ultrafast'
 export type ServiceTierWireValue = ServiceTier | 'priority'
 
 export type ServiceTierChoice = {

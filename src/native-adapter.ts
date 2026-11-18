@@ -71,14 +71,24 @@ export function installNativeAdapterBridge(
             return model &&
               provider === options.provider &&
               modelId === options.model &&
+              !extension.tierOnly &&
               capacity?.contextWindow
               ? { ...model, contextWindow: capacity.contextWindow }
               : model
           }
         if (key === 'streamSimple')
           return (model: any, context: any, settings: any) => {
+            // An omitted profile API may still resolve to a non-Responses SDK
+            // model (notably the built-in Anthropic provider).
+            if (extension.tierOnly && model.api !== 'openai-responses')
+              return target.streamSimple(model, context, settings)
             const call = extension.prepare(options)
-            const payload = call.payload as PreparedGptRequest
+            const payload = { ...call.payload } as PreparedGptRequest
+            const omitManualTier =
+              call.manualUltrafast && model.api !== 'openai-responses'
+            if (omitManualTier) delete payload.service_tier
+            if (extension.tierOnly && payload.service_tier === undefined)
+              return target.streamSimple(model, context, settings)
             const send = extension.preserveReasoning
               ? target.streamSimple.bind(target)
               : target.stream.bind(target)
@@ -100,12 +110,15 @@ export function installNativeAdapterBridge(
                         payload.reasoning?.effort ?? payload.reasoning_effort,
                     }
                   : {}),
-                serviceTier: payload.service_tier,
+                ...(omitManualTier
+                  ? {}
+                  : { serviceTier: payload.service_tier }),
                 onPayload(body: Record<string, any>) {
                   const next = { ...body }
                   // Responses may normalize omitted strictness into required fields.
                   // Keep the harness's optional arguments optional on GPT routes.
                   if (
+                    !extension.tierOnly &&
                     model.api === 'openai-responses' &&
                     Array.isArray(next.tools)
                   )
