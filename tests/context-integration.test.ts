@@ -1113,6 +1113,135 @@ describe('context settings and live model integration', () => {
     ).toBe('priority')
   })
 
+  it('persists manual Ultrafast only for GPT-6.2 Sol with unknown upstream support', async () => {
+    const f = await fixture()
+    const modelId = 'gpt-6.2-sol'
+    const session = 'ultrafast-session' as Parameters<GptModels['setSpeed']>[0]
+    const model = { id: modelId }
+    const status = () => f.service.status('fixture')
+    const tiers = (id = modelId) =>
+      f.service.modelStatus('fixture', id).serviceTiers.map((tier) => tier.id)
+    const speed = () => f.service.speed(session, 'fixture', modelId).selected
+    const requestedTier = () =>
+      f.service
+        .capture('fixture', modelId, {
+          provider: 'fixture',
+          id: modelId,
+          name: 'GPT-6.2 Sol',
+        })!
+        .prepare({ sessionId: session }).payload.service_tier
+    const toggle = (enabled: boolean) =>
+      f.service.setUltrafastFallback(
+        'fixture',
+        enabled,
+        status().optionsRevision,
+      )
+    const selectUltrafast = () =>
+      f.service.setSpeed(session, 'fixture', modelId, 'ultrafast')
+    f.models([{ id: 'gpt-5.4' }, model])
+    await f.service.refresh('fixture')
+    expect(status().canConfigureUltrafastFallback).toBe(true)
+    expect(tiers()).toEqual(['default', 'fast'])
+    await expect(selectUltrafast()).rejects.toThrow('This speed is unavailable')
+
+    await toggle(true)
+    expect(f.options().routes.fixture.allowUnadvertisedUltrafast).toBe(true)
+    expect(tiers()).toEqual(['default', 'fast', 'ultrafast'])
+    expect(tiers('gpt-5.4')).toEqual(['default', 'fast'])
+    expect(speed()).toBe('default')
+    await selectUltrafast()
+    expect(speed()).toBe('ultrafast')
+    expect(requestedTier()).toBe('ultrafast')
+    const fastSession = 'fast-session' as typeof session
+    await f.service.setSpeed(fastSession, 'fixture', modelId, 'fast')
+
+    const disable = toggle(false)
+    const racedSelection = expect(selectUltrafast()).rejects.toThrow(
+      'This speed is unavailable',
+    )
+    await Promise.all([disable, racedSelection])
+    expect(tiers()).not.toContain('ultrafast')
+    expect(speed()).toBe('default')
+    await toggle(true)
+    expect(tiers()).toContain('ultrafast')
+    expect(speed()).toBe('default')
+    expect(requestedTier()).toBe('default')
+    expect(f.service.speed(fastSession, 'fixture', modelId).selected).toBe(
+      'fast',
+    )
+
+    f.models([
+      {
+        ...model,
+        service_tiers: ['default', 'priority', 'ultrafast'],
+        supports_ultrafast: false,
+      },
+    ])
+    await f.service.refresh('fixture')
+    expect(status().canConfigureUltrafastFallback).toBe(false)
+    expect(tiers()).not.toContain('ultrafast')
+    expect(speed()).toBe('default')
+    await expect(toggle(true)).rejects.toThrow(
+      'Ultrafast fallback is unavailable',
+    )
+    await expect(selectUltrafast()).rejects.toThrow('This speed is unavailable')
+    expect(requestedTier()).toBe('default')
+
+    await f.service.updateOptions(
+      'fixture',
+      1800000,
+      '',
+      JSON.stringify({
+        [modelId]: {
+          serviceTiers: [{ id: 'fast', label: 'Fast', wireValue: 'ultrafast' }],
+          defaultServiceTier: 'fast',
+        },
+      }),
+      status().optionsRevision,
+    )
+    expect(tiers()).toEqual(['default'])
+    await expect(
+      f.service.setSpeed(session, 'fixture', modelId, 'fast'),
+    ).rejects.toThrow('This speed is unavailable')
+    expect(requestedTier()).toBe('default')
+  })
+
+  it('offers manual Ultrafast when the only positive advertisement is stale', async () => {
+    const f = await fixture()
+    const id = 'gpt-6.2-sol'
+    const status = () => f.service.status('fixture')
+    const tiers = () =>
+      f.service.modelStatus('fixture', id).serviceTiers.map((tier) => tier.id)
+    f.models([{ id, service_tiers: [{ id: 'priority' }, { id: 'ultrafast' }] }])
+    await f.service.refresh('fixture')
+    expect(status().canConfigureUltrafastFallback).toBe(false)
+    expect(tiers()).toContain('ultrafast')
+
+    f.models([{ id: 'gpt-5.4' }])
+    await f.service.refresh('fixture')
+    expect(tiers()).not.toContain('ultrafast')
+    expect(status().canConfigureUltrafastFallback).toBe(true)
+    await f.service.setUltrafastFallback(
+      'fixture',
+      true,
+      status().optionsRevision,
+    )
+    expect(tiers()).toContain('ultrafast')
+  })
+
+  it('does not offer the Ultrafast fallback for Chat Completions', async () => {
+    const f = await fixture('openai-completions')
+    const id = 'gpt-6.2-sol'
+    f.models([{ id }])
+    await f.service.refresh('fixture')
+    expect(f.service.status('fixture').canConfigureUltrafastFallback).toBe(
+      false,
+    )
+    await expect(
+      f.service.setUltrafastFallback('fixture', true),
+    ).rejects.toThrow('Ultrafast fallback is unavailable')
+  })
+
   it('falls back from a removed saved speed without changing captured requests', async () => {
     const f = await fixture()
     await f.service.setSpeed(

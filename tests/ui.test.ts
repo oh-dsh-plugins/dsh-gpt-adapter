@@ -233,6 +233,7 @@ const modelMetadata = {
 async function providerFixture(
   control: {
     initialIntervalMs?: number
+    canConfigureUltrafastFallback?: boolean
     read?(count: number, response: any): Promise<any> | any
     written?(): Promise<void>
   } = {},
@@ -244,6 +245,7 @@ async function providerFixture(
     enabled: true,
     refreshIntervalMs: control.initialIntervalMs ?? 1800000,
     overridesJSON: '{}',
+    allowUnadvertisedUltrafast: false,
     capabilityCatalogUrl: 'https://old.invalid/catalog',
   }
   const writes: Array<Record<string, unknown>> = []
@@ -264,6 +266,17 @@ async function providerFixture(
           endpoint: string,
           payload: { args: Record<string, unknown> },
         ) => {
+          if (endpoint.endsWith('/setUltrafastFallback')) {
+            writes.push(payload.args)
+            if (payload.args.expectedRevision !== revision)
+              return { ok: false, error: { message: 'revision conflict' } }
+            options = {
+              ...options,
+              allowUnadvertisedUltrafast: payload.args.enabled === true,
+            }
+            revision++
+            return { ok: true }
+          }
           if (endpoint.endsWith('/updateOptions')) {
             writes.push(payload.args)
             if (payload.args.expectedRevision !== revision)
@@ -290,6 +303,8 @@ async function providerFixture(
               models: [],
               options: { ...options },
               optionsRevision: revision,
+              canConfigureUltrafastFallback:
+                control.canConfigureUltrafastFallback ?? false,
             },
           }
           reads++
@@ -361,6 +376,124 @@ async function providerFixture(
 }
 
 describe('built client contributions', () => {
+  it('shows the default-off Ultrafast switch with upstream caveat and saves it', async () => {
+    const find = (container: HTMLElement, label: string) =>
+      container.querySelector<HTMLButtonElement>(
+        `[role="switch"][aria-label="${label}"]`,
+      )
+    const zhLabel = '允许手动选择 GPT-6.2 Sol 的 Ultrafast'
+    const unavailable = await providerFixture()
+    expect(find(unavailable.container, zhLabel)).toBeNull()
+    const f = await providerFixture({ canConfigureUltrafastFallback: true })
+    expect(find(f.container, zhLabel)?.getAttribute('aria-checked')).toBe(
+      'false',
+    )
+    expect(f.container.textContent).toContain(
+      '能否正常使用取决于上游及当前账号是否支持。',
+    )
+    await act(async () => f.locale.setLocale('en'))
+    expect(f.container.textContent).toContain(
+      'It works only if your upstream and account support it.',
+    )
+    const toggle = find(f.container, 'Allow manual Ultrafast for GPT-6.2 Sol')!
+    await act(async () => toggle.click())
+    expect(f.writes).toEqual([
+      { provider: 'fixture', enabled: true, expectedRevision: 1 },
+    ])
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('preserves a dirty sync draft and rebases its revision after toggling Ultrafast', async () => {
+    let releaseRead: (() => void) | undefined
+    const f = await providerFixture({
+      canConfigureUltrafastFallback: true,
+      read: (_count, response) =>
+        response.value.optionsRevision === 2
+          ? new Promise((resolve) => (releaseRead = () => resolve(response)))
+          : response,
+    })
+    await act(async () => f.locale.setLocale('en'))
+    const overrides = '{"gpt-custom":{"defaultServiceTier":"fast"}}'
+    await f.type('input[type=url]', 'https://unsaved.invalid/catalog')
+    await f.type('input[type=number]', '5')
+    await f.type('input:not([type])', overrides)
+    await act(async () =>
+      f.container
+        .querySelector<HTMLButtonElement>(
+          '[role="switch"][aria-label="Allow manual Ultrafast for GPT-6.2 Sol"]',
+        )!
+        .click(),
+    )
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=url]')!.value,
+    ).toBe('https://unsaved.invalid/catalog')
+    expect(
+      f.container.querySelector<HTMLInputElement>('input[type=number]')!.value,
+    ).toBe('5')
+    expect(
+      f.container.querySelector<HTMLInputElement>('input:not([type])')!.value,
+    ).toBe(overrides)
+    const save = f.container.querySelector<HTMLButtonElement>(
+      'button[type=submit]',
+    )!
+    expect(save.disabled).toBe(true)
+    await act(async () => releaseRead!())
+    expect(save.disabled).toBe(false)
+    expect(f.container.textContent).not.toContain('Reload saved settings')
+    await f.save()
+    expect(f.writes).toEqual([
+      { provider: 'fixture', enabled: true, expectedRevision: 1 },
+      {
+        provider: 'fixture',
+        expectedRevision: 2,
+        refreshIntervalMs: 5000,
+        capabilityCatalogUrl: 'https://unsaved.invalid/catalog',
+        overridesJSON: overrides,
+      },
+    ])
+    expect(f.options()).toMatchObject({
+      allowUnadvertisedUltrafast: true,
+      refreshIntervalMs: 5000,
+      capabilityCatalogUrl: 'https://unsaved.invalid/catalog',
+      overridesJSON: overrides,
+    })
+    expect(f.container.querySelector('[role=alert]')).toBeNull()
+  })
+
+  it.each([
+    { capabilityCatalogUrl: 'https://external.invalid/catalog' },
+    { refreshIntervalMs: 6000 },
+    { overridesJSON: '{"gpt-custom":{"defaultServiceTier":"fast"}}' },
+  ])(
+    'protects conflicting sync values after an Ultrafast-only rebase: %j',
+    async (changed) => {
+      const f = await providerFixture({ canConfigureUltrafastFallback: true })
+      await act(async () => f.locale.setLocale('en'))
+      await f.type('input[type=url]', 'https://unsaved.invalid/catalog')
+      await act(async () =>
+        f.container
+          .querySelector<HTMLButtonElement>(
+            '[role="switch"][aria-label="Allow manual Ultrafast for GPT-6.2 Sol"]',
+          )!
+          .click(),
+      )
+      await f.external(changed)
+      expect(
+        f.container.querySelector<HTMLInputElement>('input[type=url]')!.value,
+      ).toBe('https://unsaved.invalid/catalog')
+      expect(f.container.textContent).toContain('Reload saved settings')
+      await f.save()
+      expect(f.writes[1]!.expectedRevision).not.toBe(3)
+      expect(f.container.querySelector('[role=alert]')!.textContent).toContain(
+        'changed since it was read',
+      )
+      expect(f.options()).toMatchObject({
+        ...changed,
+        allowUnadvertisedUltrafast: true,
+      })
+    },
+  )
+
   it.each([1500, 1001, 2147483647])(
     'saves a URL-only edit with the valid initial %s millisecond interval',
     async (initialIntervalMs) => {
@@ -1167,6 +1300,17 @@ describe('built client contributions', () => {
     const components = new Map<string, React.ComponentType<any>>()
     let selected = 'default'
     const calls: string[] = []
+    const modelId = 'gpt-6.2-sol'
+    const capability = resolveCapabilities({ id: modelId }, 'fixture')
+    const serviceTiers = [
+      ...capability.serviceTiers,
+      {
+        id: 'ultrafast',
+        label: 'Ultrafast',
+        wireValue: 'ultrafast',
+        source: 'user',
+      },
+    ]
     const status = {
       enabled: true,
       status: { state: 'ready' },
@@ -1176,11 +1320,9 @@ describe('built client contributions', () => {
         refreshIntervalMs: 1800000,
         overridesJSON: '{}',
       },
-      capabilities: {
-        'gpt-custom': resolveCapabilities({ id: 'gpt-custom' }, 'fixture'),
-      },
+      capabilities: { [modelId]: { ...capability, serviceTiers } },
     }
-    const snapshot = { current: { provider: 'fixture', model: 'gpt-custom' } }
+    const snapshot = { current: { provider: 'fixture', model: modelId } }
     const store = { subscribe: () => () => {}, getSnapshot: () => snapshot }
     const directory = { directoryFor: () => ({ store }) }
     const ctx = {
@@ -1205,8 +1347,7 @@ describe('built client contributions', () => {
                 endpoint === 'gptModels/modelStatus'
                   ? {
                       enabled: true,
-                      serviceTiers:
-                        status.capabilities['gpt-custom']!.serviceTiers,
+                      serviceTiers: status.capabilities[modelId]!.serviceTiers,
                     }
                   : { selected, last: null },
             }
@@ -1258,6 +1399,13 @@ describe('built client contributions', () => {
     expect(calls).toContain('gptModels/setSpeed')
     expect(calls).not.toContain('gptModels/status')
     expect(trigger.getAttribute('aria-label')).toBe('GPT 速度：Fast')
+    await act(async () => trigger.click())
+    const ultrafast = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[role=menuitem]'),
+    ).find((button) => button.textContent === 'Ultrafast')!
+    await act(async () => ultrafast.click())
+    expect(selected).toBe('ultrafast')
+    expect(trigger.getAttribute('aria-label')).toBe('GPT 速度：Ultrafast')
     await act(async () => {
       trigger.click()
     })

@@ -47,10 +47,14 @@ import type {
   ServiceTier,
   SyncConfig,
   SyncSnapshot,
+  UpstreamModel,
 } from './types.js'
+
+const ULTRAFAST_FALLBACK_MODEL = 'gpt-6.2-sol'
 
 type RouteOptions = {
   enabled: boolean
+  allowUnadvertisedUltrafast?: boolean
   refreshIntervalMs: number
   capabilityCatalogUrl?: string
   overridesJSON: string
@@ -149,6 +153,17 @@ function parseModelOverrides(text: string): Record<string, ModelOverride> {
   return value as Record<string, ModelOverride>
 }
 
+function isUltrafastUnadvertised(model: UpstreamModel | undefined): boolean {
+  return (
+    model?.ultrafastSupported !== false &&
+    (model?.stale === true ||
+      (model?.ultrafastSupported !== true &&
+        !model?.capabilities?.serviceTiers?.some(
+          (tier) => tier.id === 'ultrafast',
+        )))
+  )
+}
+
 function effectiveSpeed(
   capability: ModelCapabilities | undefined,
   saved: ServiceTier | undefined,
@@ -182,7 +197,7 @@ type SettingsRead = {
   snapshots: Map<string, SyncSnapshot>
   overrides: Map<string, Record<string, ModelOverride>>
   models: WeakMap<object, Map<string, any>>
-  upstream: Map<string, Map<string, any>>
+  upstream: Map<string, Map<string, UpstreamModel>>
   builtin: Map<string, Map<string, any>>
   outputDefaults: WeakMap<object, number>
 }
@@ -205,6 +220,7 @@ export const Config: z<
       .dict(
         z.object({
           enabled: z.boolean().default(false),
+          allowUnadvertisedUltrafast: z.boolean().default(false),
           refreshIntervalMs: z
             .number()
             .min(1000)
@@ -237,6 +253,8 @@ export const Config: z<
         $description: 'GPT adaptation routes',
         $value: {
           enabled: 'Enable GPT adaptation',
+          allowUnadvertisedUltrafast:
+            'Allow manual Ultrafast selection for GPT-6.2 Sol (requires upstream support)',
           refreshIntervalMs: 'Sync interval (milliseconds)',
           capabilityCatalogUrl: 'Capability catalog URL',
           overridesJSON: 'Model capability overrides (JSON)',
@@ -263,6 +281,8 @@ export const Config: z<
         $description: 'GPT 适配路由',
         $value: {
           enabled: '启用 GPT 自动适配',
+          allowUnadvertisedUltrafast:
+            '允许手动选择 GPT-6.2 Sol 的 Ultrafast（需要上游支持）',
           refreshIntervalMs: '同步间隔（毫秒）',
           capabilityCatalogUrl: '能力目录 URL',
           overridesJSON: '模型能力覆盖（JSON）',
@@ -677,11 +697,14 @@ export class GptModels extends Service {
 
   private routeState(provider: string, read: SettingsRead): string {
     const { profile } = this.profile(provider, read)
+    const options = this.routeOptions(provider, profile, read)
+    // This switch changes request selection, not the model-list runner inputs.
+    const { allowUnadvertisedUltrafast: _, ...syncOptions } = options ?? {}
     return JSON.stringify([
       profile.api,
       profile.baseURL,
       profile.apiKeyEnv,
-      this.routeOptions(provider, profile, read),
+      options ? syncOptions : undefined,
     ])
   }
 
@@ -827,6 +850,10 @@ export class GptModels extends Service {
       capabilities,
       contextWindows,
       contextRevision: this.modelsRevision(read),
+      canConfigureUltrafastFallback:
+        !!options?.enabled &&
+        !!profile &&
+        this.canConfigureUltrafastFallback(provider, profile, read),
       optionsRevision: read.rows.find((row) => row.ns === this.settingsNs)
         ?.revision as number | undefined,
       options: options ?? {
@@ -869,6 +896,80 @@ export class GptModels extends Service {
       ],
       descriptor.revision,
     )
+  }
+
+  private canConfigureUltrafastFallback(
+    provider: string,
+    profile: Record<string, any>,
+    read: SettingsRead,
+  ): boolean {
+    const raw = this.upstreamModel(read, provider, ULTRAFAST_FALLBACK_MODEL)
+    return (
+      (profile.api ?? 'openai-responses') === 'openai-responses' &&
+      (!!raw ||
+        this.modelIndex(read, profile).has(ULTRAFAST_FALLBACK_MODEL) ||
+        !!this.builtinModel(read, provider, ULTRAFAST_FALLBACK_MODEL)) &&
+      isUltrafastUnadvertised(raw)
+    )
+  }
+
+  @Remote
+  async setUltrafastFallback(
+    provider: string,
+    enabled: boolean,
+    expectedRevision?: number,
+  ): Promise<void> {
+    await this.queueSpeedWrite(async () => {
+      const read = this.readSettings()
+      const { profile } = this.profile(provider, read)
+      const options = this.routeOptions(provider, profile, read)
+      if (
+        typeof enabled !== 'boolean' ||
+        !options?.enabled ||
+        !this.canConfigureUltrafastFallback(provider, profile, read)
+      )
+        throw new Error('Ultrafast fallback is unavailable for this provider')
+      const descriptor = read.rows.find((entry) => entry.ns === this.settingsNs)
+      if (!descriptor) throw new Error('GPT plugin settings unavailable')
+      const revision = expectedRevision ?? descriptor.revision
+      // Discard dormant selections from older installs or an interrupted
+      // disable before opening the manual tier again.
+      if (
+        enabled &&
+        !options.allowUnadvertisedUltrafast &&
+        revision === descriptor.revision
+      )
+        await this.clearUltrafastFallbackSpeeds(provider)
+      await this.ctx.settings.mutate(
+        this.settingsNs,
+        [
+          {
+            op: 'set',
+            path: ['routes', provider],
+            value: { ...options, allowUnadvertisedUltrafast: enabled },
+          },
+        ],
+        revision,
+      )
+      if (!enabled) await this.clearUltrafastFallbackSpeeds(provider)
+    })
+  }
+
+  private async clearUltrafastFallbackSpeeds(provider: string): Promise<void> {
+    const available = this.capability(provider, ULTRAFAST_FALLBACK_MODEL)
+    if (available?.serviceTiers.some((tier) => tier.id === 'ultrafast')) return
+    await this.persistSpeeds((next) => {
+      for (const [key, tier] of next) {
+        if (tier !== 'ultrafast') continue
+        const [, savedProvider, modelId] = JSON.parse(key) as [
+          string,
+          string,
+          string,
+        ]
+        if (savedProvider === provider && modelId === ULTRAFAST_FALLBACK_MODEL)
+          next.delete(key)
+      }
+    })
   }
 
   @Remote
@@ -1214,29 +1315,39 @@ export class GptModels extends Service {
     modelId: string,
     tier: ServiceTier,
   ): Promise<void> {
-    const capability = this.capability(provider, modelId)
-    if (!capability?.serviceTiers.some((choice) => choice.id === tier))
-      throw new Error('This speed is unavailable for the selected model')
     const key = JSON.stringify([sessionId, provider, modelId])
-    await this.writeSpeeds((next) => next.set(key, tier))
+    await this.writeSpeeds((next) => {
+      const capability = this.capability(provider, modelId)
+      if (!capability?.serviceTiers.some((choice) => choice.id === tier))
+        throw new Error('This speed is unavailable for the selected model')
+      next.set(key, tier)
+    })
   }
 
   private writeSpeeds(
     change: (next: Map<string, ServiceTier>) => void,
   ): Promise<void> {
-    const write = this.speedWrites.then(async () => {
-      const next = new Map(this.speeds)
-      change(next)
-      if (
-        next.size === this.speeds.size &&
-        [...next].every(([key, value]) => this.speeds.get(key) === value)
-      )
-        return
-      await this.store.write('speeds', Object.fromEntries(next))
-      this.speeds = next
-    })
+    return this.queueSpeedWrite(() => this.persistSpeeds(change))
+  }
+
+  private queueSpeedWrite(work: () => Promise<void>): Promise<void> {
+    const write = this.speedWrites.then(work)
     this.speedWrites = write.catch(() => undefined)
     return write
+  }
+
+  private async persistSpeeds(
+    change: (next: Map<string, ServiceTier>) => void,
+  ): Promise<void> {
+    const next = new Map(this.speeds)
+    change(next)
+    if (
+      next.size === this.speeds.size &&
+      [...next].every(([key, value]) => this.speeds.get(key) === value)
+    )
+      return
+    await this.store.write('speeds', Object.fromEntries(next))
+    this.speeds = next
   }
 
   @Remote({ resources: { session: (sessionId: SessionId) => sessionId } })
@@ -1302,6 +1413,20 @@ export class GptModels extends Service {
       snapshot?.capabilities[modelId]?.capabilityRevision ?? 'gpt-preset',
       override,
     )
+    if (
+      options.allowUnadvertisedUltrafast &&
+      modelId === ULTRAFAST_FALLBACK_MODEL &&
+      (profile.api ?? 'openai-responses') === 'openai-responses' &&
+      isUltrafastUnadvertised(raw) &&
+      !result.serviceTiers.some((choice) => choice.id === 'ultrafast')
+    ) {
+      result.serviceTiers.push({
+        id: 'ultrafast',
+        label: 'Ultrafast',
+        wireValue: 'ultrafast',
+        source: 'user',
+      })
+    }
     return {
       ...result,
       contextWindow: this.contextWindow(

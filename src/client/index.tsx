@@ -265,7 +265,7 @@ export function apply(ctx: Context): void {
     async function act(
       method: string,
       args: Record<string, unknown>,
-      saved?: (status: ProviderStatus) => void,
+      saved?: true | ((status: ProviderStatus) => void),
     ) {
       if (requests.current.writing) return
       requests.current.writing = true
@@ -281,7 +281,7 @@ export function apply(ctx: Context): void {
           reading = true
           const status = await query.resumeAndRead()
           if (!status || sequence !== requests.current.sequence) return false
-          saved(status)
+          if (typeof saved === 'function') saved(status)
         }
         return true
       } catch (failure) {
@@ -327,11 +327,21 @@ export function apply(ctx: Context): void {
     const [overrides, setOverrides] = useState(value.options.overridesJSON)
     const dirty = useRef(false)
     const revision = useRef(value.optionsRevision)
+    const base = useRef(value.options)
+    // Other options share this revision but must not invalidate a sync draft.
+    const expectedRevision =
+      (value.options.capabilityCatalogUrl ?? '') ===
+        (base.current.capabilityCatalogUrl ?? '') &&
+      value.options.refreshIntervalMs === base.current.refreshIntervalMs &&
+      value.options.overridesJSON === base.current.overridesJSON
+        ? value.optionsRevision
+        : revision.current
     const adopt = (status: ProviderStatus) => {
       setUrl(status.options.capabilityCatalogUrl ?? '')
       setSeconds(String(status.options.refreshIntervalMs / 1000))
       setOverrides(status.options.overridesJSON)
       revision.current = status.optionsRevision
+      base.current = status.options
       dirty.current = false
     }
     useEffect(() => {
@@ -354,7 +364,7 @@ export function apply(ctx: Context): void {
                 refreshIntervalMs: Math.round(Number(seconds) * 1000),
                 capabilityCatalogUrl: url.trim(),
                 overridesJSON: overrides,
-                expectedRevision: revision.current,
+                expectedRevision,
               },
               adopt,
             )
@@ -415,7 +425,7 @@ export function apply(ctx: Context): void {
             <Button type="submit" variant="primary" size="sm" disabled={busy}>
               {t('saveSync')}
             </Button>
-            {dirty.current && revision.current !== value.optionsRevision && (
+            {dirty.current && expectedRevision !== value.optionsRevision && (
               <Button
                 type="button"
                 variant="ghost"
@@ -488,6 +498,32 @@ export function apply(ctx: Context): void {
                 >
                   {t('removeStale', { count: stale })}
                 </Button>
+              </div>
+            )}
+            {value.canConfigureUltrafastFallback && (
+              <div>
+                <div className={styles.rowHead}>
+                  <span className={styles.rowName}>{t('manualUltrafast')}</span>
+                  <Switch
+                    label={t('manualUltrafast')}
+                    checked={value.options.allowUnadvertisedUltrafast ?? false}
+                    disabled={!configured || busy}
+                    onChange={(enabled) => {
+                      void act(
+                        'setUltrafastFallback',
+                        {
+                          provider: provider.provider,
+                          enabled,
+                          expectedRevision: value.optionsRevision,
+                        },
+                        true,
+                      )
+                    }}
+                  />
+                </div>
+                <p className={styles.advancedHint}>
+                  {t('manualUltrafastHint')}
+                </p>
               </div>
             )}
             <p className={styles.advancedHint}>{t('contextHint')}</p>

@@ -107,6 +107,151 @@ function streamResponse(protocol: string, serviceTier = 'priority') {
 }
 
 describe('built plugin and official transport integration', () => {
+  it.each(['structured metadata', 'initial route opt-in'] as const)(
+    'sends Ultrafast only when selected through native Responses with %s',
+    async (source) => {
+      const native = await import('@deepseek-ai/dsh-llm-pi-ai')
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-gpt-ultrafast-test-'))
+      cleanup.push(() => rm(directory, { recursive: true, force: true }))
+      vi.stubEnv('DSH_HOME', directory)
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      const modelId = 'gpt-6.2-sol'
+      const profile = {
+        api: 'openai-responses' as const,
+        reasoning: 'high' as const,
+        baseURL: 'https://fixture.invalid/v1',
+        apiKeyEnv: 'TEST_API_KEY',
+        models: [{ id: modelId }],
+      }
+      ctx.provide('settings', {
+        configure: () => () => {},
+        // No saved gpt-adapter settings: the opt-in must come from effective
+        // initial configuration, not a persisted route or model override.
+        describe: () => [
+          {
+            ns: 'llm-pi-ai',
+            value: { providers: { fixture: profile } },
+            revision: 1,
+          },
+        ],
+        mutate: vi.fn(async () => {}),
+      })
+      ctx.provide('credentials', {
+        resolve: async () => ({ value: 'fixture-key' }),
+      })
+      let adapter: LlmAdapter | undefined
+      ctx.provide('llm', {
+        listConfigurableProviders: () => [],
+        registerAdapter: (_providers: unknown, value: LlmAdapter) => {
+          adapter = value
+          return Object.assign(() => {}, { replace() {} })
+        },
+        registerConfigurableProviders: () =>
+          Object.assign(() => {}, { replace() {} }),
+        registerModelDiscovery: () => () => {},
+      })
+      const requests: Array<Record<string, unknown>> = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (String(url).endsWith('/models'))
+            return new Response(
+              JSON.stringify({
+                data: [
+                  source === 'structured metadata'
+                    ? {
+                        id: modelId,
+                        service_tiers: [
+                          { id: 'priority', name: 'Fast' },
+                          {
+                            id: 'ultrafast',
+                            name: 'Ultrafast',
+                            description: 'Lowest-latency service tier',
+                          },
+                        ],
+                      }
+                    : {
+                        id: modelId,
+                        service_tiers: [{ id: 'priority', name: 'Fast' }],
+                      },
+                ],
+              }),
+            )
+          expect(String(url)).toBe('https://fixture.invalid/v1/responses')
+          const body = JSON.parse(String(init!.body)) as Record<string, unknown>
+          requests.push(body)
+          return streamResponse(
+            'openai-responses',
+            String(body.service_tier ?? 'default'),
+          )
+        }),
+      )
+      const plugin = await import('../lib/index.js')
+      await plugin.apply(
+        ctx,
+        Config({
+          codexCompatibility: { enabled: false },
+          routes: {
+            fixture: {
+              enabled: true,
+              refreshIntervalMs: 1800000,
+              overridesJSON: '{}',
+              allowUnadvertisedUltrafast: source === 'initial route opt-in',
+            },
+          },
+        }),
+      )
+      const service = ctx.get('gptModels') as GptModels
+      await service.refresh('fixture')
+      expect(service.status('fixture').canConfigureUltrafastFallback).toBe(
+        source === 'initial route opt-in',
+      )
+      native.apply(ctx, native.Config({ providers: { fixture: profile } }))
+      expect(adapter).toBeDefined()
+      const sessionId = 'ultrafast-session' as SessionId
+      const send = async () => {
+        const call = await adapter!.prepareCall('fixture', modelId)
+        for await (const _chunk of call.stream({
+          provider: 'fixture',
+          model: modelId,
+          sessionId,
+          reasoningEffort: ReasoningEffortId('high'),
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+          ],
+        })) {
+        }
+      }
+      expect(service.speed(sessionId, 'fixture', modelId).selected).toBe(
+        'default',
+      )
+      await send()
+      expect(requests.at(-1)!.service_tier).toBe('default')
+      for (const [speed, wireValue] of [
+        ['fast', 'priority'],
+        ['ultrafast', 'ultrafast'],
+        ['default', 'default'],
+      ] as const) {
+        await service.setSpeed(sessionId, 'fixture', modelId, speed)
+        await send()
+        expect(requests.at(-1)!).toMatchObject({
+          model: modelId,
+          service_tier: wireValue,
+        })
+        expect(service.speed(sessionId, 'fixture', modelId)).toMatchObject({
+          selected: speed,
+          last: { requested: wireValue, actual: wireValue },
+        })
+      }
+      expect(requests.map((body) => body.service_tier)).toEqual([
+        'default',
+        'priority',
+        'ultrafast',
+        'default',
+      ])
+    },
+  )
   it('records all supported runtimes and verifies the installed native source', async () => {
     const versions = ['0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3']
     const manifest = JSON.parse(await readFile('package.json', 'utf8'))

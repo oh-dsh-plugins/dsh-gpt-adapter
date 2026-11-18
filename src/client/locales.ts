@@ -5,6 +5,14 @@ export const NS = 'gpt-adapter'
 const copy = {
   title: ['GPT model adaptation', 'GPT 模型适配'],
   autoAdapt: ['Automatic GPT adaptation', 'GPT 自动适配'],
+  manualUltrafast: [
+    'Allow manual Ultrafast for GPT-6.2 Sol',
+    '允许手动选择 GPT-6.2 Sol 的 Ultrafast',
+  ],
+  manualUltrafastHint: [
+    'The upstream does not report Ultrafast support. Turning this on adds Ultrafast to the chat speed menu. It works only if your upstream and account support it.',
+    '上游未声明是否支持 Ultrafast。开启后可在聊天栏的速度菜单中选择；能否正常使用取决于上游及当前账号是否支持。',
+  ],
   syncSettings: ['Sync settings', '同步设置'],
   catalogUrl: ['Capability catalog URL', '能力目录 URL'],
   interval: ['Sync interval (seconds)', '同步间隔（秒）'],
@@ -145,6 +153,10 @@ const errors = {
     'GPT 插件设置不可用',
   ],
   enable: ['Enable GPT adaptation first', '请先启用 GPT 自动适配'],
+  ultrafastUnavailable: [
+    'Ultrafast fallback is unavailable for this provider',
+    '当前提供商不适用 Ultrafast 手动开关',
+  ],
   speedUnavailable: [
     'This speed is unavailable for the selected model',
     '所选模型不支持此速度',

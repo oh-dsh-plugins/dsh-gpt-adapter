@@ -97,9 +97,22 @@ export function resolveCapabilities(
   )
     ? candidateDefaultReasoning
     : undefined
-  const serviceTiers = override?.serviceTiers ??
+  const tiers = override?.serviceTiers ??
     upstream?.serviceTiers ??
     base?.serviceTiers ?? [presetTier('default', 'Standard')]
+  const availableTiers = tiers.filter(
+    (choice) =>
+      (choice.id !== 'ultrafast' && choice.wireValue !== 'ultrafast') ||
+      (model.ultrafastSupported !== false &&
+        !(
+          model.stale &&
+          !override?.serviceTiers &&
+          choice.source === 'upstream'
+        )),
+  )
+  const serviceTiers = availableTiers.length
+    ? availableTiers
+    : [presetTier('default', 'Standard')]
   const candidateServiceTier =
     override?.defaultServiceTier ??
     upstream?.defaultServiceTier ??
