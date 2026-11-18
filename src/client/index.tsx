@@ -616,12 +616,26 @@ export function apply(ctx: Context): void {
         }
       }
     }
-    const choiceLabel = (tier: { id: SpeedSelection; label: string }) =>
-      tier.id === 'manual-ultrafast' ? t('manualUltrafastChoice') : tier.label
+    const manual = capability.serviceTiers.find(
+      (tier) => tier.id === 'manual-ultrafast',
+    )
+    const choices = capability.serviceTiers.filter(
+      (tier) =>
+        !manual ||
+        tier.id !== 'ultrafast' ||
+        tier.label.trim().toLowerCase() !== manual.label.toLowerCase(),
+    )
     const selectedChoice = capability.serviceTiers.find(
       (tier) => tier.id === speed.selected,
     )
-    const label = selectedChoice ? choiceLabel(selectedChoice) : 'Standard'
+    const selectedId =
+      manual &&
+      selectedChoice &&
+      !choices.includes(selectedChoice) &&
+      selectedChoice.wireValue === manual.wireValue
+        ? manual.id
+        : speed.selected
+    const label = selectedChoice?.label ?? 'Standard'
     return (
       <>
         <Menu
@@ -629,10 +643,10 @@ export function apply(ctx: Context): void {
           portal
           side="top"
           compact
-          selectedId={speed.selected}
-          items={capability.serviceTiers.map((tier) => ({
+          selectedId={selectedId}
+          items={choices.map((tier) => ({
             id: tier.id,
-            label: choiceLabel(tier),
+            label: tier.label,
             disabled: busy,
           }))}
           onClose={() => setOpen(false)}

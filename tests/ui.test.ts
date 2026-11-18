@@ -398,7 +398,7 @@ describe('built client contributions', () => {
     for (const text of [
       '上游模型元数据决定是否自动提供 Ultrafast。',
       '此 Responses 提供商开关独立于模型和订阅套餐；开启仅允许手动选择，不会改变当前速度或授予权限。',
-      '选择 Ultrafast（手动）后发送 service_tier: "ultrafast"，是否接受取决于上游及当前账号。',
+      '选择 Ultrafast 后发送 service_tier: "ultrafast"，是否接受取决于上游及当前账号。',
     ]) {
       expect(f.container.textContent).toContain(text)
     }
@@ -406,7 +406,7 @@ describe('built client contributions', () => {
     for (const text of [
       'Upstream model metadata controls automatic Ultrafast availability.',
       'This Responses provider switch is independent of model and subscription; turning it on only permits manual selection and does not change the current speed or grant access.',
-      'Selecting Ultrafast (manual) sends service_tier: "ultrafast". Whether it is accepted depends on your upstream and account.',
+      'Selecting Ultrafast sends service_tier: "ultrafast". Whether it is accepted depends on your upstream and account.',
     ]) {
       expect(f.container.textContent).toContain(text)
     }
@@ -1321,6 +1321,36 @@ describe('built client contributions', () => {
     ).toBe(true)
   })
 
+  it('shows one Ultrafast entry when both sources offer the same label', async () => {
+    const f = await composerFixture(async (endpoint) => ({
+      ok: true,
+      value: endpoint.endsWith('/modelStatus')
+        ? {
+            ...modelMetadata,
+            serviceTiers: [
+              ...modelMetadata.serviceTiers,
+              { id: 'ultrafast', label: 'UltraFast', wireValue: 'ultrafast' },
+              {
+                id: 'manual-ultrafast',
+                label: 'Ultrafast',
+                wireValue: 'ultrafast',
+              },
+            ],
+          }
+        : { selected: 'ultrafast', last: null },
+    }))
+    await act(async () => {
+      f.container
+        .querySelector<HTMLButtonElement>('[aria-haspopup=menu]')!
+        .click()
+    })
+    expect(
+      [...f.container.querySelectorAll('[role=menuitem]')].map(
+        (item) => item.textContent,
+      ),
+    ).toEqual(['Standard', 'Fast', 'Ultrafast'])
+  })
+
   it('keeps the existing model directory and saves speed through the native composer slot', async () => {
     const components = new Map<string, React.ComponentType<any>>()
     let selected = 'default'
@@ -1338,7 +1368,7 @@ describe('built client contributions', () => {
       },
       {
         id: 'manual-ultrafast',
-        label: 'Ultrafast (manual)',
+        label: 'Ultrafast',
         wireValue: 'ultrafast',
         source: 'user',
       },
@@ -1444,27 +1474,18 @@ describe('built client contributions', () => {
     await act(async () => trigger.click())
     const manual = Array.from(
       container.querySelectorAll<HTMLButtonElement>('[role=menuitem]'),
-    ).find((button) => button.textContent === 'Ultrafast（手动）')!
+    ).find((button) => button.textContent === 'Ultrafast')!
     await act(async () => manual.click())
     expect(selected).toBe('manual-ultrafast')
-    expect(trigger.getAttribute('aria-label')).toBe(
-      'GPT 速度：Ultrafast（手动）',
-    )
+    expect(trigger.getAttribute('aria-label')).toBe('GPT 速度：Ultrafast')
     await act(async () => locale.setLocale('en'))
-    expect(trigger.getAttribute('aria-label')).toBe(
-      'GPT speed: Ultrafast (manual)',
-    )
+    expect(trigger.getAttribute('aria-label')).toBe('GPT speed: Ultrafast')
     await act(async () => trigger.click())
     expect(
       Array.from(container.querySelectorAll('[role=menuitem]')).map(
         (item) => item.textContent,
       ),
-    ).toEqual([
-      'Standard',
-      'Fast',
-      'Legacy priority label',
-      'Ultrafast (manual)',
-    ])
+    ).toEqual(['Standard', 'Fast', 'Legacy priority label', 'Ultrafast'])
     await act(async () => trigger.click())
     await act(async () => locale.setLocale('zh'))
     await act(async () => {
