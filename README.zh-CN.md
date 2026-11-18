@@ -12,7 +12,7 @@
 - 自动发现上游模型，在原生模型设置页中管理。
 - 提供 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 六档 GPT 思考等级。
 - 为每个模型选择「默认」「516K」「1M」或「自定义」上下文窗口。
-- 在聊天栏选择 Standard 或 Fast；上游声明支持或在提供商设置中手动启用后，也可选择 Ultrafast。
+- 在聊天栏选择 Standard 或 Fast；上游声明支持时提供自动 Ultrafast，在提供商设置中启用后还可选择独立的「Ultrafast（手动）」。
 - 复用 Codex 指令文件、本地及插件技能、MCP 服务器。
 - 将受信任项目的配置应用到对应会话代理（Agent）。
 
@@ -27,7 +27,7 @@
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.11
+dsh plugin --profile web add dsh-gpt-adapter@0.2.12
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.11.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.12.tgz
 ```
 
 ## 使用 GPT 模型
@@ -49,9 +49,11 @@ dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.11.tgz
 2. 查看提供商卡片上的「GPT 自动适配」。插件会自动识别符合条件的 GPT 提供商，也可使用开关启用或停用适配。
 3. 在对话中选择模型和思考等级，通过聊天栏的速度菜单选择 Standard 或 Fast。
 
-Fast 会请求上游优先档位。上游模型列表声明支持 Ultrafast 时，速度菜单会自动显示该档位。如果列表没有说明 GPT-6.2 Sol 是否支持 Ultrafast，可在 Responses 提供商卡片开启「允许手动选择 GPT-6.2 Sol 的 Ultrafast」，再在聊天栏选择「Ultrafast」。开关默认关闭，不会授予权限；能否使用取决于上游及当前账号是否支持。选择后，请求会发送 `service_tier: "ultrafast"`。速度选择按会话保存。
+Fast 会请求上游优先档位。上游模型元数据决定是否自动提供 Ultrafast。「允许手动选择 Ultrafast」是 Responses 提供商的独立设置，不依赖模型或订阅套餐。此设置默认关闭；开启仅在聊天栏开放手动选择，不会改变当前速度或授予权限。选择「Ultrafast（手动）」后发送 `service_tier: "ultrafast"`；此独立选项可与自动 Ultrafast 同时存在，不会替换自动选项的标签或已配置的协议值（包括旧的 `priority` 映射）。插件透传手动选项的协议参数，是否接受取决于上游及当前账号。速度选择按会话保存。
 
-使用提供商卡片上的「立即同步」刷新模型列表。上游不再列出的模型会保留到主动移除。卡片还可配置同步间隔、可选的能力目录地址和模型能力覆盖。显式覆盖优先于上游元数据、外部能力目录和预设，但不能绕过上游明确不支持 Ultrafast 的限制。
+**从 v0.2.11 升级：** 旧版使用同一个标识保存自动和手动 Ultrafast。为避免误发手动档位，新版不会把这个旧标识恢复为手动选择。如果你以前手动选过 Ultrafast，升级后请重新选择「Ultrafast（手动）」。
+
+使用提供商卡片上的「立即同步」刷新模型列表。上游不再列出的模型会保留到主动移除。卡片还可配置同步间隔、可选的能力目录地址和模型能力覆盖。显式能力覆盖优先于上游元数据、外部能力目录和预设，但自动能力解析仍保留上游明确不支持 Ultrafast 的声明。独立的手动选择开关并不表示上游支持此能力。
 
 ### 上下文窗口
 

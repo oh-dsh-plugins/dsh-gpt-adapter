@@ -45,12 +45,11 @@ import type {
   ModelCapabilities,
   ModelOverride,
   ServiceTier,
+  SpeedSelection,
   SyncConfig,
   SyncSnapshot,
   UpstreamModel,
 } from './types.js'
-
-const ULTRAFAST_FALLBACK_MODEL = 'gpt-6.2-sol'
 
 type RouteOptions = {
   enabled: boolean
@@ -153,19 +152,35 @@ function parseModelOverrides(text: string): Record<string, ModelOverride> {
   return value as Record<string, ModelOverride>
 }
 
-function isUltrafastUnadvertised(model: UpstreamModel | undefined): boolean {
-  return (
-    model?.ultrafastSupported !== false &&
-    (model?.stale === true ||
-      (model?.ultrafastSupported !== true &&
-        !model?.capabilities?.serviceTiers?.some(
-          (tier) => tier.id === 'ultrafast',
-        )))
-  )
+const MANUAL_ULTRAFAST = {
+  id: 'manual-ultrafast',
+  label: 'Ultrafast (manual)',
+  wireValue: 'ultrafast',
+  source: 'user',
+} as const
+
+const MANUAL_SPEED = {
+  defaultServiceTier: 'default',
+  serviceTiers: [
+    {
+      id: 'default',
+      label: 'Standard',
+      wireValue: 'default',
+      source: 'catalog',
+    },
+    MANUAL_ULTRAFAST,
+  ],
+} satisfies SpeedCapability
+
+type SpeedCapability = {
+  defaultServiceTier: ServiceTier
+  serviceTiers: Array<
+    ModelCapabilities['serviceTiers'][number] | typeof MANUAL_ULTRAFAST
+  >
 }
 
 function effectiveSpeed(
-  capability: ModelCapabilities | undefined,
+  capability: SpeedCapability | undefined,
   saved: ServiceTier | undefined,
 ): ServiceTier {
   return saved && capability?.serviceTiers.some((tier) => tier.id === saved)
@@ -173,10 +188,13 @@ function effectiveSpeed(
     : (capability?.defaultServiceTier ?? 'default')
 }
 
-function validSpeedCache(value: unknown): value is Record<string, ServiceTier> {
+function validSpeedCache(
+  value: unknown,
+): value is Record<string, SpeedSelection> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   return Object.entries(value).every(([key, tier]) => {
-    if (!['default', 'fast', 'ultrafast'].includes(tier)) return false
+    if (!['default', 'fast', 'ultrafast', 'manual-ultrafast'].includes(tier))
+      return false
     try {
       const parts: unknown = JSON.parse(key)
       return (
@@ -194,6 +212,7 @@ type SettingsRead = {
   rows: any[]
   descriptor: any
   routes: PluginConfig['routes']
+  manualUltrafast: Record<string, boolean>
   snapshots: Map<string, SyncSnapshot>
   overrides: Map<string, Record<string, ModelOverride>>
   models: WeakMap<object, Map<string, any>>
@@ -203,6 +222,7 @@ type SettingsRead = {
 }
 export type PluginConfig = {
   routes: Record<string, RouteOptions>
+  manualUltrafast?: Record<string, boolean>
   codexCompatibility?: Partial<CodexCompatibilityConfig>
 }
 
@@ -212,6 +232,7 @@ export const Config: z<
   PluginConfig,
   {
     routes: { get(): PluginConfig['routes'] }
+    manualUltrafast: { get(): Record<string, boolean> }
     codexCompatibility: CodexCompatibilityConfig
   }
 > = z
@@ -232,6 +253,7 @@ export const Config: z<
       )
       .default({})
       .volatile(),
+    manualUltrafast: z.dict(z.boolean()).default({}).volatile(),
     codexCompatibility: z
       .object({
         enabled: z.boolean().default(true),
@@ -254,11 +276,15 @@ export const Config: z<
         $value: {
           enabled: 'Enable GPT adaptation',
           allowUnadvertisedUltrafast:
-            'Allow manual Ultrafast selection for GPT-6.2 Sol (requires upstream support)',
+            'Allow manual Ultrafast selection (requires upstream support)',
           refreshIntervalMs: 'Sync interval (milliseconds)',
           capabilityCatalogUrl: 'Capability catalog URL',
           overridesJSON: 'Model capability overrides (JSON)',
         },
+      },
+      manualUltrafast: {
+        $description: 'Manual Ultrafast by Responses provider',
+        $value: 'Allow manual Ultrafast selection (requires upstream support)',
       },
       codexCompatibility: {
         $description: 'Codex compatibility',
@@ -281,12 +307,15 @@ export const Config: z<
         $description: 'GPT 适配路由',
         $value: {
           enabled: '启用 GPT 自动适配',
-          allowUnadvertisedUltrafast:
-            '允许手动选择 GPT-6.2 Sol 的 Ultrafast（需要上游支持）',
+          allowUnadvertisedUltrafast: '允许手动选择 Ultrafast（需要上游支持）',
           refreshIntervalMs: '同步间隔（毫秒）',
           capabilityCatalogUrl: '能力目录 URL',
           overridesJSON: '模型能力覆盖（JSON）',
         },
+      },
+      manualUltrafast: {
+        $description: '按 Responses 提供商启用手动 Ultrafast',
+        $value: '允许手动选择 Ultrafast（需要上游支持）',
       },
       codexCompatibility: {
         $description: 'Codex 兼容',
@@ -315,8 +344,10 @@ type NativeRequest = { reasoningEffort?: string; sessionId?: string }
 export type NativeExtension = {
   model: BaseModelInfo
   preserveReasoning?: boolean
+  tierOnly?: boolean
   prepare(options: NativeRequest): {
     payload: Record<string, unknown>
+    manualUltrafast?: boolean
     observe(event: unknown): void
   }
 }
@@ -340,10 +371,15 @@ export class GptModels extends Service {
   >()
   private readonly snapshots = new Map<string, SyncSnapshot>()
   private readonly publications = new Map<string, Promise<void>>()
-  private speeds = new Map<string, ServiceTier>()
+  private speeds = new Map<string, SpeedSelection>()
+  private readonly manualSpeedEpochs = new Map<string, symbol>()
   private readonly results = new Map<
     string,
-    { requested: string; actual?: string }
+    {
+      provider: string
+      manualUltrafast: boolean
+      tier: { requested: string; actual?: string }
+    }
   >()
   private readonly store = new JsonStorage(
     dshHomePath('storages', 'gpt-adapter'),
@@ -410,10 +446,8 @@ export class GptModels extends Service {
     const loading = this.speedWrites.then(async () => {
       const savedSpeeds = await this.store.read('speeds', validSpeedCache)
       if (this.closed) return
-      for (const [key, value] of Object.entries(savedSpeeds ?? {})) {
-        if (value === 'default' || value === 'fast' || value === 'ultrafast')
-          this.speeds.set(key, value)
-      }
+      for (const [key, value] of Object.entries(savedSpeeds ?? {}))
+        this.speeds.set(key, value)
     })
     this.speedWrites = loading.catch(() => undefined)
     await loading
@@ -515,6 +549,7 @@ export class GptModels extends Service {
       rows,
       descriptor: rows.find((entry) => entry.ns === 'llm-pi-ai'),
       routes: this.options.routes,
+      manualUltrafast: this.options.manualUltrafast ?? {},
       snapshots: new Map(this.snapshots),
       overrides: new Map(),
       models: new WeakMap(),
@@ -540,7 +575,7 @@ export class GptModels extends Service {
     return index
   }
 
-  private builtinModel(read: SettingsRead, provider: string, modelId: string) {
+  private builtinIndex(read: SettingsRead, provider: string) {
     let index = read.builtin.get(provider)
     if (!index) {
       index = new Map(
@@ -548,7 +583,11 @@ export class GptModels extends Service {
       )
       read.builtin.set(provider, index)
     }
-    return index.get(modelId)
+    return index
+  }
+
+  private builtinModel(read: SettingsRead, provider: string, modelId: string) {
+    return this.builtinIndex(read, provider).get(modelId)
   }
 
   private upstreamModel(read: SettingsRead, provider: string, modelId: string) {
@@ -850,23 +889,30 @@ export class GptModels extends Service {
       capabilities,
       contextWindows,
       contextRevision: this.modelsRevision(read),
-      canConfigureUltrafastFallback:
-        !!options?.enabled &&
-        !!profile &&
-        this.canConfigureUltrafastFallback(provider, profile, read),
+      canConfigureUltrafastFallback: this.supportsManualUltrafast(
+        provider,
+        profile,
+        read,
+      ),
       optionsRevision: read.rows.find((row) => row.ns === this.settingsNs)
         ?.revision as number | undefined,
-      options: options ?? {
-        enabled: false,
-        refreshIntervalMs: 1800000,
-        overridesJSON: '{}',
+      options: {
+        ...(options ?? {
+          enabled: false,
+          refreshIntervalMs: 1800000,
+          overridesJSON: '{}',
+        }),
+        allowUnadvertisedUltrafast: this.manualUltrafastConfigured(
+          provider,
+          read,
+        ),
       },
     }
   }
 
   @Remote
   modelStatus(provider: string, modelId: string) {
-    const capability = this.capability(provider, modelId)
+    const capability = this.speedCapability(provider, modelId)
     return {
       enabled: !!capability,
       serviceTiers: capability?.serviceTiers ?? [],
@@ -898,19 +944,74 @@ export class GptModels extends Service {
     )
   }
 
-  private canConfigureUltrafastFallback(
+  private supportsManualUltrafast(
     provider: string,
-    profile: Record<string, any>,
+    profile: { api?: string; models?: readonly { id: string }[] } | undefined,
+    read: SettingsRead,
+    modelId?: string,
+  ): boolean {
+    if (!profile) return false
+    if (profile.api !== undefined) return profile.api === 'openai-responses'
+    // Match the native catalog: an explicit route API wins, followed by the
+    // model's API and then the catalog's single shared API, if it has one.
+    const builtin = this.builtinIndex(read, provider)
+    const protocols = new Set([...builtin.values()].map((model) => model.api))
+    const shared =
+      protocols.size === 1 ? protocols.values().next().value : undefined
+    const usesResponses = (id: string) =>
+      (builtin.get(id)?.api ?? shared) === 'openai-responses'
+    return modelId !== undefined
+      ? usesResponses(modelId)
+      : (profile.models?.length ? profile.models : [...builtin.values()]).some(
+          (model) => usesResponses(model.id),
+        )
+  }
+
+  private manualUltrafastConfigured(
+    provider: string,
     read: SettingsRead,
   ): boolean {
-    const raw = this.upstreamModel(read, provider, ULTRAFAST_FALLBACK_MODEL)
+    // Retain settings saved by older versions that stored this on the GPT route.
     return (
-      (profile.api ?? 'openai-responses') === 'openai-responses' &&
-      (!!raw ||
-        this.modelIndex(read, profile).has(ULTRAFAST_FALLBACK_MODEL) ||
-        !!this.builtinModel(read, provider, ULTRAFAST_FALLBACK_MODEL)) &&
-      isUltrafastUnadvertised(raw)
+      read.manualUltrafast[provider] ??
+      read.routes[provider]?.allowUnadvertisedUltrafast ??
+      false
     )
+  }
+
+  private manualUltrafastEnabled(
+    provider: string,
+    modelId: string,
+    profile: { api?: string; models?: readonly { id: string }[] },
+    read: SettingsRead,
+  ): boolean {
+    return (
+      this.manualUltrafastConfigured(provider, read) &&
+      this.supportsManualUltrafast(provider, profile, read, modelId)
+    )
+  }
+
+  private speedCapability(
+    provider: string,
+    modelId: string,
+    read = this.readSettings(),
+  ): SpeedCapability | undefined {
+    const profile = this.configuredProfiles(read)[provider]
+    if (!profile) return undefined
+    const automatic = this.capability(
+      provider,
+      modelId,
+      undefined,
+      profile,
+      read,
+    )
+    if (!this.manualUltrafastEnabled(provider, modelId, profile, read))
+      return automatic
+    if (!automatic) return MANUAL_SPEED
+    return {
+      ...automatic,
+      serviceTiers: [...automatic.serviceTiers, MANUAL_ULTRAFAST],
+    }
   }
 
   @Remote
@@ -922,11 +1023,9 @@ export class GptModels extends Service {
     await this.queueSpeedWrite(async () => {
       const read = this.readSettings()
       const { profile } = this.profile(provider, read)
-      const options = this.routeOptions(provider, profile, read)
       if (
         typeof enabled !== 'boolean' ||
-        !options?.enabled ||
-        !this.canConfigureUltrafastFallback(provider, profile, read)
+        !this.supportsManualUltrafast(provider, profile, read)
       )
         throw new Error('Ultrafast fallback is unavailable for this provider')
       const descriptor = read.rows.find((entry) => entry.ns === this.settingsNs)
@@ -936,7 +1035,7 @@ export class GptModels extends Service {
       // disable before opening the manual tier again.
       if (
         enabled &&
-        !options.allowUnadvertisedUltrafast &&
+        !this.manualUltrafastConfigured(provider, read) &&
         revision === descriptor.revision
       )
         await this.clearUltrafastFallbackSpeeds(provider)
@@ -945,29 +1044,29 @@ export class GptModels extends Service {
         [
           {
             op: 'set',
-            path: ['routes', provider],
-            value: { ...options, allowUnadvertisedUltrafast: enabled },
+            path: ['manualUltrafast', provider],
+            value: enabled,
           },
         ],
         revision,
       )
-      if (!enabled) await this.clearUltrafastFallbackSpeeds(provider)
+      if (!enabled) {
+        this.manualSpeedEpochs.set(provider, Symbol())
+        for (const [key, result] of this.results) {
+          if (result.provider === provider && result.manualUltrafast)
+            this.results.delete(key)
+        }
+        await this.clearUltrafastFallbackSpeeds(provider)
+      }
     })
   }
 
   private async clearUltrafastFallbackSpeeds(provider: string): Promise<void> {
-    const available = this.capability(provider, ULTRAFAST_FALLBACK_MODEL)
-    if (available?.serviceTiers.some((tier) => tier.id === 'ultrafast')) return
     await this.persistSpeeds((next) => {
       for (const [key, tier] of next) {
-        if (tier !== 'ultrafast') continue
-        const [, savedProvider, modelId] = JSON.parse(key) as [
-          string,
-          string,
-          string,
-        ]
-        if (savedProvider === provider && modelId === ULTRAFAST_FALLBACK_MODEL)
-          next.delete(key)
+        if (tier !== MANUAL_ULTRAFAST.id) continue
+        const [, savedProvider] = JSON.parse(key) as [string, string, string]
+        if (savedProvider === provider) next.delete(key)
       }
     })
   }
@@ -1313,11 +1412,12 @@ export class GptModels extends Service {
     sessionId: SessionId,
     provider: string,
     modelId: string,
-    tier: ServiceTier,
+    tier: SpeedSelection,
   ): Promise<void> {
     const key = JSON.stringify([sessionId, provider, modelId])
     await this.writeSpeeds((next) => {
-      const capability = this.capability(provider, modelId)
+      const read = this.readSettings()
+      const capability = this.speedCapability(provider, modelId, read)
       if (!capability?.serviceTiers.some((choice) => choice.id === tier))
         throw new Error('This speed is unavailable for the selected model')
       next.set(key, tier)
@@ -1325,7 +1425,7 @@ export class GptModels extends Service {
   }
 
   private writeSpeeds(
-    change: (next: Map<string, ServiceTier>) => void,
+    change: (next: Map<string, SpeedSelection>) => void,
   ): Promise<void> {
     return this.queueSpeedWrite(() => this.persistSpeeds(change))
   }
@@ -1337,7 +1437,7 @@ export class GptModels extends Service {
   }
 
   private async persistSpeeds(
-    change: (next: Map<string, ServiceTier>) => void,
+    change: (next: Map<string, SpeedSelection>) => void,
   ): Promise<void> {
     const next = new Map(this.speeds)
     change(next)
@@ -1352,14 +1452,16 @@ export class GptModels extends Service {
 
   @Remote({ resources: { session: (sessionId: SessionId) => sessionId } })
   speed(sessionId: SessionId, provider: string, modelId: string) {
+    const read = this.readSettings()
+    const key = JSON.stringify([sessionId, provider, modelId])
+    const saved = this.speeds.get(key)
+    const capability = this.speedCapability(provider, modelId, read)
     return {
-      selected: effectiveSpeed(
-        this.capability(provider, modelId),
-        this.speeds.get(JSON.stringify([sessionId, provider, modelId])),
-      ),
-      last:
-        this.results.get(JSON.stringify([sessionId, provider, modelId])) ??
-        null,
+      selected:
+        saved && capability?.serviceTiers.some((tier) => tier.id === saved)
+          ? saved
+          : (capability?.defaultServiceTier ?? 'default'),
+      last: capability ? (this.results.get(key)?.tier ?? null) : null,
     }
   }
 
@@ -1413,20 +1515,6 @@ export class GptModels extends Service {
       snapshot?.capabilities[modelId]?.capabilityRevision ?? 'gpt-preset',
       override,
     )
-    if (
-      options.allowUnadvertisedUltrafast &&
-      modelId === ULTRAFAST_FALLBACK_MODEL &&
-      (profile.api ?? 'openai-responses') === 'openai-responses' &&
-      isUltrafastUnadvertised(raw) &&
-      !result.serviceTiers.some((choice) => choice.id === 'ultrafast')
-    ) {
-      result.serviceTiers.push({
-        id: 'ultrafast',
-        label: 'Ultrafast',
-        wireValue: 'ultrafast',
-        source: 'user',
-      })
-    }
     return {
       ...result,
       contextWindow: this.contextWindow(
@@ -1446,7 +1534,6 @@ export class GptModels extends Service {
     base: BaseModelInfo,
     nativeSnapshot?: object,
   ): NativeExtension | undefined {
-    if (!isGptModel({ id: modelId })) return undefined
     let read: SettingsRead
     if (nativeSnapshot && this.nativeRead?.snapshot === nativeSnapshot) {
       read = this.nativeRead.read
@@ -1454,40 +1541,45 @@ export class GptModels extends Service {
       read = this.readSettings()
       if (nativeSnapshot) this.nativeRead = { snapshot: nativeSnapshot, read }
     }
-    const current = this.capability(
+    const profile = this.configuredProfiles(read)[provider]
+    if (!profile) return undefined
+    const current = this.capability(provider, modelId, base.name, profile, read)
+    const manualEnabled = this.manualUltrafastEnabled(
       provider,
       modelId,
-      base.name,
-      undefined,
+      profile,
       read,
     )
-    if (!current) return undefined
-    // The plugin preset also covers configured GPT models missing from the upstream list.
-    const preserveReasoning = current.reasoning.status === 'unknown'
-    const capabilities: ModelCapabilities = structuredClone(current)
+    if (!current && !manualEnabled) return undefined
+    // Outside GPT adaptation, the manual switch only forwards a selected tier.
+    const tierOnly = !current
+    const preserveReasoning = tierOnly || current.reasoning.status === 'unknown'
+    const capabilities = current && structuredClone(current)
     const speeds = this.speeds
-    const { profile } = this.profile(provider, read)
+    const manualEpoch = this.manualSpeedEpochs.get(provider)
     const protocol = (profile.api ?? 'openai-responses') as GptProtocol
-    const model = {
-      ...base,
-      context: {
-        ...((base.context as object) ?? {}),
-        contextWindow: this.contextWindow(
-          provider,
-          modelId,
-          (base.context as { contextWindow?: number } | undefined)
-            ?.contextWindow,
-          undefined,
-          read,
-        ).effectiveTokens,
-      },
-      name:
-        capabilities.displayName === modelId
-          ? base.name
-          : capabilities.displayName,
-    }
+    const model = capabilities
+      ? {
+          ...base,
+          context: {
+            ...((base.context as object) ?? {}),
+            contextWindow: this.contextWindow(
+              provider,
+              modelId,
+              (base.context as { contextWindow?: number } | undefined)
+                ?.contextWindow,
+              undefined,
+              read,
+            ).effectiveTokens,
+          },
+          name:
+            capabilities.displayName === modelId
+              ? base.name
+              : capabilities.displayName,
+        }
+      : base
     if (!preserveReasoning) delete model.reasoning
-    if (!preserveReasoning && capabilities.reasoning.choices.length)
+    if (!preserveReasoning && capabilities?.reasoning.choices.length)
       model.reasoning = {
         efforts: capabilities.reasoning.choices.map((choice) => ({
           id: choice.id,
@@ -1497,28 +1589,51 @@ export class GptModels extends Service {
           ? { defaultEffort: capabilities.reasoning.defaultId }
           : {}),
       }
-    const bridge = createRequestBridge({
-      currentSnapshot: () => undefined,
-      resolveCapabilities: () => capabilities,
-    })
+    const bridge =
+      capabilities &&
+      createRequestBridge({
+        currentSnapshot: () => undefined,
+        resolveCapabilities: () => capabilities,
+      })
     return {
       model,
       preserveReasoning,
+      tierOnly,
       prepare: (options) => {
         const key = JSON.stringify([options.sessionId ?? '', provider, modelId])
-        const payload = bridge.prepare({
-          modelId,
-          protocol,
-          ...(preserveReasoning
-            ? { reasoningId: null }
-            : options.reasoningEffort
-              ? { reasoningId: options.reasoningEffort }
-              : {}),
-          serviceTier: effectiveSpeed(capabilities, speeds.get(key)),
-        })
-        const result: { requested: string; actual?: string } = {
+        const saved = speeds.get(key)
+        // Plain 'ultrafast' records are ambiguous: use them only as an
+        // automatic choice, never as permission to send a manual tier.
+        const manualPermissionCurrent =
+          manualEpoch === this.manualSpeedEpochs.get(provider)
+        const manualUltrafast =
+          manualEnabled &&
+          manualPermissionCurrent &&
+          saved === MANUAL_ULTRAFAST.id
+        if (!bridge && !manualUltrafast) {
+          if (manualPermissionCurrent) this.results.delete(key)
+          return { payload: {}, observe() {} }
+        }
+        const payload: Record<string, unknown> = bridge
+          ? bridge.prepare({
+              modelId,
+              protocol,
+              ...(preserveReasoning
+                ? { reasoningId: null }
+                : options.reasoningEffort
+                  ? { reasoningId: options.reasoningEffort }
+                  : {}),
+              serviceTier: effectiveSpeed(
+                capabilities,
+                saved === 'manual-ultrafast' ? undefined : saved,
+              ),
+            })
+          : {}
+        if (manualUltrafast) payload.service_tier = MANUAL_ULTRAFAST.wireValue
+        const tier: { requested: string; actual?: string } = {
           requested: String(payload.service_tier ?? 'default'),
         }
+        const result = { provider, manualUltrafast, tier }
         if (!this.closed) {
           this.results.delete(key)
           this.results.set(key, result)
@@ -1527,6 +1642,7 @@ export class GptModels extends Service {
         }
         return {
           payload,
+          manualUltrafast,
           observe: (event: unknown) => {
             const response =
               (
@@ -1540,7 +1656,7 @@ export class GptModels extends Service {
               this.results.get(key) === result &&
               typeof response?.service_tier === 'string'
             )
-              result.actual = response.service_tier
+              tier.actual = response.service_tier
           },
         }
       },
@@ -1577,6 +1693,9 @@ export async function apply(
     {
       get routes() {
         return config.routes.get() as PluginConfig['routes']
+      },
+      get manualUltrafast() {
+        return config.manualUltrafast.get()
       },
     },
     ctx.fiber.entry?.options.id ?? name,

@@ -12,7 +12,7 @@ A third-party plugin for DeepSeek Harness (DSH) that adapts GPT models and reuse
 - Discover upstream models automatically and manage them on the native Models page.
 - Choose from six GPT reasoning levels: `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
 - Set per-model context windows with Default, 516K, 1M, or Custom.
-- Select Standard or Fast in the chat toolbar, or Ultrafast when advertised or enabled in the provider settings.
+- Select Standard or Fast in the chat toolbar, automatic Ultrafast when advertised, or the separate Ultrafast (manual) option when enabled in the provider settings.
 - Reuse Codex instruction files, local and plugin skills, and MCP servers.
 - Apply trusted project configuration to the corresponding Agent session.
 
@@ -27,7 +27,7 @@ Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`,
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.11
+dsh plugin --profile web add dsh-gpt-adapter@0.2.12
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.11.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.12.tgz
 ```
 
 ## Using GPT models
@@ -49,9 +49,11 @@ dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.11.tgz
 2. Check **GPT auto-adaptation** on the provider card. Eligible GPT providers are detected automatically; the switch lets you enable or disable adaptation.
 3. Select the model and reasoning level in the conversation. Use the speed menu in the chat toolbar to choose Standard or Fast.
 
-Fast requests the upstream priority tier. When the upstream model list advertises Ultrafast, it appears in the speed menu automatically. If the list does not say whether GPT-6.2 Sol supports it, enable **Allow manual Ultrafast for GPT-6.2 Sol** on the Responses provider card, then select **Ultrafast** in the chat toolbar. The switch is off by default and does not grant access: the upstream and your account must already support it. Selecting Ultrafast sends `service_tier: "ultrafast"`. Speed selections are saved per session.
+Fast requests the upstream priority tier. Upstream model metadata controls automatic Ultrafast availability. **Allow manual Ultrafast** is a separate Responses provider setting, independent of model and subscription plan. It is off by default; turning it on only exposes manual selection in the chat toolbar and does not change the current speed or grant access. Select **Ultrafast (manual)** to send `service_tier: "ultrafast"`; this separate option can coexist with automatic Ultrafast and does not replace its label or configured wire value (including legacy `priority` mappings). The plugin passes the manual protocol parameter through, and whether it is accepted depends on the upstream and your account. Speed selections are saved per session.
 
-Use **Sync now** on the provider card to refresh the model list. Models no longer listed upstream are retained until you choose to remove them. You can also configure the sync interval, an optional capability catalog URL, and model capability overrides on that card. Explicit overrides take precedence over upstream metadata, external catalogs, and presets, except that an upstream Ultrafast denial cannot be overridden.
+**Upgrading from v0.2.11:** Older sessions saved automatic and manual Ultrafast under the same identifier. To avoid sending the manual tier unintentionally, the plugin does not restore that identifier as a manual selection. If you previously selected Ultrafast manually, choose **Ultrafast (manual)** again after upgrading.
+
+Use **Sync now** on the provider card to refresh the model list. Models no longer listed upstream are retained until you choose to remove them. You can also configure the sync interval, an optional capability catalog URL, and model capability overrides on that card. Explicit capability overrides take precedence over upstream metadata, external catalogs, and presets, except that an upstream Ultrafast denial is retained for automatic capability resolution. The separate manual-selection switch does not assert upstream support.
 
 ### Context windows
 

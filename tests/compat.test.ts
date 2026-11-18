@@ -9,6 +9,8 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Config, type GptModels } from '../src/host.js'
+import { installNativeAdapterBridge } from '../src/native-adapter.js'
+import { JsonStorage } from '../src/storage.js'
 
 const cleanup: Array<() => Promise<unknown>> = []
 afterEach(async () => {
@@ -106,8 +108,117 @@ function streamResponse(protocol: string, serviceTier = 'priority') {
   )
 }
 
+describe('native SDK protocol boundary', () => {
+  it.each(['anthropic-messages', 'openai-completions'])(
+    'leaves tier-only %s calls entirely native',
+    async (api) => {
+      const model = { api }
+      const settings = {
+        serviceTier: 'native-tier',
+        signal: new AbortController().signal,
+      }
+      const send = vi.fn(async function* (
+        _model: any,
+        _context: any,
+        _settings: any,
+      ) {})
+      const prepare = vi.fn(() => ({
+        payload: { service_tier: 'ultrafast' },
+        manualUltrafast: true,
+        observe() {},
+      }))
+      const snapshot = {
+        profiles: new Map([['fixture', {}]]),
+        models: { stream: send, streamSimple: send },
+      }
+      const adapter = {
+        current: () => snapshot,
+        modelInfo: () => model,
+        streamWithSnapshot(_options: any, current: typeof snapshot) {
+          return current.models.streamSimple(model, {}, settings)
+        },
+        async prepareCall() {},
+        async *stream(_options: any) {},
+      }
+      const dispose = installNativeAdapterBridge(adapter, () => ({
+        model: { provider: 'fixture', id: 'alias', name: 'Alias' },
+        tierOnly: true,
+        preserveReasoning: true,
+        prepare,
+      }))
+      try {
+        for await (const _chunk of adapter.stream({ provider: 'fixture' })) {
+        }
+        expect(prepare).not.toHaveBeenCalled()
+        expect(send).toHaveBeenCalledExactlyOnceWith(model, {}, settings)
+        expect(send.mock.calls[0]![2]).toBe(settings)
+      } finally {
+        dispose()
+      }
+    },
+  )
+
+  it.each([
+    { preserveReasoning: false, manualUltrafast: true },
+    { preserveReasoning: true, manualUltrafast: true },
+    { preserveReasoning: false, manualUltrafast: false },
+    { preserveReasoning: true, manualUltrafast: false },
+  ])(
+    'filters only manual tiers on adapted non-Responses calls: %j',
+    async ({ preserveReasoning, manualUltrafast }) => {
+      for (const nativeTier of [undefined, 'native-tier']) {
+        const model = { api: 'anthropic-messages' }
+        const settings = { serviceTier: nativeTier }
+        const body = nativeTier ? { service_tier: nativeTier } : {}
+        const payload = { service_tier: 'ultrafast' }
+        let sent: Record<string, unknown> | undefined
+        let sentSettings: Record<string, unknown> | undefined
+        async function* send(_model: any, _context: any, next: any) {
+          sentSettings = next
+          sent = next.onPayload(body)
+        }
+        const snapshot = {
+          profiles: new Map([['fixture', {}]]),
+          models: { stream: send, streamSimple: send },
+        }
+        const adapter = {
+          current: () => snapshot,
+          modelInfo: () => model,
+          streamWithSnapshot(_options: any, current: typeof snapshot) {
+            return current.models.streamSimple(model, {}, settings)
+          },
+          async prepareCall() {},
+          async *stream(_options: any) {},
+        }
+        const dispose = installNativeAdapterBridge(adapter, () => ({
+          model: { provider: 'fixture', id: 'gpt-alias', name: 'GPT alias' },
+          preserveReasoning,
+          prepare: () => ({ payload, manualUltrafast, observe() {} }),
+        }))
+        try {
+          for await (const _chunk of adapter.stream({ provider: 'fixture' })) {
+          }
+          const expectedTier = manualUltrafast ? nativeTier : 'ultrafast'
+          expect(sentSettings!.serviceTier).toBe(expectedTier)
+          expect(sent!.service_tier).toBe(expectedTier)
+          if (expectedTier === undefined)
+            expect(sent).not.toHaveProperty('service_tier')
+          expect(payload.service_tier).toBe('ultrafast')
+          expect(body).toEqual(nativeTier ? { service_tier: nativeTier } : {})
+        } finally {
+          dispose()
+        }
+      }
+    },
+  )
+})
+
 describe('built plugin and official transport integration', () => {
-  it.each(['structured metadata', 'initial route opt-in'] as const)(
+  it.each([
+    'structured metadata',
+    'initial route opt-in',
+    'manual tier only',
+  ] as const)(
     'sends Ultrafast only when selected through native Responses with %s',
     async (source) => {
       const native = await import('@deepseek-ai/dsh-llm-pi-ai')
@@ -116,10 +227,11 @@ describe('built plugin and official transport integration', () => {
       vi.stubEnv('DSH_HOME', directory)
       const ctx = new Context()
       cleanup.push(() => ctx.fiber.dispose())
-      const modelId = 'gpt-6.2-sol'
+      const tierOnly = source === 'manual tier only'
+      const modelId = tierOnly ? 'gateway-model-v2' : 'gpt-6.2-astra'
       const profile = {
         api: 'openai-responses' as const,
-        reasoning: 'high' as const,
+        ...(tierOnly ? {} : { reasoning: 'high' as const }),
         baseURL: 'https://fixture.invalid/v1',
         apiKeyEnv: 'TEST_API_KEY',
         models: [{ id: modelId }],
@@ -194,19 +306,17 @@ describe('built plugin and official transport integration', () => {
           codexCompatibility: { enabled: false },
           routes: {
             fixture: {
-              enabled: true,
+              enabled: !tierOnly,
               refreshIntervalMs: 1800000,
               overridesJSON: '{}',
-              allowUnadvertisedUltrafast: source === 'initial route opt-in',
+              allowUnadvertisedUltrafast: source !== 'structured metadata',
             },
           },
         }),
       )
       const service = ctx.get('gptModels') as GptModels
-      await service.refresh('fixture')
-      expect(service.status('fixture').canConfigureUltrafastFallback).toBe(
-        source === 'initial route opt-in',
-      )
+      if (!tierOnly) await service.refresh('fixture')
+      expect(service.status('fixture').canConfigureUltrafastFallback).toBe(true)
       native.apply(ctx, native.Config({ providers: { fixture: profile } }))
       expect(adapter).toBeDefined()
       const sessionId = 'ultrafast-session' as SessionId
@@ -216,7 +326,7 @@ describe('built plugin and official transport integration', () => {
           provider: 'fixture',
           model: modelId,
           sessionId,
-          reasoningEffort: ReasoningEffortId('high'),
+          ...(tierOnly ? {} : { reasoningEffort: ReasoningEffortId('high') }),
           messages: [
             { role: 'user', content: [{ type: 'text', text: 'hello' }] },
           ],
@@ -227,10 +337,41 @@ describe('built plugin and official transport integration', () => {
         'default',
       )
       await send()
+      if (tierOnly) {
+        const standard = requests.at(-1)!
+        expect(standard.service_tier).not.toBe('ultrafast')
+        expect(service.status('fixture').enabled).toBe(false)
+        await service.setSpeed(
+          sessionId,
+          'fixture',
+          modelId,
+          'manual-ultrafast',
+        )
+        await send()
+        const { service_tier, ...manualBody } = requests.at(-1)!
+        const { service_tier: _, ...standardBody } = standard
+        expect(service_tier).toBe('ultrafast')
+        expect(manualBody).toEqual(standardBody)
+        expect(service.speed(sessionId, 'fixture', modelId).last).toEqual({
+          requested: 'ultrafast',
+          actual: 'ultrafast',
+        })
+        await service.setSpeed(sessionId, 'fixture', modelId, 'default')
+        await send()
+        expect(requests.at(-1)).toEqual(standard)
+        expect(service.speed(sessionId, 'fixture', modelId)).toEqual({
+          selected: 'default',
+          last: null,
+        })
+        return
+      }
       expect(requests.at(-1)!.service_tier).toBe('default')
       for (const [speed, wireValue] of [
         ['fast', 'priority'],
-        ['ultrafast', 'ultrafast'],
+        [
+          source === 'structured metadata' ? 'ultrafast' : 'manual-ultrafast',
+          'ultrafast',
+        ],
         ['default', 'default'],
       ] as const) {
         await service.setSpeed(sessionId, 'fixture', modelId, speed)
@@ -250,6 +391,126 @@ describe('built plugin and official transport integration', () => {
         'ultrafast',
         'default',
       ])
+    },
+  )
+  it.each([false, true])(
+    'never sends a saved manual Ultrafast tier to implicit Anthropic (route enabled=%s)',
+    async (enabled) => {
+      const native = await import('@deepseek-ai/dsh-llm-pi-ai')
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-gpt-anthropic-test-'))
+      cleanup.push(() => rm(directory, { recursive: true, force: true }))
+      vi.stubEnv('DSH_HOME', directory)
+      const sessionId = 'anthropic-session' as SessionId
+      const modelId = 'claude-haiku-4-5'
+      // Reproduce a previously saved selection without going through today's
+      // protocol validation (e.g. after changing a provider's protocol).
+      await new JsonStorage(join(directory, 'storages', 'gpt-adapter')).write(
+        'speeds',
+        {
+          [JSON.stringify([sessionId, 'anthropic', modelId])]:
+            'manual-ultrafast',
+        },
+      )
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      const profile = {
+        // Deliberately omit api: the native built-in model resolves Anthropic.
+        baseURL: 'https://fixture.invalid',
+        apiKeyEnv: 'TEST_API_KEY',
+        models: [{ id: modelId }],
+      }
+      ctx.provide('settings', {
+        configure: () => () => {},
+        describe: () => [
+          {
+            ns: 'llm-pi-ai',
+            value: { providers: { anthropic: profile } },
+            revision: 1,
+          },
+        ],
+        mutate: vi.fn(async () => {}),
+      })
+      ctx.provide('credentials', {
+        resolve: async () => ({ value: 'fixture-key' }),
+      })
+      let adapter: LlmAdapter | undefined
+      ctx.provide('llm', {
+        listConfigurableProviders: () => [],
+        registerAdapter: (_providers: unknown, value: LlmAdapter) => {
+          adapter = value
+          return Object.assign(() => {}, { replace() {} })
+        },
+        registerConfigurableProviders: () =>
+          Object.assign(() => {}, { replace() {} }),
+        registerModelDiscovery: () => () => {},
+      })
+      const requests: Array<Record<string, unknown>> = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          const endpoint = new URL(String(url))
+          expect(endpoint.origin).toBe('https://fixture.invalid')
+          if (endpoint.pathname === '/models')
+            return Response.json({ data: [] })
+          expect(endpoint.pathname).toBe('/v1/messages')
+          requests.push(JSON.parse(String(init!.body)))
+          return Response.json(
+            {
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                message: 'Fixture captured the request',
+              },
+            },
+            { status: 400 },
+          )
+        }),
+      )
+      const plugin = await import('../lib/index.js')
+      await plugin.apply(
+        ctx,
+        Config({
+          codexCompatibility: { enabled: false },
+          routes: {
+            anthropic: {
+              enabled,
+              refreshIntervalMs: 1800000,
+              overridesJSON: '{}',
+              allowUnadvertisedUltrafast: true,
+            },
+          },
+        }),
+      )
+      const service = ctx.get('gptModels') as GptModels
+      expect(service.status('anthropic').canConfigureUltrafastFallback).toBe(
+        false,
+      )
+      await expect(
+        service.setUltrafastFallback('anthropic', true),
+      ).rejects.toThrow('Ultrafast fallback is unavailable')
+      await expect(
+        service.setSpeed(sessionId, 'anthropic', modelId, 'manual-ultrafast'),
+      ).rejects.toThrow('This speed is unavailable')
+      native.apply(ctx, native.Config({ providers: { anthropic: profile } }))
+      expect(adapter).toBeDefined()
+      const call = await adapter!.prepareCall('anthropic', modelId)
+      const chunks = []
+      for await (const chunk of call.stream({
+        provider: 'anthropic',
+        model: modelId,
+        sessionId,
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      }))
+        chunks.push(chunk)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toMatchObject({ model: modelId, stream: true })
+      expect(requests[0]).not.toHaveProperty('service_tier')
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'finish',
+        reason: { kind: 'error' },
+      })
     },
   )
   it('records all supported runtimes and verifies the installed native source', async () => {

@@ -23,7 +23,7 @@ import type {
   PropsLocale,
 } from '@deepseek-ai/dsh-client-ui-slots'
 import type { GptModels } from '../host.js'
-import type { ServiceTier } from '../types.js'
+import type { SpeedSelection } from '../types.js'
 import type { ClientContext } from './compat-slots.js'
 import type {
   ModelDirectoryState,
@@ -235,6 +235,11 @@ export function apply(ctx: Context): void {
     }, [method, key, enabled, intervalMs])
     return {
       value: value?.key === key ? value.value : undefined,
+      replaceValue: (update: (current: T | undefined) => T) =>
+        setValue((previous) => ({
+          key,
+          value: update(previous?.key === key ? previous.value : undefined),
+        })),
       error,
       refresh: () => controls.current?.invalidate(),
       pause: () => controls.current?.pause(),
@@ -476,6 +481,30 @@ export function apply(ctx: Context): void {
             />
           </div>
         </div>
+        {value?.canConfigureUltrafastFallback && (
+          <div className={styles.customizedBody}>
+            <div className={styles.rowHead}>
+              <span className={styles.rowName}>{t('manualUltrafast')}</span>
+              <Switch
+                label={t('manualUltrafast')}
+                checked={value.options.allowUnadvertisedUltrafast ?? false}
+                disabled={!configured || busy}
+                onChange={(enabled) => {
+                  void act(
+                    'setUltrafastFallback',
+                    {
+                      provider: provider.provider,
+                      enabled,
+                      expectedRevision: value.optionsRevision,
+                    },
+                    true,
+                  )
+                }}
+              />
+            </div>
+            <p className={styles.advancedHint}>{t('manualUltrafastHint')}</p>
+          </div>
+        )}
         {value?.enabled && (
           <div className={styles.customizedBody}>
             <p className={styles.advancedHint} role="status">
@@ -498,32 +527,6 @@ export function apply(ctx: Context): void {
                 >
                   {t('removeStale', { count: stale })}
                 </Button>
-              </div>
-            )}
-            {value.canConfigureUltrafastFallback && (
-              <div>
-                <div className={styles.rowHead}>
-                  <span className={styles.rowName}>{t('manualUltrafast')}</span>
-                  <Switch
-                    label={t('manualUltrafast')}
-                    checked={value.options.allowUnadvertisedUltrafast ?? false}
-                    disabled={!configured || busy}
-                    onChange={(enabled) => {
-                      void act(
-                        'setUltrafastFallback',
-                        {
-                          provider: provider.provider,
-                          enabled,
-                          expectedRevision: value.optionsRevision,
-                        },
-                        true,
-                      )
-                    }}
-                  />
-                </div>
-                <p className={styles.advancedHint}>
-                  {t('manualUltrafastHint')}
-                </p>
               </div>
             )}
             <p className={styles.advancedHint}>{t('contextHint')}</p>
@@ -586,13 +589,17 @@ export function apply(ctx: Context): void {
     }, [sessionId, provider, modelId])
     const capability = metadata.value?.enabled ? metadata.value : undefined
     if (!capability) return null
-    async function select(tier: ServiceTier) {
+    async function select(tier: SpeedSelection) {
       const sequence = ++action.current
       setBusy(true)
       speedQuery.pause()
       try {
         await call('setSpeed', { sessionId, provider, modelId, tier })
         if (sequence !== action.current) return
+        speedQuery.replaceValue((current) => ({
+          selected: tier,
+          last: current?.last ?? null,
+        }))
         setError('')
         setOpen(false)
       } catch (failure) {
@@ -609,9 +616,12 @@ export function apply(ctx: Context): void {
         }
       }
     }
-    const label =
-      capability.serviceTiers.find((tier) => tier.id === speed.selected)
-        ?.label ?? 'Standard'
+    const choiceLabel = (tier: { id: SpeedSelection; label: string }) =>
+      tier.id === 'manual-ultrafast' ? t('manualUltrafastChoice') : tier.label
+    const selectedChoice = capability.serviceTiers.find(
+      (tier) => tier.id === speed.selected,
+    )
+    const label = selectedChoice ? choiceLabel(selectedChoice) : 'Standard'
     return (
       <>
         <Menu
@@ -622,12 +632,12 @@ export function apply(ctx: Context): void {
           selectedId={speed.selected}
           items={capability.serviceTiers.map((tier) => ({
             id: tier.id,
-            label: tier.label,
+            label: choiceLabel(tier),
             disabled: busy,
           }))}
           onClose={() => setOpen(false)}
           onSelect={(tier) => {
-            void select(tier as ServiceTier)
+            void select(tier as SpeedSelection)
           }}
           anchor={
             <Button
