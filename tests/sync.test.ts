@@ -17,6 +17,103 @@ function response(body: unknown, init: ResponseInit = {}): Response {
 }
 
 describe('upstream model synchronization', () => {
+  it('re-fetches a legacy cache and removes advertised Ultrafast if a fresh list omits tier metadata', async () => {
+    const config = {
+      baseUrl: 'https://fixture.invalid',
+      apiKey: 'fixture',
+      cacheIdentity: 'fixture',
+      refreshIntervalMs: 1000,
+    }
+    const id = 'gpt-6.2-sol'
+    const old = (
+      await synchronize(config, undefined, async () =>
+        response({ data: [{ id }] }, { headers: { etag: 'v1' } }),
+      )
+    ).snapshot
+    delete old.tierMetadataVersion
+    const restored = restoreSnapshot(config, old)!
+    expect(restored.etag).toBeUndefined()
+    const advertised = (
+      await synchronize(config, restored, async (_url, init) => {
+        expect(new Headers(init?.headers).has('if-none-match')).toBe(false)
+        return response(
+          {
+            data: [
+              {
+                id,
+                capabilities: {
+                  service_tiers: [
+                    { id: 'default', name: 'Standard' },
+                    { id: 'priority', name: 'Fast' },
+                    { id: 'ultrafast', name: 'Ultrafast' },
+                  ],
+                },
+              },
+            ],
+          },
+          { headers: { etag: 'v1' } },
+        )
+      })
+    ).snapshot
+    expect(advertised.models[0]?.ultrafastSupported).toBe(true)
+    expect(
+      advertised.capabilities[id]!.serviceTiers.map((tier) => tier.id),
+    ).toEqual(['default', 'fast', 'ultrafast'])
+    const { snapshot: latest } = await synchronize(
+      config,
+      advertised,
+      async (_url, init) => {
+        expect(new Headers(init?.headers).get('if-none-match')).toBe('v1')
+        return response({ data: [{ id }] })
+      },
+    )
+    expect(latest.models[0]?.ultrafastSupported).toBeUndefined()
+    expect(
+      latest.capabilities[id]!.serviceTiers.map((tier) => tier.id),
+    ).toEqual(['default', 'fast'])
+  })
+
+  it('ignores unusable structured tier entries without losing recognized tiers or other models', async () => {
+    const id = 'gpt-6.2-sol'
+    const unrelated = 'gpt-other'
+    const { snapshot } = await synchronize(
+      {
+        baseUrl: 'https://fixture.invalid',
+        apiKey: 'fixture',
+        cacheIdentity: 'fixture',
+        refreshIntervalMs: 1000,
+      },
+      undefined,
+      async () =>
+        response({
+          data: [
+            {
+              id,
+              service_tiers: [
+                { id: 'priority' },
+                { id: 'ultrafast' },
+                { id: 'flex' },
+                { name: 'Incomplete tier' },
+                null,
+              ],
+            },
+            { id: unrelated, service_tiers: [{ id: 'flex' }] },
+          ],
+        }),
+    )
+    expect(snapshot.models.map((model) => model.id)).toEqual([id, unrelated])
+    expect(snapshot.models[0]?.ultrafastSupported).toBe(true)
+    expect(snapshot.models[1]?.ultrafastSupported).toBeUndefined()
+    expect(
+      snapshot.capabilities[id]!.serviceTiers.map((tier) => tier.wireValue),
+    ).toEqual(['default', 'priority', 'ultrafast'])
+    expect(
+      snapshot.capabilities[unrelated]!.serviceTiers.map(
+        (tier) => tier.wireValue,
+      ),
+    ).toEqual(['default', 'priority'])
+  })
+
   it.each(['', ' \t'])(
     'uses the model ID for an empty upstream name (%j)',
     async (displayName) => {

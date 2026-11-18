@@ -56,6 +56,8 @@ export type UpstreamModel = {
   ownedBy?: string
   shutdownDate?: string | null
   stale?: boolean
+  /** Advertised Ultrafast support; false only for explicit upstream denial. */
+  ultrafastSupported?: boolean
   capabilities?: CapabilityHints
 }
 
@@ -96,6 +98,8 @@ export type SyncSnapshot = {
   /** Fingerprint of the input settings used to generate this snapshot. */
   configKey?: string
   etag?: string
+  /** Version of the parser that produced the cached upstream tier metadata. */
+  tierMetadataVersion?: number
   catalog?: CapabilityCatalog
   /** Source URL of a fetched catalog; absent for inline or legacy catalogs. */
   capabilityCatalogUrl?: string

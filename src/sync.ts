@@ -15,6 +15,7 @@ import type {
 } from './types.js'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+const TIER_METADATA_VERSION = 1
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
@@ -141,6 +142,8 @@ function validCachedModels(value: unknown): boolean {
           (typeof model.displayName === 'string' &&
             model.displayName.trim().length > 0)) &&
         (model.stale === undefined || typeof model.stale === 'boolean') &&
+        (model.ultrafastSupported === undefined ||
+          typeof model.ultrafastSupported === 'boolean') &&
         (model.capabilities === undefined ||
           validCachedHints(model.capabilities))
       )
@@ -209,9 +212,33 @@ function serviceTier(value: string): ServiceTier | undefined {
     : undefined
 }
 
-function serviceTierChoices(value: unknown): ServiceTierChoice[] | undefined {
-  const values = stringArray(value)
-  if (!values) return undefined
+function structuredServiceTierIds(entries: unknown[]): string[] | undefined {
+  const ids = entries.flatMap((entry) => {
+    const id = typeof entry === 'string' ? entry : record(entry)?.id
+    return typeof id === 'string' && serviceTier(id) ? [id] : []
+  })
+  // A supplemental list with no recognized entries supplies no tier hints.
+  return ids.length ? ids : undefined
+}
+
+function serviceTierMetadata(sources: Record<string, unknown>[]) {
+  const rawTiers = firstDefined(sources, [
+    'service_tiers',
+    'supported_service_tiers',
+  ])
+  const structured =
+    Array.isArray(rawTiers) && rawTiers.some((tier) => record(tier))
+  return {
+    ids: structured
+      ? structuredServiceTierIds(rawTiers)
+      : stringArray(rawTiers),
+    structured,
+    supportsFast: firstDefined(sources, ['supports_fast']),
+    supportsUltrafast: firstDefined(sources, ['supports_ultrafast']),
+  }
+}
+
+function serviceTierChoices(values: string[]): ServiceTierChoice[] {
   const seen = new Set<ServiceTier>()
   return values.flatMap((value) => {
     const id = serviceTier(value)
@@ -231,12 +258,18 @@ function serviceTierChoices(value: unknown): ServiceTierChoice[] | undefined {
   })
 }
 
-function parseCapabilityHints(
-  row: Record<string, unknown>,
-  modelId: string,
-): CapabilityHints | undefined {
+function sourcesFor(row: Record<string, unknown>): Record<string, unknown>[] {
   const nested = record(row.capabilities)
-  const sources = nested ? [row, nested] : [row]
+  return nested ? [row, nested] : [row]
+}
+
+function parseCapabilityHints(
+  sources: Record<string, unknown>[],
+  modelId: string,
+  { ids, structured, supportsFast, supportsUltrafast } = serviceTierMetadata(
+    sources,
+  ),
+): CapabilityHints | undefined {
   const rawReasoning = firstDefined(sources, [
     'reasoning_supported_efforts',
     'supported_reasoning_efforts',
@@ -268,21 +301,28 @@ function parseCapabilityHints(
     'supports_reasoning',
     'reasoning_supported',
   ])
-  const rawServiceTiers = firstDefined(sources, [
-    'service_tiers',
-    'supported_service_tiers',
-  ])
-  let tiers =
-    serviceTierChoices(rawServiceTiers) ??
-    resolveCapabilities({ id: modelId }, 'gpt-preset').serviceTiers
-  const supportsFast = firstDefined(sources, ['supports_fast'])
-  const supportsUltrafast = firstDefined(sources, ['supports_ultrafast'])
+  let tiers = ids
+    ? serviceTierChoices(ids)
+    : resolveCapabilities({ id: modelId }, 'gpt-preset').serviceTiers
+  // Codex-style structured lists can contain only the additional tiers.
+  // Standard is still selectable and remains the default unless specified.
+  if (
+    structured &&
+    tiers.length &&
+    !tiers.some((tier) => tier.id === 'default')
+  )
+    tiers.unshift({
+      id: 'default',
+      label: 'Standard',
+      wireValue: 'default',
+      source: 'catalog',
+    })
   const rawDefaultTier = firstDefined(sources, [
     'default_service_tier',
     'service_tier',
   ])
   const hasTierSignal =
-    rawServiceTiers !== undefined ||
+    ids !== undefined ||
     typeof supportsFast === 'boolean' ||
     typeof supportsUltrafast === 'boolean'
   if (supportsFast === false) tiers = tiers.filter((tier) => tier.id !== 'fast')
@@ -350,7 +390,16 @@ function parseModelList(payload: unknown): UpstreamModel[] {
     if (!candidate || typeof candidate !== 'object') return []
     const row = candidate as Record<string, unknown>
     if (typeof row.id !== 'string' || row.id.length === 0) return []
-    const capabilities = parseCapabilityHints(row, row.id)
+    const sources = sourcesFor(row)
+    const tierMetadata = serviceTierMetadata(sources)
+    const capabilities = parseCapabilityHints(sources, row.id, tierMetadata)
+    // A list can be partial. Only an explicit flag establishes a denial.
+    const ultrafastSupported =
+      typeof tierMetadata.supportsUltrafast === 'boolean'
+        ? tierMetadata.supportsUltrafast
+        : tierMetadata.ids?.includes('ultrafast')
+          ? true
+          : undefined
     return [
       {
         id: row.id,
@@ -363,6 +412,7 @@ function parseModelList(payload: unknown): UpstreamModel[] {
           ? { shutdownDate: row.shutdown_date }
           : {}),
         ...(capabilities ? { capabilities } : {}),
+        ...(ultrafastSupported === undefined ? {} : { ultrafastSupported }),
       },
     ]
   })
@@ -412,6 +462,21 @@ function mergeModels(
         }
       : { ...model }
     delete merged.stale
+    if (model.ultrafastSupported === undefined) delete merged.ultrafastSupported
+    // A successful fresh listing is authoritative for Ultrafast. Do not
+    // inherit it from a previous listing that supplied more tier metadata.
+    const tiers = merged.capabilities?.serviceTiers
+    if (
+      tiers?.some((tier) => tier.id === 'ultrafast') &&
+      !model.capabilities?.serviceTiers?.some((tier) => tier.id === 'ultrafast')
+    ) {
+      const hints = merged.capabilities!
+      const remaining = tiers.filter((tier) => tier.id !== 'ultrafast')
+      if (remaining.length) hints.serviceTiers = remaining
+      else delete hints.serviceTiers
+      if (hints.defaultServiceTier === 'ultrafast')
+        delete hints.defaultServiceTier
+    }
     return merged
   })
   if (!previous) return current.filter(includeModel ?? isGptModel)
@@ -604,7 +669,12 @@ export function restoreSnapshot(
   next.source = 'cache'
   next.configKey = syncConfigKey(config)
   next.fetchedAt = cached.fetchedAt
-  if (cached.etag !== undefined) next.etag = cached.etag
+  // Older parsers dropped structured service tiers. Re-fetch once rather
+  // than reusing an ETag whose cached payload lost that information.
+  if (cached.tierMetadataVersion === TIER_METADATA_VERSION) {
+    next.tierMetadataVersion = TIER_METADATA_VERSION
+    if (cached.etag !== undefined) next.etag = cached.etag
+  }
   if (cached.upstreamModels !== undefined)
     next.upstreamModels = cached.upstreamModels
   if (catalog && !config.catalog && config.capabilityCatalogUrl)
@@ -621,7 +691,11 @@ export async function synchronize(
   const currentCacheKey = syncCacheKey(config)
   const currentConfigKey = syncConfigKey(config)
   const reusable = previous?.cacheKey === currentCacheKey ? previous : undefined
-  const result = await fetchModels(config, fetchImpl, signal, reusable?.etag)
+  const etag =
+    reusable?.tierMetadataVersion === TIER_METADATA_VERSION
+      ? reusable.etag
+      : undefined
+  const result = await fetchModels(config, fetchImpl, signal, etag)
   const catalog =
     config.catalog ??
     (config.capabilityCatalogUrl
@@ -645,7 +719,9 @@ export async function synchronize(
       reusable,
       currentCacheKey,
     )
-    if (reusable.etag !== undefined) next.etag = reusable.etag
+    if (reusable.tierMetadataVersion === TIER_METADATA_VERSION)
+      next.tierMetadataVersion = TIER_METADATA_VERSION
+    if (etag !== undefined) next.etag = etag
     next.upstreamModels = upstreamModels
     next.configKey = currentConfigKey
     if (!config.catalog && config.capabilityCatalogUrl)
@@ -664,6 +740,7 @@ export async function synchronize(
     currentCacheKey,
   )
   next.upstreamModels = result.models
+  next.tierMetadataVersion = TIER_METADATA_VERSION
   next.configKey = currentConfigKey
   if (result.etag !== undefined) next.etag = result.etag
   if (!config.catalog && config.capabilityCatalogUrl)
@@ -711,7 +788,7 @@ export async function fetchCapabilityCatalog(
   for (const [id, raw] of Object.entries(models)) {
     const row = record(raw)
     if (!id || !row) throw new Error('invalid capability catalog model')
-    normalized[id] = parseCapabilityHints(row, id) ?? {}
+    normalized[id] = parseCapabilityHints(sourcesFor(row), id) ?? {}
   }
   return { version: root.version, models: normalized }
 }
