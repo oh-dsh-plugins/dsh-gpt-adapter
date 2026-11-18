@@ -6,10 +6,9 @@ const copy = {
   title: ['GPT model adaptation', 'GPT 模型适配'],
   autoAdapt: ['Automatic GPT adaptation', 'GPT 自动适配'],
   manualUltrafast: ['Allow manual Ultrafast', '允许手动选择 Ultrafast'],
-  manualUltrafastChoice: ['Ultrafast (manual)', 'Ultrafast（手动）'],
   manualUltrafastHint: [
-    'Upstream model metadata controls automatic Ultrafast availability. This Responses provider switch is independent of model and subscription; turning it on only permits manual selection and does not change the current speed or grant access. Selecting Ultrafast (manual) sends service_tier: "ultrafast". Whether it is accepted depends on your upstream and account.',
-    '上游模型元数据决定是否自动提供 Ultrafast。此 Responses 提供商开关独立于模型和订阅套餐；开启仅允许手动选择，不会改变当前速度或授予权限。选择 Ultrafast（手动）后发送 service_tier: "ultrafast"，是否接受取决于上游及当前账号。',
+    'Upstream model metadata controls automatic Ultrafast availability. This Responses provider switch is independent of model and subscription; turning it on only permits manual selection and does not change the current speed or grant access. Selecting Ultrafast sends service_tier: "ultrafast". Whether it is accepted depends on your upstream and account.',
+    '上游模型元数据决定是否自动提供 Ultrafast。此 Responses 提供商开关独立于模型和订阅套餐；开启仅允许手动选择，不会改变当前速度或授予权限。选择 Ultrafast 后发送 service_tier: "ultrafast"，是否接受取决于上游及当前账号。',
   ],
   syncSettings: ['Sync settings', '同步设置'],
   catalogUrl: ['Capability catalog URL', '能力目录 URL'],

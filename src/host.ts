@@ -154,7 +154,7 @@ function parseModelOverrides(text: string): Record<string, ModelOverride> {
 
 const MANUAL_ULTRAFAST = {
   id: 'manual-ultrafast',
-  label: 'Ultrafast (manual)',
+  label: 'Ultrafast',
   wireValue: 'ultrafast',
   source: 'user',
 } as const

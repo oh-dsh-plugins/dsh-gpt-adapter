@@ -1291,7 +1291,7 @@ describe('context settings and live model integration', () => {
       }),
       expect.objectContaining({
         id: 'manual-ultrafast',
-        label: 'Ultrafast (manual)',
+        label: 'Ultrafast',
         wireValue: 'ultrafast',
       }),
     ])
