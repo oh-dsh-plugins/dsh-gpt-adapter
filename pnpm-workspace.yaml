@@ -1,7 +1,26 @@
-# Exact, verified build inputs for the requested DSH rc.3 compatibility.
+# Build inputs derived by pnpm compat:sync.
+allowBuilds:
+  '@google/genai': true
+  esbuild: true
+  protobufjs: true
 minimumReleaseAgeExclude:
+  - '@deepseek-ai/dsh-brand@0.2.2-rc.2'
+  - '@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.2'
+  - '@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.2'
+  - '@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.2'
+  - '@deepseek-ai/dsh-util-values@0.2.2-rc.2'
   - '@deepseek-ai/dsh-brand@0.2.2-rc.3'
   - '@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.3'
   - '@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.3'
   - '@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.3'
   - '@deepseek-ai/dsh-util-values@0.2.2-rc.3'
+  - '@deepseek-ai/dsh-brand@0.2.2-rc.4'
+  - '@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.4'
+  - '@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.4'
+  - '@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.4'
+  - '@deepseek-ai/dsh-util-values@0.2.2-rc.4'
+  - '@deepseek-ai/dsh-brand@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-client-ui-model-selection@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-client-ui-settings-models@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-llm-pi-ai@0.2.2-rc.5'
+  - '@deepseek-ai/dsh-util-values@0.2.2-rc.5'

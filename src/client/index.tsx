@@ -446,12 +446,17 @@ export function apply(ctx: Context): void {
       </details>
     )
   }
+  let contextPresets: ReturnType<typeof installNativeContextPresets> | undefined
   function ProviderExtras({
     provider,
     configured,
     t,
   }: PropsRuntime<'settings.models.provider-card'> & PropsLocale<typeof NS>) {
     const { value, error, busy, act } = useProvider(provider.provider)
+    const presetsUnavailable = useSyncExternalStore(
+      (listener) => contextPresets?.subscribe(listener) ?? (() => {}),
+      () => contextPresets?.getSnapshot() ?? false,
+    )
     const stale = value?.models.filter((model) => model.stale).length ?? 0
     return (
       <section className={styles.customized} aria-label={t('title')}>
@@ -539,6 +544,11 @@ export function apply(ctx: Context): void {
               t={t}
             />
           </div>
+        )}
+        {presetsUnavailable && (
+          <p className={styles.error} role="status">
+            {t('nativeMismatch')}
+          </p>
         )}
         {error && (
           <p className={styles.error} role="alert">
@@ -686,7 +696,8 @@ export function apply(ctx: Context): void {
     )
   }
   ctx.slots.inject('settings.models.provider-card', () => {
-    const restore = installNativeContextPresets(ctx.slots, translate)
+    const presets = installNativeContextPresets(ctx.slots, translate)
+    contextPresets = presets
     try {
       const dispose = ctx.slots.register(
         { name: 'settings.models.provider-card', key: 'llm-pi-ai', locale: NS },
@@ -694,10 +705,10 @@ export function apply(ctx: Context): void {
       )
       return () => {
         dispose()
-        restore()
+        presets.dispose()
       }
     } catch (error) {
-      restore()
+      presets.dispose()
       throw error
     }
   })

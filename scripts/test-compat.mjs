@@ -10,7 +10,7 @@ import {
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import { supportedDshVersions } from './compat.mjs'
+import { sourceAliases, supportedDshVersions } from './compat.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
@@ -40,9 +40,6 @@ for (const version of versions) {
       ...manifest.dependencies,
       ...manifest.devDependencies,
     }
-    const sourceAliases = Object.keys(dependencies).filter((name) =>
-      name.startsWith('dsh-rc'),
-    )
     for (const name of sourceAliases) delete dependencies[name]
     for (const name of Object.keys(dependencies))
       if (name.startsWith('@deepseek-ai/dsh-')) dependencies[name] = version

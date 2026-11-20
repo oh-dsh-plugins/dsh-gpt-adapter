@@ -23,11 +23,12 @@ const require = createRequire(import.meta.url)
 const { nativeContextSettingsSource } = await import(
   pathToFileURL(resolve('scripts/native-context-settings.mjs')).href
 )
-const packages = [
-  '@deepseek-ai/dsh-client-ui-settings-models',
-  'dsh-rc2-model-settings',
-  'dsh-rc3-model-settings',
-]
+const { compatibilityTargets } = await import(
+  pathToFileURL(resolve('scripts/compat.mjs')).href
+)
+const packages: string[] = compatibilityTargets.map(
+  (target: { settings: string }) => target.settings,
+)
 type NativeSource = {
   source: string
   body: string
@@ -615,7 +616,108 @@ function client() {
   new Function(readFileSync('lib/client.js', 'utf8'))()
   const loaded = result
   return {
-    apply: (ctx: any) => loaded.apply(localeContext(ctx, modules, cleanup)),
+    apply: (ctx: any) => {
+      const ready = localeContext(ctx, modules, cleanup)
+      loaded.apply(ready)
+      return ready.locale
+    },
+  }
+}
+
+function presetFixture(component: any, failRoot = false) {
+  const entry = {
+    component,
+    options: { id: 'models' },
+    children: {
+      'settings.models.provider-card': { kind: 'keyed', scope: 'root' },
+    },
+  }
+  const listeners = new Set<() => void>()
+  const components = new Map<string, React.ComponentType<any>>()
+  const disposers: Array<() => void> = []
+  const calls: string[] = []
+  let policies = 0
+  const notify = () => {
+    for (const fn of listeners) fn()
+  }
+  const dispose = () => {
+    for (const fn of disposers.splice(0).reverse()) fn()
+  }
+  cleanup.push(dispose)
+  const locale = client().apply({
+    get: () => undefined,
+    on: () => () => {},
+    remote: { $on: () => () => {} },
+    connection: {
+      rpc: {
+        call: async (_channel: string, endpoint: string) => {
+          calls.push(endpoint)
+          return {
+            ok: true,
+            value: {
+              enabled: false,
+              models: [],
+              status: { state: 'ready' },
+            },
+          }
+        },
+      },
+    },
+    slots: {
+      entries: () => [entry],
+      subscribe: (_key: string, listener: () => void) => {
+        listeners.add(listener)
+        return () => {
+          listeners.delete(listener)
+        }
+      },
+      provideRoot: () => {
+        if (failRoot) throw new Error('root source failed')
+        policies++
+        notify()
+        return () => {
+          policies--
+          notify()
+        }
+      },
+      inject: (_key: string, callback: () => () => void) => {
+        disposers.push(callback())
+      },
+      register: (
+        options: { name: string },
+        Component: React.ComponentType<any>,
+      ) => {
+        components.set(options.name, Component)
+        return () => {
+          components.delete(options.name)
+        }
+      },
+    },
+  })
+  return {
+    entry,
+    listeners,
+    components,
+    calls,
+    locale,
+    notify,
+    dispose,
+    policies: () => policies,
+    async render() {
+      const container = document.createElement('div')
+      document.body.append(container)
+      const root = createRoot(container)
+      roots.push(root)
+      await act(async () =>
+        root.render(
+          React.createElement(
+            components.get('settings.models.provider-card')!,
+            { provider: { provider: 'fixture' }, configured: true },
+          ),
+        ),
+      )
+      return container
+    },
   }
 }
 
@@ -768,28 +870,63 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     await ctx.fiber.dispose()
   })
 
-  it('rejects an incompatible native renderer without replacing it', () => {
+  it('keeps provider actions and speed registration available with localized preset feedback', async () => {
     const original = () => null
-    const entry = {
-      component: original,
-      options: { id: 'models' },
-      children: {
-        'settings.models.provider-card': { kind: 'keyed', scope: 'root' },
-      },
-    }
-    expect(() =>
-      client().apply({
-        slots: {
-          entries: () => [entry],
-          subscribe: () => () => {},
-          provideRoot: () => {
-            throw new Error('must not publish')
-          },
-          inject: (_key: string, callback: () => void) => callback(),
-          register: () => () => {},
-        },
-      }),
-    ).toThrow('原生模型设置组件与已核验版本不一致')
-    expect(entry.component).toBe(original)
+    const fixture = presetFixture(original)
+    const container = await fixture.render()
+    expect(fixture.entry.component).toBe(original)
+    expect(fixture.policies()).toBe(0)
+    expect(fixture.components.has('conversation.input.left')).toBe(true)
+    expect(container.textContent).toContain('无法安装上下文预设')
+    const toggle =
+      container.querySelector<HTMLButtonElement>('[role="switch"]')!
+    expect(toggle.disabled).toBe(false)
+    await act(async () => toggle.click())
+    expect(fixture.calls).toContain('gptModels/configure')
+    await act(async () => fixture.locale.setLocale('en'))
+    expect(container.textContent).toContain(
+      'context presets cannot be installed',
+    )
+  })
+
+  it('recovers after incompatible replacement and leaves foreign components intact on disposal', async () => {
+    const original = originalNative(adapted).ModelsSection
+    const fixture = presetFixture(original)
+    const container = await fixture.render()
+    expect(fixture.entry.component).not.toBe(original)
+    expect(fixture.policies()).toBe(1)
+    const foreign = () => null
+    await act(async () => {
+      fixture.entry.component = foreign
+      fixture.notify()
+    })
+    expect(fixture.entry.component).toBe(foreign)
+    expect(fixture.policies()).toBe(0)
+    expect(container.textContent).toContain('无法安装上下文预设')
+    await act(async () => {
+      fixture.entry.component = original
+      fixture.notify()
+    })
+    expect(fixture.entry.component).not.toBe(original)
+    expect(fixture.policies()).toBe(1)
+    expect(container.textContent).not.toContain('无法安装上下文预设')
+    fixture.entry.component = foreign
+    fixture.dispose()
+    expect(fixture.entry.component).toBe(foreign)
+    expect(fixture.policies()).toBe(0)
+    expect(fixture.listeners.size).toBe(0)
+    fixture.notify()
+    fixture.dispose()
+    expect(fixture.entry.component).toBe(foreign)
+  })
+
+  it('restores the native component if the optional root policy cannot be installed', async () => {
+    const original = originalNative(adapted).ModelsSection
+    const fixture = presetFixture(original, true)
+    const container = await fixture.render()
+    expect(fixture.entry.component).toBe(original)
+    expect(fixture.policies()).toBe(0)
+    expect(container.textContent).toContain('无法安装上下文预设')
+    expect(fixture.components.has('conversation.input.left')).toBe(true)
   })
 })
