@@ -7,10 +7,15 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { Config, type GptModels } from '../src/host.js'
 import { installNativeAdapterBridge } from '../src/native-adapter.js'
 import { JsonStorage } from '../src/storage.js'
+
+const { supportedDshVersions, supportedDshRange } = await import(
+  pathToFileURL(resolve('scripts/compat.mjs')).href
+)
 
 const cleanup: Array<() => Promise<unknown>> = []
 afterEach(async () => {
@@ -514,9 +519,9 @@ describe('built plugin and official transport integration', () => {
     },
   )
   it('records all supported runtimes and verifies the installed native source', async () => {
-    const versions = ['0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3']
+    const versions = supportedDshVersions
     const manifest = JSON.parse(await readFile('package.json', 'utf8'))
-    expect(manifest.engines.dsh).toBe(versions.join(' || '))
+    expect(manifest.engines.dsh).toBe(supportedDshRange)
     for (const [name, range] of Object.entries(manifest.peerDependencies)) {
       if (name.startsWith('@deepseek-ai/dsh-'))
         expect(range).toBe(manifest.engines.dsh)

@@ -13,8 +13,26 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  versions:
+    name: Read verified DSH versions
+    runs-on: ubuntu-latest
+    outputs:
+      dsh: ${{ steps.matrix.outputs.dsh }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Derive the compatibility matrix
+        id: matrix
+        run: node scripts/compat-matrix.mjs >> "$GITHUB_OUTPUT"
+
   test:
-    name: Full suite (DSH rc.1)
+    name: Full suite (baseline DSH)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -26,7 +44,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.8.0
+          version: 10.26.0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -45,12 +63,13 @@ jobs:
 
   compatibility:
     name: Compatibility (DSH ${{ matrix.dsh }})
+    needs: versions
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        dsh: ['0.2.2-rc.2', '0.2.2-rc.3']
+        dsh: ${{ fromJSON(needs.versions.outputs.dsh) }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
@@ -60,7 +79,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.8.0
+          version: 10.26.0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

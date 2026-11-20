@@ -10,6 +10,15 @@ export function installNativeContextPresets(
   slots: Pick<SlotRegistry, 'entries' | 'subscribe' | 'provideRoot'>,
   t: Translator,
 ) {
+  let unavailable = false
+  let disposed = false
+  let syncing = false
+  const listeners = new Set<() => void>()
+  const publish = (next: boolean) => {
+    if (unavailable === next) return
+    unavailable = next
+    for (const listener of listeners) listener()
+  }
   let current:
     | {
         entry: StoredEntry
@@ -25,64 +34,94 @@ export function installNativeContextPresets(
     if (entry.component === component) entry.component = original
     release()
   }
-  const sync = () => {
-    const entry = slots
+  const findEntry = () =>
+    slots
       .entries('settings.section')
       .find(
         (entry) =>
           entry.options.id === 'models' &&
           entry.children?.['settings.models.provider-card'],
       )
-    if (entry === current?.entry && entry?.component === current?.component)
-      return
-    restore()
-    if (!entry) return
-    const original = entry.component
-    const source =
-      typeof original === 'function'
-        ? Function.prototype.toString.call(original)
-        : undefined
-    const runtime = nativeModelsRuntimes.find(
-      (candidate) => candidate.expectedModelsSectionSource === source,
-    )
-    if (!runtime) throw new Error(t('nativeMismatch'))
-    const NativeModelsSection = runtime.getComponent()
-    function ModelsWithContextPresets(props: Record<string, unknown>) {
-      return (
-        <ContextWindowPresetScope.Provider
-          value={props.gptContextPresetControls === true ? t : undefined}
-        >
-          <NativeModelsSection {...props} />
-        </ContextWindowPresetScope.Provider>
-      )
-    }
-    entry.component = ModelsWithContextPresets
+  const sync = () => {
+    if (disposed || syncing) return
+    syncing = true
     try {
-      // This supported root source publishes the control policy and refreshes
-      // existing slot renderers after installation and disposal.
-      const release = slots.provideRoot({
-        props: { gptContextPresetControls: true },
-      })
-      current = {
-        entry,
-        original,
-        component: ModelsWithContextPresets,
-        release,
+      let entry = findEntry()
+      if (
+        current &&
+        entry === current.entry &&
+        entry.component === current.component
+      )
+        return
+      restore()
+      // Re-read after releasing the root source, which may notify other owners.
+      entry = findEntry()
+      if (!entry) {
+        publish(false)
+        return
       }
-    } catch (error) {
-      entry.component = original
-      throw error
+      const original = entry.component
+      const source =
+        typeof original === 'function'
+          ? Function.prototype.toString.call(original)
+          : undefined
+      const runtime = nativeModelsRuntimes.find(
+        (candidate) => candidate.expectedModelsSectionSource === source,
+      )
+      if (!runtime) {
+        publish(true)
+        return
+      }
+      const NativeModelsSection = runtime.getComponent()
+      function ModelsWithContextPresets(props: Record<string, unknown>) {
+        return (
+          <ContextWindowPresetScope.Provider
+            value={props.gptContextPresetControls === true ? t : undefined}
+          >
+            <NativeModelsSection {...props} />
+          </ContextWindowPresetScope.Provider>
+        )
+      }
+      entry.component = ModelsWithContextPresets
+      try {
+        const release = slots.provideRoot({
+          props: { gptContextPresetControls: true },
+        })
+        current = {
+          entry,
+          original,
+          component: ModelsWithContextPresets,
+          release,
+        }
+      } catch (error) {
+        if (entry.component === ModelsWithContextPresets)
+          entry.component = original
+        throw error
+      }
+      publish(false)
+    } catch {
+      // Presets are optional; keep provider and speed controls usable.
+      publish(true)
+    } finally {
+      syncing = false
     }
   }
   const unsubscribe = slots.subscribe('settings.section', sync)
-  try {
-    sync()
-  } catch (error) {
-    unsubscribe()
-    throw error
-  }
-  return () => {
-    unsubscribe()
-    restore()
+  sync()
+  return {
+    getSnapshot: () => unavailable,
+    subscribe(listener: () => void) {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+    dispose() {
+      if (disposed) return
+      disposed = true
+      unsubscribe()
+      restore()
+      listeners.clear()
+    },
   }
 }

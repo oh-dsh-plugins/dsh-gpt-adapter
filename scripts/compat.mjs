@@ -21,11 +21,68 @@ export const compatibilityTargets = [
     menu: 'dsh-rc3-model-selection',
     settings: 'dsh-rc3-model-settings',
   },
+  {
+    version: '0.2.2-rc.4',
+    adapter: 'dsh-rc4-pi-ai',
+    menu: 'dsh-rc4-model-selection',
+    settings: 'dsh-rc4-model-settings',
+  },
+  {
+    version: '0.2.2-rc.5',
+    adapter: 'dsh-rc5-pi-ai',
+    menu: 'dsh-rc5-model-selection',
+    settings: 'dsh-rc5-model-settings',
+  },
 ]
 
 export const supportedDshVersions = compatibilityTargets.map(
   ({ version }) => version,
 )
+
+export const supportedDshRange = supportedDshVersions.join(' || ')
+
+export const nativePackages = {
+  adapter: '@deepseek-ai/dsh-llm-pi-ai',
+  menu: '@deepseek-ai/dsh-client-ui-model-selection',
+  settings: '@deepseek-ai/dsh-client-ui-settings-models',
+}
+export const sourceAliases = compatibilityTargets.flatMap((target) =>
+  Object.keys(nativePackages)
+    .map((key) => target[key])
+    .filter((name) => name.startsWith('dsh-')),
+)
+
+/** npm needs literal ranges; derive those declarations from the verified targets. */
+export function compatibilityManifest(
+  manifest,
+  targets = compatibilityTargets,
+) {
+  const versions = targets.map(({ version }) => version)
+  const range = versions.join(' || ')
+  const devDependencies = Object.fromEntries(
+    Object.entries(manifest.devDependencies).filter(
+      ([name]) => !name.startsWith('dsh-'),
+    ),
+  )
+  for (const name of Object.keys(devDependencies))
+    if (name.startsWith('@deepseek-ai/dsh-'))
+      devDependencies[name] = versions[0]
+  for (const target of targets)
+    for (const [key, name] of Object.entries(nativePackages))
+      if (target[key] !== name)
+        devDependencies[target[key]] = 'npm:' + name + '@' + target.version
+  return {
+    ...manifest,
+    engines: { ...manifest.engines, dsh: range },
+    devDependencies,
+    peerDependencies: Object.fromEntries(
+      Object.entries(manifest.peerDependencies).map(([name, value]) => [
+        name,
+        name.startsWith('@deepseek-ai/dsh-') ? range : value,
+      ]),
+    ),
+  }
+}
 
 export function menuSource(
   packageName = '@deepseek-ai/dsh-client-ui-model-selection',
