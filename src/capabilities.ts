@@ -7,12 +7,6 @@ import type {
   UpstreamModel,
 } from './types.js'
 
-const reasoning = (
-  id: string,
-  label: string,
-  source: ReasoningChoice['source'] = 'catalog',
-): ReasoningChoice => ({ id, label, wireValue: id, source })
-
 const presetTier = (
   id: ServiceTier,
   label: string,
@@ -24,11 +18,7 @@ const GPT_SPEED_PRESET: ServiceTierChoice[] = [
   { ...presetTier('fast', 'Fast'), wireValue: 'priority' },
 ]
 
-/**
- * Baseline catalog for known GPT families. This data is deliberately separate
- * from `/models`: the upstream list identifies models but does not guarantee
- * complete reasoning or service-tier metadata.
- */
+/** Recognized GPT defaults; a level is available only when declared. */
 export const GPT_REASONING_LEVELS = [
   'low',
   'medium',
@@ -39,11 +29,6 @@ export const GPT_REASONING_LEVELS = [
 ] as const
 
 const GPT_PRESET = {
-  reasoning: {
-    status: 'known' as const,
-    choices: GPT_REASONING_LEVELS.map((level) => reasoning(level, level)),
-    defaultId: 'medium',
-  },
   serviceTiers: GPT_SPEED_PRESET,
   defaultServiceTier: 'default' as const,
 }
@@ -57,7 +42,7 @@ function catalogFor(modelId: string) {
 }
 
 export function isGptModel(model: UpstreamModel): boolean {
-  return /^(gpt|codex|o[1345])[-.]/i.test(model.id)
+  return /^(?:(?:gpt|codex|o[1345])[-.]|o[13]$)/i.test(model.id)
 }
 
 export function resolveCapabilities(
@@ -68,30 +53,21 @@ export function resolveCapabilities(
   const base = catalogFor(model.id)
   const upstream = model.capabilities
   const displayName = override?.displayName ?? model.displayName ?? model.id
-  const choices =
-    override?.reasoningChoices ??
-    upstream?.reasoningChoices ??
-    base?.reasoning.choices ??
-    []
+  const choices = override?.reasoningChoices ?? upstream?.reasoningChoices
   const supportsReasoning =
     override?.supportsReasoning ??
     (override?.reasoningChoices === undefined
       ? upstream?.supportsReasoning
       : undefined)
   const status =
-    supportsReasoning === false
+    supportsReasoning === false || choices?.length === 0
       ? 'unsupported'
-      : override?.reasoningChoices !== undefined ||
-          upstream?.reasoningChoices !== undefined
-        ? choices.length > 0
-          ? 'known'
-          : 'unsupported'
-        : (base?.reasoning.status ?? 'unknown')
-  const finalChoices = status === 'unsupported' ? [] : choices
+      : choices === undefined
+        ? 'unknown'
+        : 'known'
+  const finalChoices = status === 'known' ? choices! : []
   const candidateDefaultReasoning =
-    override?.defaultReasoningId ??
-    upstream?.defaultReasoningId ??
-    base?.reasoning.defaultId
+    override?.defaultReasoningId ?? upstream?.defaultReasoningId
   const defaultReasoningId = finalChoices.some(
     (choice) => choice.id === candidateDefaultReasoning,
   )

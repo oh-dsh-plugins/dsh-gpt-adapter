@@ -208,6 +208,26 @@ function validSpeedCache(
   })
 }
 
+type SessionSpeeds = {
+  sessionId: string
+  speeds: Record<string, SpeedSelection>
+}
+
+function validSessionSpeeds(value: unknown): value is SessionSpeeds {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    !('sessionId' in value) ||
+    typeof value.sessionId !== 'string' ||
+    !('speeds' in value) ||
+    !validSpeedCache(value.speeds)
+  )
+    return false
+  return Object.keys(value.speeds).every(
+    (key) => JSON.parse(key)[0] === value.sessionId,
+  )
+}
+
 type SettingsRead = {
   rows: any[]
   descriptor: any
@@ -373,6 +393,10 @@ export class GptModels extends Service {
   private readonly publications = new Map<string, Promise<void>>()
   private speeds = new Map<string, SpeedSelection>()
   private readonly manualSpeedEpochs = new Map<string, symbol>()
+  private readonly legacySpeedSessions = new Set<string>()
+  private readonly speedStore = new JsonStorage(
+    dshHomePath('storages', 'gpt-adapter', 'session-speeds'),
+  )
   private readonly results = new Map<
     string,
     {
@@ -445,9 +469,18 @@ export class GptModels extends Service {
   async initialize(): Promise<void> {
     const loading = this.speedWrites.then(async () => {
       const savedSpeeds = await this.store.read('speeds', validSpeedCache)
+      const sessions = await this.speedStore.readAll(validSessionSpeeds)
       if (this.closed) return
-      for (const [key, value] of Object.entries(savedSpeeds ?? {}))
-        this.speeds.set(key, value)
+      const overridden = new Set(sessions.map(({ sessionId }) => sessionId))
+      const next = new Map<string, SpeedSelection>()
+      for (const [key, value] of Object.entries(savedSpeeds ?? {})) {
+        const [sessionId] = JSON.parse(key)
+        this.legacySpeedSessions.add(sessionId)
+        if (!overridden.has(sessionId)) next.set(key, value)
+      }
+      for (const { speeds } of sessions)
+        for (const [key, value] of Object.entries(speeds)) next.set(key, value)
+      this.speeds = next
     })
     this.speedWrites = loading.catch(() => undefined)
     await loading
@@ -1441,13 +1474,42 @@ export class GptModels extends Service {
   ): Promise<void> {
     const next = new Map(this.speeds)
     change(next)
-    if (
-      next.size === this.speeds.size &&
-      [...next].every(([key, value]) => this.speeds.get(key) === value)
-    )
-      return
-    await this.store.write('speeds', Object.fromEntries(next))
-    this.speeds = next
+    const changedBySession = new Map<string, string[]>()
+    for (const key of new Set([...this.speeds.keys(), ...next.keys()])) {
+      if (this.speeds.get(key) === next.get(key)) continue
+      const [sessionId] = JSON.parse(key) as [string, string, string]
+      const changed = changedBySession.get(sessionId) ?? []
+      changed.push(key)
+      changedBySession.set(sessionId, changed)
+    }
+    if (!changedBySession.size) return
+
+    let persisted = this.speeds
+    try {
+      for (const [sessionId, changed] of changedBySession) {
+        const entries = [...next].filter(
+          ([key]) => JSON.parse(key)[0] === sessionId,
+        )
+        // An empty override keeps deleted legacy preferences from reappearing.
+        if (entries.length || this.legacySpeedSessions.has(sessionId)) {
+          await this.speedStore.write(sessionId, {
+            sessionId,
+            speeds: Object.fromEntries(entries),
+          })
+        } else {
+          await this.speedStore.remove(sessionId)
+        }
+        if (persisted === this.speeds) persisted = new Map(this.speeds)
+        for (const key of changed) {
+          const value = next.get(key)
+          if (value === undefined) persisted.delete(key)
+          else persisted.set(key, value)
+        }
+      }
+    } finally {
+      // A provider-wide clear may have written only some sessions before failing.
+      this.speeds = persisted
+    }
   }
 
   @Remote({ resources: { session: (sessionId: SessionId) => sessionId } })
@@ -1708,6 +1770,7 @@ export async function apply(
       >[0],
       (provider, model, base, snapshot) =>
         service.capture(provider, model, base, snapshot),
+      ctx.llm,
     ),
   )
   ctx.effect(() => {

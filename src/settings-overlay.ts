@@ -1,6 +1,5 @@
 import z from '@deepseek-ai/schemastery'
 import { symbols } from '@deepseek-ai/cordis'
-import { GPT_REASONING_LEVELS } from './capabilities.js'
 import type { ModelCapabilities } from './types.js'
 import { validContextWindow } from './context-window.js'
 
@@ -57,15 +56,19 @@ export function projectModel(
     ...(includeContext && validContextWindow(capability.contextWindow)
       ? { contextWindow: capability.contextWindow }
       : {}),
-    reasoningEfforts:
-      capability.reasoning.status === 'unsupported'
-        ? false
-        : Object.fromEntries(
-            capability.reasoning.choices.map((choice) => [
-              choice.id,
-              choice.wireValue,
-            ]),
-          ),
+    ...(capability.reasoning.status === 'unknown'
+      ? {}
+      : {
+          reasoningEfforts:
+            capability.reasoning.status === 'unsupported'
+              ? false
+              : Object.fromEntries(
+                  capability.reasoning.choices.map((choice) => [
+                    choice.id,
+                    choice.wireValue,
+                  ]),
+                ),
+        }),
   }
 }
 
@@ -96,7 +99,11 @@ export function projectConfiguration(
   }
 }
 
-function projectSchema(json: any, preserveNativeLevels: boolean): any {
+function projectSchema(
+  json: any,
+  levels: Set<string>,
+  preserveNativeLevels: boolean,
+): any {
   if (!json) return json
   const schema = new z(json)
   const efforts =
@@ -106,13 +113,8 @@ function projectSchema(json: any, preserveNativeLevels: boolean): any {
   )?.sKey
   if (!keys?.list) throw new Error('Unsupported native Models reasoning schema')
   const offered = preserveNativeLevels
-    ? [
-        ...new Set([
-          ...keys.list.map((entry: any) => entry.value),
-          ...GPT_REASONING_LEVELS,
-        ]),
-      ]
-    : [...GPT_REASONING_LEVELS]
+    ? [...new Set([...keys.list.map((entry: any) => entry.value), ...levels])]
+    : [...levels]
   keys.list = offered.map((level) => z.const(level))
   return schema.toJSON()
 }
@@ -160,6 +162,7 @@ function nativeWrite(
             ownershipProfile,
           )
           if (
+            capability.reasoning.status !== 'unknown' &&
             original &&
             JSON.stringify(model.reasoningEfforts) !==
               JSON.stringify(managed.reasoningEfforts)
@@ -212,11 +215,13 @@ function nativeWrite(
                 : { ...model, contextWindow: capability.contextWindow },
               profile,
             )
-          if (original && Object.hasOwn(original, 'reasoningEfforts'))
-            restored.reasoningEfforts = structuredClone(
-              original.reasoningEfforts,
-            )
-          else delete restored.reasoningEfforts
+          if (capability.reasoning.status !== 'unknown') {
+            if (original && Object.hasOwn(original, 'reasoningEfforts'))
+              restored.reasoningEfforts = structuredClone(
+                original.reasoningEfforts,
+              )
+            else delete restored.reasoningEfforts
+          }
           return restored
         })
         // Validate inherited models without materializing a user-owned array.
@@ -278,6 +283,7 @@ export function installSettingsOverlay(
         (profile as JsonObject).models?.map((model: JsonObject) => [
           model.id,
           model.contextWindow,
+          model.reasoningEfforts,
         ]),
       ]),
     )
@@ -313,13 +319,23 @@ export function installSettingsOverlay(
       if (row.ns !== 'llm-pi-ai') return row
       let managed = false
       let other = false
+      const declared = new Set<string>()
       for (const [provider, profile] of Object.entries(
         row.value?.providers ?? {},
       ))
-        for (const model of (profile as JsonObject).models ?? [])
-          if (resolveModel(provider, model, profile as JsonObject))
-            managed = true
-          else other = true
+        for (const model of (profile as JsonObject).models ?? []) {
+          const capability = resolveModel(
+            provider,
+            model,
+            profile as JsonObject,
+          )
+          if (capability) managed = true
+          if (!capability || capability.reasoning.status === 'unknown')
+            other = true
+          else
+            for (const choice of capability.reasoning.choices)
+              declared.add(choice.id)
+        }
       const value = managed
         ? projectConfiguration(row.value, resolveModel)
         : row.value
@@ -328,7 +344,9 @@ export function installSettingsOverlay(
         ...row,
         ...(managed
           ? {
-              schema: projectSchema(row.schema, other),
+              schema: declared.size
+                ? projectSchema(row.schema, declared, other)
+                : row.schema,
               value,
               base: projectConfiguration(row.base, editableResolve),
               user: projectConfiguration(row.user, editableResolve),

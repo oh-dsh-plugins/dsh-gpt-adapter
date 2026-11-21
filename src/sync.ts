@@ -61,7 +61,7 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined
 }
 
-function validCachedHints(value: unknown): boolean {
+function validCachedHints(value: unknown, allowEmptyTiers = false): boolean {
   const hints = record(value)
   if (!hints) return false
   if (
@@ -103,7 +103,7 @@ function validCachedHints(value: unknown): boolean {
     if (choices === undefined) continue
     if (
       !Array.isArray(choices) ||
-      (field === 'serviceTiers' && !choices.length)
+      (field === 'serviceTiers' && !allowEmptyTiers && !choices.length)
     )
       return false
     for (const item of choices) {
@@ -129,7 +129,7 @@ function validCachedHints(value: unknown): boolean {
   return true
 }
 
-function validCachedModels(value: unknown): boolean {
+function validCachedModels(value: unknown, raw = false): boolean {
   return (
     Array.isArray(value) &&
     value.every((item) => {
@@ -145,7 +145,7 @@ function validCachedModels(value: unknown): boolean {
         (model.ultrafastSupported === undefined ||
           typeof model.ultrafastSupported === 'boolean') &&
         (model.capabilities === undefined ||
-          validCachedHints(model.capabilities))
+          validCachedHints(model.capabilities, raw))
       )
     })
   )
@@ -345,8 +345,6 @@ function parseCapabilityHints(
       source: 'upstream',
     })
   }
-  if (!tiers.length)
-    throw new Error(`model ${modelId} declares no supported service tiers`)
   const defaultTier =
     typeof rawDefaultTier === 'string' ? serviceTier(rawDefaultTier) : undefined
   const contextWindow = firstDefined(sources, [
@@ -593,6 +591,11 @@ export function buildSnapshot(
   const capabilities: Record<string, ModelCapabilities> = {}
   for (const model of filtered) {
     const catalogHints = config.catalog?.models[model.id]
+    if (
+      model.capabilities?.serviceTiers?.length === 0 ||
+      catalogHints?.serviceTiers?.length === 0
+    )
+      throw new Error(`model ${model.id} declares no supported service tiers`)
     const catalogChoices = catalogHints?.reasoningChoices?.map((choice) => ({
       ...choice,
       source: 'catalog' as const,
@@ -630,7 +633,7 @@ export function restoreSnapshot(
     typeof cached.fetchedAt !== 'string' ||
     !validCachedModels(cached.models) ||
     (cached.upstreamModels !== undefined &&
-      !validCachedModels(cached.upstreamModels)) ||
+      !validCachedModels(cached.upstreamModels, true)) ||
     (cached.etag !== undefined && typeof cached.etag !== 'string')
   )
     return undefined
@@ -640,8 +643,11 @@ export function restoreSnapshot(
     if (
       !catalog ||
       typeof catalog.version !== 'string' ||
+      !catalog.version ||
       !models ||
-      !Object.values(models).every(validCachedHints)
+      !Object.entries(models).every(
+        ([id, hints]) => id && validCachedHints(hints, true),
+      )
     )
       return undefined
   }
@@ -659,6 +665,8 @@ export function restoreSnapshot(
     ...(cached.upstreamModels ?? []),
     ...cached.models,
   ]).filter(config.includeModel ?? isGptModel)
+  if (models.some((model) => model.capabilities?.serviceTiers?.length === 0))
+    return undefined
   const next = buildSnapshot(
     models,
     effectiveConfig,

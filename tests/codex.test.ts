@@ -61,6 +61,8 @@ const fixtureFs = {
       return undefined
     }),
   readText: (path: string) => readFile(path, 'utf8'),
+  readByteRange: async (path: string, { length }: { length: number }) =>
+    (await readFile(path)).subarray(0, length),
 }
 const skillFs = {
   resolve: async (path: string) => ({ targetKey: path, displayPath: path }),
@@ -367,6 +369,76 @@ describe('Codex config and plugin resources', () => {
     },
   )
 
+  it.each([
+    { type: 'http', command: 'fixture' },
+    {
+      type: 'streamable-http',
+      url: 'https://fixture.invalid/mcp',
+      command: 'fixture',
+    },
+    { type: 'stdio', url: 'https://fixture.invalid/mcp' },
+    { type: 'stdio', url: 'https://fixture.invalid/mcp', command: 'fixture' },
+    { type: 'http' },
+    { type: 'stdio' },
+  ])(
+    'reports and removes a conflicting explicit MCP declaration: %j',
+    async (bad) => {
+      const good = {
+        local: { type: 'stdio', command: 'fixture' },
+        remote: { type: 'http', url: 'https://fixture.invalid/mcp' },
+        stream: { type: 'streamable-http', url: 'https://fixture.invalid/mcp' },
+      }
+      const previous = await discoverCodexSnapshot('/fixture', options, {
+        config: { mcp_servers: { ...good, changed: good.local } },
+      })
+      const current = await discoverCodexSnapshot('/fixture', options, {
+        previous,
+        config: { mcp_servers: { ...good, changed: bad } },
+      })
+      expect(current.items).toContainEqual({
+        name: 'changed',
+        kind: 'mcp',
+        state: 'unsupported',
+        reason: 'transport-config-conflict',
+      })
+      expect(
+        current.mcp.map(({ serverName, transport }) => [serverName, transport]),
+      ).toEqual([
+        ['local', 'stdio'],
+        ['remote', 'streamable-http'],
+        ['stream', 'streamable-http'],
+      ])
+    },
+  )
+
+  it.each([{}, { type: 'http' }])(
+    'does not revive stdio after switching to an HTTP service with missing credentials (%j)',
+    async (transport) => {
+      const previous = await discoverCodexSnapshot('/fixture', options, {
+        config: { mcp_servers: { changed: { command: 'fixture' } } },
+      })
+      const current = await discoverCodexSnapshot('/fixture', options, {
+        previous,
+        config: {
+          mcp_servers: {
+            changed: {
+              ...transport,
+              url: 'https://fixture.invalid',
+              bearer_token_env_var: 'GPT_ADAPTER_TEST_MISSING_TOKEN',
+            },
+          },
+        },
+      })
+      expect(current.items).toContainEqual({
+        name: 'changed',
+        kind: 'mcp',
+        state: 'unsupported',
+        reason: 'missing-environment',
+      })
+      expect(current.mcp).toHaveLength(0)
+    },
+  )
+
   it('overrides HTTP headers without retaining differently cased credentials', () => {
     const http = normalizeCodexMcp(
       'remote',
@@ -520,6 +592,30 @@ describe('Codex config and plugin resources', () => {
     expect((await discoverCodexSnapshot(home, options)).mcp).toEqual([])
   })
 
+  it('resolves only project-declared relative MCP commands against the Agent cwd', async () => {
+    const home = await directory(),
+      project = join(home, 'project'),
+      cwd = join(project, 'nested')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await mkdir(cwd)
+    await put(
+      join(home, 'config.toml'),
+      `[projects.${JSON.stringify(project)}]\ntrust_level="trusted"\n[mcp_servers.user]\ncommand="./bin/user"\n`,
+    )
+    await put(
+      join(project, '.codex/config.toml'),
+      '[mcp_servers.local]\ncommand="./bin/project"\n[mcp_servers.user]\nargs=["--local"]\n',
+    )
+    const result = await discoverCodexSnapshot(home, options, {
+      cwd,
+      fs: fixtureFs,
+    })
+    expect(result.mcp.map(({ command, cwd }) => [command, cwd])).toEqual([
+      [join(home, 'bin/user'), cwd],
+      [join(cwd, 'bin/project'), cwd],
+    ])
+  })
+
   it('does not convert invalid config into a successful empty configuration', async () => {
     const home = await directory()
     expect(await readCodexConfig(home)).toEqual({})
@@ -576,6 +672,28 @@ describe('Codex config and plugin resources', () => {
       ),
     ).resolves.toBe(false)
   })
+
+  it.each([
+    ['win32', String.raw`C:\user\skills\.system\example\SKILL.md`, false],
+    ['linux', String.raw`/work/skills\.system\custom/SKILL.md`, true],
+  ] as const)(
+    'uses %s separators for bundled skills',
+    async (platform, path, enabled) => {
+      const mock = vi
+        .spyOn(process, 'platform', 'get')
+        .mockReturnValue(platform)
+      try {
+        const skill = { name: 'example', path }
+        const config = { skills: { bundled: { enabled: false } } }
+        expect(skillEnabled(config, skill)).toBe(enabled)
+        expect(
+          await skillEnabledWithFs(config, skill, undefined, fixtureFs),
+        ).toBe(enabled)
+      } finally {
+        mock.mockRestore()
+      }
+    },
+  )
 
   it('honors ordered disabled skill selectors and bundled policy', () => {
     const skill = { name: 'example', path: '/tmp/skills/example/SKILL.md' }
@@ -767,6 +885,30 @@ describe('Codex instruction context', () => {
     ).toContain('<\\/system-reminder>')
   })
 
+  it('keeps a descendant instruction that reinstates an overridden rule', async () => {
+    const root = await directory(),
+      child = join(root, 'child'),
+      cwd = join(child, 'leaf')
+    await mkdir(join(root, '.git'))
+    await put(join(root, 'AGENTS.md'), 'Rule A')
+    await put(join(child, 'AGENTS.md'), 'Rule B')
+    await put(join(cwd, 'AGENTS.md'), 'Rule A')
+    const absent = join(root, 'absent')
+    const files = await loadCodexInstructions(
+      absent,
+      cwd,
+      {},
+      absent,
+      absent,
+      fixtureFs,
+    )
+    expect(files.map(({ content }) => content)).toEqual([
+      'Rule A',
+      'Rule B',
+      'Rule A',
+    ])
+  })
+
   it('logs a baseline once, replaces native project candidates, refreshes changes and preserves user messages', async () => {
     const home = await directory(),
       project = join(home, 'project')
@@ -880,7 +1022,7 @@ describe('Codex instruction context', () => {
     await mkdir(join(project, '.git'), { recursive: true })
     await put(outside, 'PRIVATE_FIXTURE')
     await symlink(outside, join(project, 'AGENTS.override.md'))
-    const readText = vi.fn(async () => {
+    const readByteRange = vi.fn(async () => {
       throw new Error('denied-by-filesystem')
     })
     const signal = new AbortController().signal
@@ -891,7 +1033,7 @@ describe('Codex instruction context', () => {
           gate = fn
         },
         workingDirectory: { ensure: async () => project },
-        get: () => ({ ...fixtureFs, readText }),
+        get: () => ({ ...fixtureFs, readByteRange }),
         logger: { warn() {} },
       },
       home,
@@ -903,8 +1045,9 @@ describe('Codex instruction context', () => {
       async () => decision,
     )
     expect(result).toBe(decision)
-    expect(readText).toHaveBeenCalledWith(
+    expect(readByteRange).toHaveBeenCalledWith(
       join(project, 'AGENTS.override.md'),
+      expect.objectContaining({ offset: 0 }),
       signal,
     )
     expect(JSON.stringify(result)).not.toContain('PRIVATE_FIXTURE')

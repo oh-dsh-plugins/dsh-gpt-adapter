@@ -28,9 +28,12 @@ async function fixture(
     rotateWhileResolving?: boolean
   },
   savedSpeeds?: Record<string, string>,
+  sharedHome?: string,
 ) {
-  const directory = await mkdtemp(join(tmpdir(), 'dsh-context-test-'))
-  cleanup.push(() => rm(directory, { recursive: true, force: true }))
+  const directory =
+    sharedHome ?? (await mkdtemp(join(tmpdir(), 'dsh-context-test-')))
+  if (!sharedHome)
+    cleanup.push(() => rm(directory, { recursive: true, force: true }))
   vi.stubEnv('DSH_HOME', directory)
   const ctx = new Context()
   cleanup.push(() => ctx.fiber.dispose())
@@ -365,12 +368,15 @@ async function fixture(
 
 describe('context settings and live model integration', () => {
   it('orders session deletion after an in-flight startup speed read', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-speed-startup-'))
+    cleanup.push(() => rm(directory, { recursive: true, force: true }))
+    vi.stubEnv('DSH_HOME', directory)
     const ctx = new Context()
     cleanup.push(() => ctx.fiber.dispose())
     ctx.provide('settings', { describe: () => [] } as any)
     const service = new GptModels(ctx, { routes: {} }, 'gpt-adapter')
     const store = (service as any).store
-    let saved: any = {
+    const saved = {
       [JSON.stringify(['removed', 'fixture', 'gpt-5.4'])]: 'fast',
     }
     let release!: () => void, entered!: () => void
@@ -385,9 +391,6 @@ describe('context settings and live model integration', () => {
       await gate
       return structuredClone(saved)
     })
-    vi.spyOn(store, 'write').mockImplementation(async (_key, value) => {
-      saved = value
-    })
     const initializing = service.initialize()
     await started
     ctx.emit('api-session/removed', 'removed' as any)
@@ -395,7 +398,10 @@ describe('context settings and live model integration', () => {
     await initializing
     await (service as any).speedWrites
     expect((service as any).speeds.size).toBe(0)
-    expect(saved).toEqual({})
+    expect(await (service as any).speedStore.read('removed')).toEqual({
+      sessionId: 'removed',
+      speeds: {},
+    })
   })
 
   it('discovers new models into an empty user layer without copying inherited provider options', async () => {
@@ -911,14 +917,7 @@ describe('context settings and live model integration', () => {
       },
     })
     const current = f.service.capability('fixture', 'gpt-5.4')!
-    expect(current.reasoning.choices.map((choice) => choice.id)).toEqual([
-      'low',
-      'medium',
-      'high',
-      'xhigh',
-      'max',
-      'ultra',
-    ])
+    expect(current.reasoning).toEqual({ status: 'unknown', choices: [] })
     expect(current.serviceTiers.map((choice) => choice.id)).toEqual([
       'default',
       'fast',
@@ -1078,6 +1077,9 @@ describe('context settings and live model integration', () => {
     await f.legacy({
       'gpt-5.4': {
         displayName: 'Old override',
+        reasoningChoices: [
+          { id: 'ultra', label: 'Ultra', wireValue: 'ultra', source: 'user' },
+        ],
         defaultReasoningId: 'ultra',
         defaultServiceTier: 'fast',
       },
@@ -1089,13 +1091,13 @@ describe('context settings and live model integration', () => {
     await f.legacy({})
     expect(f.service.capability('fixture', 'gpt-5.4')).toMatchObject({
       displayName: 'gpt-5.4',
-      reasoning: { defaultId: 'medium' },
+      reasoning: { status: 'unknown', choices: [] },
       defaultServiceTier: 'default',
     })
     expect(
       f.service.capture('fixture', 'gpt-5.4', base)!.prepare({}).payload,
-    ).toMatchObject({
-      reasoning: { effort: 'medium' },
+    ).toEqual({
+      model: 'gpt-5.4',
       service_tier: 'default',
     })
     expect(captured.prepare({}).payload).toMatchObject({
@@ -1540,6 +1542,35 @@ describe('context settings and live model integration', () => {
     ).toBe('priority')
   })
 
+  it('reloads both session speeds after independent instances write in the same home', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'dsh-speed-shared-'))
+    cleanup.push(() => rm(home, { recursive: true, force: true }))
+    const legacy = new JsonStorage(join(home, 'storages', 'gpt-adapter'))
+    await legacy.write('speeds', {
+      [JSON.stringify(['legacy', 'fixture', 'gpt-5.4'])]: 'fast',
+      [JSON.stringify(['deleted', 'fixture', 'gpt-5.4'])]: 'fast',
+    })
+    const open = () =>
+      fixture(undefined, false, false, undefined, undefined, home)
+    const first = await open()
+    const second = await open()
+    await Promise.all([
+      first.service.setSpeed('one' as any, 'fixture', 'gpt-5.4', 'fast'),
+      second.service.setSpeed('two' as any, 'fixture', 'gpt-5.4', 'fast'),
+    ])
+    first.ctx.emit('api-session/removed', 'deleted' as any)
+    await (first.service as any).speedWrites
+    const reloaded = await open()
+    const selected = (id: string) =>
+      reloaded.service.speed(id as any, 'fixture', 'gpt-5.4').selected
+    expect(['one', 'two', 'legacy', 'deleted'].map(selected)).toEqual([
+      'fast',
+      'fast',
+      'fast',
+      'default',
+    ])
+  })
+
   it('replaces speed snapshots only after a successful write and keeps previously captured calls stable', async () => {
     const f = await fixture()
     await f.service.setSpeed(
@@ -1554,7 +1585,7 @@ describe('context settings and live model integration', () => {
       name: 'GPT',
     })!
     const before = (f.service as any).speeds
-    vi.spyOn((f.service as any).store, 'write').mockRejectedValueOnce(
+    vi.spyOn((f.service as any).speedStore, 'write').mockRejectedValueOnce(
       new Error('disk full'),
     )
     await expect(
@@ -1589,7 +1620,7 @@ describe('context settings and live model integration', () => {
   it('removes deleted session speeds after pending writes without losing other sessions', async () => {
     const f = await fixture()
     await f.service.setSpeed('keep' as any, 'fixture', 'gpt-5.4', 'fast')
-    const store = (f.service as any).store as JsonStorage
+    const store = (f.service as any).speedStore as JsonStorage
     const write = store.write.bind(store)
     let release!: () => void, entered!: () => void
     const gate = new Promise<void>((done) => {
@@ -1617,8 +1648,10 @@ describe('context settings and live model integration', () => {
     expect([
       ...((f.service as any).speeds as Map<string, unknown>).keys(),
     ]).toEqual([JSON.stringify(['keep', 'fixture', 'gpt-5.4'])])
-    expect(await store.read('speeds')).toEqual({
-      [JSON.stringify(['keep', 'fixture', 'gpt-5.4'])]: 'fast',
+    expect(await store.read('removed')).toBeUndefined()
+    expect(await store.read('keep')).toEqual({
+      sessionId: 'keep',
+      speeds: { [JSON.stringify(['keep', 'fixture', 'gpt-5.4'])]: 'fast' },
     })
   })
   it.each([
@@ -1646,7 +1679,7 @@ describe('context settings and live model integration', () => {
       ).rejects.toThrow()
       expect(f.options()).toEqual(before)
       expect(f.service.capability('fixture', 'gpt-5.4')!.reasoning.status).toBe(
-        'known',
+        'unknown',
       )
       await expect(
         f.native().prepareCall('fixture', 'gpt-5.4'),
@@ -2140,7 +2173,7 @@ describe('context settings and live model integration', () => {
       const call = await adapter.prepareCall('fixture', 'gpt-5.4')
       expect(call.model.context).toEqual({ contextWindow: 516000 })
       const snapshot = (adapter as any).current()
-      const sdk = vi.spyOn(snapshot.models, 'stream')
+      const sdk = vi.spyOn(snapshot.models, 'streamSimple')
       const nativeCapacity = snapshot.models.getModel(
         'fixture',
         'gpt-5.4',

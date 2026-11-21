@@ -79,8 +79,11 @@ it('refreshes Codex instructions on a real tool continuation without additional 
         [join(cwd, '.git'), join(cwd, 'AGENTS.md')].includes(path)
           ? {}
           : undefined,
-      readText: async (path: string) =>
-        path === join(cwd, 'AGENTS.md') ? version : '',
+      readByteRange: async (path: string, { length }: { length: number }) =>
+        Buffer.from(path === join(cwd, 'AGENTS.md') ? version : '').subarray(
+          0,
+          length,
+        ),
     } as any)
     ctx.provide('workingDirectory', { ensure: async () => cwd } as any)
     installCodexInstructions(

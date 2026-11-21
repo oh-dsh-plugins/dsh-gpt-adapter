@@ -1,3 +1,4 @@
+import { symbols } from '@deepseek-ai/cordis'
 import type { NativeExtension } from './host.js'
 import type { PreparedGptRequest } from './types.js'
 
@@ -22,16 +23,51 @@ type NativeAdapter = {
   stream(options: any): AsyncIterable<any>
 }
 
-/** Install a disposable extension without replacing the host's plugin entries. */
+type Capture = (
+  provider: string,
+  model: string,
+  base: any,
+  snapshot: Snapshot,
+) => NativeExtension | undefined
+// Isolated Cordis services and separately loaded plugin modules can share a prototype.
+const bridgeOwner = Symbol.for('dsh-gpt-adapter.native-adapter.owner')
+type Runtime = { adapters?: ReadonlyMap<string, { adapter: unknown }> }
+
+/** Install one dispatcher per prototype and one capture per LLM service. */
 export function installNativeAdapterBridge(
   prototype: NativeAdapter,
-  capture: (
-    provider: string,
-    model: string,
-    base: any,
-    snapshot: Snapshot,
-  ) => NativeExtension | undefined,
+  capture: Capture,
+  llm: object = prototype,
 ): () => void {
+  const runtime: Runtime = Reflect.get(llm, symbols.original) ?? llm
+  const state =
+    (Reflect.get(prototype, bridgeOwner) as
+      ReturnType<typeof patch> | undefined) ?? patch(prototype)
+  if (state.owners.has(runtime))
+    throw new Error('A GPT adapter bridge already owns this LLM service')
+  state.owners.set(runtime, capture)
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    state.owners.delete(runtime)
+    if (!state.owners.size) state.restore()
+  }
+}
+
+function patch(prototype: NativeAdapter) {
+  const owners = new Map<Runtime, Capture>()
+  function owner(
+    adapter: NativeAdapter,
+    provider: string,
+  ): Capture | undefined {
+    for (const [runtime, capture] of owners) {
+      if (runtime.adapters?.get(provider)?.adapter === adapter) return capture
+      // Direct bridge users can supply an adapter without a host registry.
+      if (!runtime.adapters && owners.size === 1) return capture
+    }
+    return undefined
+  }
   const original = {
     modelInfo: prototype.modelInfo,
     prepareCall: prototype.prepareCall,
@@ -164,9 +200,19 @@ export function installNativeAdapterBridge(
     model: string,
   ) {
     const base = original.modelInfo.call(this, snapshot, provider, model)
-    return capture(provider, model, base, snapshot)?.model ?? base
+    return (
+      owner(this, provider)?.(provider, model, base, snapshot)?.model ?? base
+    )
   }
-  function prepareCall(this: NativeAdapter, provider: string, model: string) {
+  function prepareCall(
+    this: NativeAdapter,
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ) {
+    const capture = owner(this, provider)
+    if (!capture)
+      return original.prepareCall.call(this, provider, model, signal)
     const snapshot = this.current()
     const base = original.modelInfo.call(this, snapshot, provider, model)
     const extension = capture(provider, model, base, snapshot)
@@ -177,6 +223,8 @@ export function installNativeAdapterBridge(
     })
   }
   function directStream(this: NativeAdapter, options: any) {
+    const capture = owner(this, options.provider)
+    if (!capture) return original.stream.call(this, options)
     const snapshot = this.current()
     const base = original.modelInfo.call(
       this,
@@ -192,10 +240,18 @@ export function installNativeAdapterBridge(
       base,
     )
   }
+  const state = { owners, restore }
+  Object.defineProperty(prototype, bridgeOwner, {
+    configurable: true,
+    value: state,
+  })
   prototype.modelInfo = modelInfo
   prototype.prepareCall = prepareCall
   prototype.stream = directStream
-  return () => {
+  return state
+
+  function restore() {
+    Reflect.deleteProperty(prototype, bridgeOwner)
     if (prototype.modelInfo === modelInfo)
       prototype.modelInfo = original.modelInfo
     if (prototype.prepareCall === prepareCall)

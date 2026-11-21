@@ -7,7 +7,6 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   readCodexConfig,
   projectDirectories,
-  projectText,
   strings,
   type JsonObject,
   type ProjectFileSystem,
@@ -109,23 +108,33 @@ export async function loadCodexInstructions(
     optionalPrefix(path, prefixLimit(path), signal)
   const projectRead = async (path: string) => {
     if (!fs) return hostRead(path)
-    const text = (await projectText(path, fs, signal))?.trim()
     signal?.throwIfAborted()
-    if (text === undefined) return undefined
+    const target = await fs.resolve(path, signal ? { signal } : {})
+    if (!(await fs.stat(target, signal))) return undefined
+    if (!fs.readByteRange)
+      throw new Error('Project instruction prefix reads unavailable')
     const limit = prefixLimit(path)
-    return {
-      content: truncateUtf8(text, limit),
-      truncated: Buffer.byteLength(text) > limit,
-    }
+    // One byte beyond the prefix distinguishes an exact fit from more input.
+    const window = await fs.readByteRange(
+      target,
+      { offset: 0, length: limit + 1 },
+      signal,
+    )
+    signal?.throwIfAborted()
+    const bytes = window.subarray(0, limit)
+    if (bytes.includes(0))
+      throw new Error('Project instructions contain binary data')
+    const truncated = window.length > limit
+    const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes, {
+      stream: truncated,
+    })
+    return { content, truncated }
   }
   const add = (file: CodexInstructionFile | undefined) => {
     if (
       file &&
-      !result.some(
-        (p) =>
-          p.path === file.path ||
-          (!file.truncated && p.content === file.content),
-      )
+      !result.some((p) => p.path === file.path) &&
+      (file.truncated || result.at(-1)?.content !== file.content)
     ) {
       const text = `Instructions from: ${file.path}\n\n${file.content}`
       remaining = file.truncated

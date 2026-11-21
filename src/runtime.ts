@@ -116,7 +116,8 @@ export class ModelSynchronizer {
     if (this.stopped) return Promise.reject(new Error('synchronizer stopped'))
     const preceding = this.pruning ?? this.pending
     const work = (async () => {
-      await preceding
+      // Serialize with the previous operation, then use the last committed snapshot.
+      await preceding?.catch(() => undefined)
       if (this.stopped) throw new Error('synchronizer stopped')
       if (!this.snapshot) throw new Error('no model snapshot available')
       const next = pruneStale(this.snapshot, ids)

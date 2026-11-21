@@ -40,6 +40,8 @@ const filesystem = {
         }
       : undefined
   },
+  readByteRange: async (target: any, { length }: { length: number }) =>
+    (await nodeRead(target.displayPath)).subarray(0, length),
   readText: (target: any, _signal?: AbortSignal) =>
     nodeRead(target.displayPath, 'utf8'),
   listDir: async (target: any) =>

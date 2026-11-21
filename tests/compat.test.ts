@@ -239,7 +239,11 @@ describe('built plugin and official transport integration', () => {
         ...(tierOnly ? {} : { reasoning: 'high' as const }),
         baseURL: 'https://fixture.invalid/v1',
         apiKeyEnv: 'TEST_API_KEY',
-        models: [{ id: modelId }],
+        models: [
+          tierOnly
+            ? { id: modelId }
+            : { id: modelId, reasoningEfforts: { high: 'high' } },
+        ],
       }
       ctx.provide('settings', {
         configure: () => () => {},
@@ -560,7 +564,6 @@ describe('built plugin and official transport integration', () => {
       cleanup.push(() => ctx.fiber.dispose())
       const profile = {
         api: protocol,
-        reasoning: 'high' as const,
         baseURL: 'https://fixture.invalid/v1',
         apiKeyEnv: 'TEST_API_KEY',
         models: [
@@ -574,6 +577,7 @@ describe('built plugin and official transport integration', () => {
             id: 'gpt-unreported',
             reasoningEfforts: { low: 'low', high: 'high' },
           },
+          { id: 'gpt-4o' },
         ],
       }
       const options = {
@@ -582,7 +586,19 @@ describe('built plugin and official transport integration', () => {
           fixture: {
             enabled: true,
             refreshIntervalMs: 1800000,
-            overridesJSON: '{}',
+            overridesJSON: JSON.stringify({
+              'gpt-local-only': {
+                reasoningChoices: [
+                  'low',
+                  'medium',
+                  'high',
+                  'xhigh',
+                  'max',
+                  'ultra',
+                ].map((id) => ({ id, label: id, wireValue: id })),
+                defaultReasoningId: 'high',
+              },
+            }),
           },
         },
       }
@@ -612,8 +628,6 @@ describe('built plugin and official transport integration', () => {
           Object.assign(() => {}, { replace() {} }),
         registerModelDiscovery: () => () => {},
       })
-      if (protocol === 'openai-completions')
-        options.routes = {} as typeof options.routes
       const requests: Array<Record<string, unknown>> = []
       vi.stubGlobal(
         'fetch',
@@ -627,9 +641,8 @@ describe('built plugin and official transport integration', () => {
                     reasoning_supported_efforts: ['max', 'ultra'],
                     service_tiers: ['default', 'priority', 'ultrafast'],
                   },
-                  {
-                    id: 'gpt-unreported',
-                  },
+                  { id: 'gpt-unreported' },
+                  { id: 'gpt-4o' },
                 ],
               }),
             )
@@ -749,8 +762,19 @@ describe('built plugin and official transport integration', () => {
       if (protocol === 'openai-responses')
         expect(requests[1]!.reasoning).toMatchObject({ effort: 'high' })
       else expect(requests[1]!.reasoning_effort).toBe('high')
-      // Every preset, including Ultra, works even before the upstream lists a
-      // configured model, through both real SDK serializers.
+      const plain = await adapter!.prepareCall('fixture', 'gpt-4o')
+      for await (const _chunk of plain.stream({
+        provider: 'fixture',
+        model: 'gpt-4o',
+        sessionId,
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      })) {
+      }
+      expect(requests.at(-1)).not.toHaveProperty('reasoning')
+      expect(requests.at(-1)).not.toHaveProperty('reasoning_effort')
+      // A user override can supply all six levels for a configured-only model.
       await service.setSpeed(sessionId, 'fixture', 'gpt-local-only', 'fast')
       const local = await adapter!.prepareCall('fixture', 'gpt-local-only')
       const levels = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
