@@ -27,7 +27,7 @@
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.15
+dsh plugin --profile web add dsh-gpt-adapter@0.2.16
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.15.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.16.tgz
 ```
 
 ## 使用 GPT 模型
@@ -55,7 +55,7 @@ Fast 会请求上游优先档位。上游模型元数据决定是否自动提供
 
 使用提供商卡片上的「立即同步」刷新模型列表。上游不再列出的模型会保留到主动移除。卡片还可配置同步间隔、可选的能力目录地址和模型能力覆盖。显式能力覆盖优先于上游元数据、外部能力目录和预设，但自动能力解析仍保留上游明确不支持 Ultrafast 的声明。独立的手动选择开关并不表示上游支持此能力。
 
-**从旧版六档预设迁移。** 当网关只列出模型 ID（包括 `gpt-4o`）时，思考等级和请求参数沿用 DSH 的行为，原生思考等级映射仍可编辑。如果网关支持 `max` 或 `ultra`，但未提供推理元数据，可在能力目录或该模型的 `reasoningChoices` 覆盖中声明支持的等级和实际请求值。如果原先选择的是旧预设中的等级，请重新选择可用等级。
+**从旧版六档预设迁移。** 当网关只列出模型 ID（包括 `gpt-4o`）时，思考等级和请求参数通常沿用 DSH 的行为，原生思考等级映射仍可编辑。网关、能力目录和原生模型设置都没有为 `gpt-6.2-sol` 声明思考等级时，插件会提供 `low`、`medium`、`high` 和 `xhigh` 作为后备选项。如果网关支持 `max` 或 `ultra`，但未提供推理元数据，可在能力目录或该模型的 `reasoningChoices` 覆盖中声明支持的等级和实际请求值。如果原先选择的是旧预设中的等级，请重新选择可用等级。
 
 ### 上下文窗口
 

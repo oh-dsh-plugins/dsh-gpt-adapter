@@ -15,6 +15,39 @@ describe('GPT capability resolution', () => {
       })
     },
   )
+  it('uses the Sol reasoning preset only when the route has no declared choices', () => {
+    const id = 'gpt-6.2-sol'
+    const fallback = resolveCapabilities({ id }, 'test')
+    expect(fallback.reasoning.choices.map((choice) => choice.id)).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ])
+    expect(fallback.reasoning.defaultId).toBeUndefined()
+    const advertised = [
+      {
+        id: 'high',
+        label: 'High',
+        wireValue: 'high',
+        source: 'upstream' as const,
+      },
+    ]
+    const upstream = { id, capabilities: { reasoningChoices: advertised } }
+    expect(resolveCapabilities(upstream, 'test').reasoning.choices).toEqual(
+      advertised,
+    )
+    expect(
+      resolveCapabilities(upstream, 'test', { reasoningChoices: [] }).reasoning,
+    ).toEqual({ status: 'unsupported', choices: [] })
+    expect(
+      resolveCapabilities(
+        { id, capabilities: { supportsReasoning: false } },
+        'test',
+      ).reasoning,
+    ).toEqual({ status: 'unsupported', choices: [] })
+  })
+
   it('keeps Max and Ultra as separate native choices', () => {
     const capabilities = resolveCapabilities({ id: 'gpt-6-astra' }, 'test', {
       reasoningChoices: [

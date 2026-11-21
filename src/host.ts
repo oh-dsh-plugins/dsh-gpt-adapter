@@ -1532,7 +1532,12 @@ export class GptModels extends Service {
     provider: string,
     modelId: string,
     displayName?: string,
-    profileOverride?: { api?: string; reasoning?: string },
+    profileOverride?: {
+      api?: string
+      reasoning?: string
+      models?: Array<{ id: string; reasoningEfforts?: unknown }>
+      modelOverrides?: Record<string, { reasoningEfforts?: unknown }>
+    },
     read?: SettingsRead,
   ): ModelCapabilities | undefined {
     if (!isGptModel({ id: modelId })) return undefined
@@ -1556,6 +1561,9 @@ export class GptModels extends Service {
     const snapshot = read.snapshots.get(provider)
     const raw = this.upstreamModel(read, provider, modelId)
     const catalog = snapshot?.catalog?.models[modelId]
+    const nativeModel = profile.models?.length
+      ? this.modelIndex(read, profile).get(modelId)
+      : profile.modelOverrides?.[modelId]
     // Cached capabilities already contain old local overrides. Rebuild from
     // raw metadata so removing an override takes effect without a network refresh.
     const result = resolveCapabilities(
@@ -1576,6 +1584,7 @@ export class GptModels extends Service {
       },
       snapshot?.capabilities[modelId]?.capabilityRevision ?? 'gpt-preset',
       override,
+      nativeModel?.reasoningEfforts !== undefined,
     )
     return {
       ...result,

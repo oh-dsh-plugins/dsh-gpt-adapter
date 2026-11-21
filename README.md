@@ -27,7 +27,7 @@ Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`,
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.15
+dsh plugin --profile web add dsh-gpt-adapter@0.2.16
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.15.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.16.tgz
 ```
 
 ## Using GPT models
@@ -55,7 +55,7 @@ Fast requests the upstream priority tier. Upstream model metadata controls autom
 
 Use **Sync now** on the provider card to refresh the model list. Models no longer listed upstream are retained until you choose to remove them. You can also configure the sync interval, an optional capability catalog URL, and model capability overrides on that card. Explicit capability overrides take precedence over upstream metadata, external catalogs, and presets, except that an upstream Ultrafast denial is retained for automatic capability resolution. The separate manual-selection switch does not assert upstream support.
 
-**Migrating from the six-level preset.** When the gateway lists only a model ID (including `gpt-4o`), DSH controls its reasoning options and request parameters. Your native reasoning mappings remain editable. If your gateway supports `max` or `ultra` but omits reasoning metadata, declare its supported levels and wire values in a capability catalog or a per-model `reasoningChoices` override. Select an available level again if your previous selection came from the preset.
+**Migrating from the six-level preset.** When the gateway lists only a model ID (including `gpt-4o`), DSH normally controls its reasoning options and request parameters, and native reasoning mappings remain editable. For `gpt-6.2-sol`, the plugin provides `low`, `medium`, `high`, and `xhigh` as a fallback when the gateway, capability catalog, and native model settings omit reasoning choices. If your gateway supports `max` or `ultra` but omits reasoning metadata, declare its supported levels and wire values in a capability catalog or a per-model `reasoningChoices` override. Select an available level again if your previous selection came from the preset.
 
 ### Context windows
 

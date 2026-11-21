@@ -578,6 +578,7 @@ describe('built plugin and official transport integration', () => {
             reasoningEfforts: { low: 'low', high: 'high' },
           },
           { id: 'gpt-4o' },
+          { id: 'gpt-6.2-sol' },
         ],
       }
       const options = {
@@ -643,6 +644,7 @@ describe('built plugin and official transport integration', () => {
                   },
                   { id: 'gpt-unreported' },
                   { id: 'gpt-4o' },
+                  { id: 'gpt-6.2-sol' },
                 ],
               }),
             )
@@ -830,6 +832,48 @@ describe('built plugin and official transport integration', () => {
         selected: 'default',
         last: { requested: 'default', actual: 'default' },
       })
+      // An existing session can request xhigh when /models only lists the ID.
+      const sol = await adapter!.prepareCall('fixture', 'gpt-6.2-sol')
+      const solChunks = []
+      for await (const chunk of sol.stream({
+        provider: 'fixture',
+        model: 'gpt-6.2-sol',
+        sessionId,
+        reasoningEffort: ReasoningEffortId('xhigh'),
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      }))
+        solChunks.push(chunk)
+      expect(solChunks.at(-1)).toMatchObject({
+        type: 'finish',
+        reason: { kind: 'stop' },
+      })
+      const solPayload = requests.at(-1)!
+      expect(solPayload.model).toBe('gpt-6.2-sol')
+      if (protocol === 'openai-responses')
+        expect(solPayload.reasoning).toMatchObject({ effort: 'xhigh' })
+      else expect(solPayload.reasoning_effort).toBe('xhigh')
+      expect(sol.model.reasoning?.efforts.map((effort) => effort.id)).toContain(
+        'xhigh',
+      )
+      const solRow = profile.models.find(({ id }) => id === 'gpt-6.2-sol')!
+      Object.assign(solRow, { reasoningEfforts: { high: 'native-high' } })
+      expect(
+        service.capture('fixture', 'gpt-6.2-sol', {
+          provider: 'fixture',
+          id: 'gpt-6.2-sol',
+          name: sol.model.name,
+        }),
+      ).toMatchObject({
+        preserveReasoning: true,
+      })
+      const settingsView = ctx.settings.describe()[0]!.value as any
+      expect(
+        settingsView.providers.fixture.models.find(
+          (model: { id: string }) => model.id === 'gpt-6.2-sol',
+        ).reasoningEfforts,
+      ).toEqual({ high: 'native-high' })
       // Non-GPT routes continue through the original adapter path.
       const legacy = await adapter!.prepareCall('fixture', 'legacy-model')
       expect(legacy.model.reasoning).toBeUndefined()
