@@ -18,7 +18,7 @@ const GPT_SPEED_PRESET: ServiceTierChoice[] = [
   { ...presetTier('fast', 'Fast'), wireValue: 'priority' },
 ]
 
-/** Recognized GPT defaults; a level is available only when declared. */
+/** Recognized GPT profile defaults. */
 export const GPT_REASONING_LEVELS = [
   'low',
   'medium',
@@ -27,6 +27,14 @@ export const GPT_REASONING_LEVELS = [
   'max',
   'ultra',
 ] as const
+
+// Keep existing GPT-6.2 Sol selections working on gateways with ID-only listings.
+const GPT_62_SOL_REASONING: ReasoningChoice[] = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+].map((id) => ({ id, label: id, wireValue: id, source: 'catalog' }))
 
 const GPT_PRESET = {
   serviceTiers: GPT_SPEED_PRESET,
@@ -49,11 +57,17 @@ export function resolveCapabilities(
   model: UpstreamModel,
   revision: string,
   override?: ModelOverride,
+  hasNativeReasoning = false,
 ): ModelCapabilities {
   const base = catalogFor(model.id)
   const upstream = model.capabilities
   const displayName = override?.displayName ?? model.displayName ?? model.id
-  const choices = override?.reasoningChoices ?? upstream?.reasoningChoices
+  const choices =
+    override?.reasoningChoices ??
+    upstream?.reasoningChoices ??
+    (!hasNativeReasoning && model.id === 'gpt-6.2-sol'
+      ? GPT_62_SOL_REASONING
+      : undefined)
   const supportsReasoning =
     override?.supportsReasoning ??
     (override?.reasoningChoices === undefined
