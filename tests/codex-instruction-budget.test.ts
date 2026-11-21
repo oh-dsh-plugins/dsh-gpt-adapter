@@ -34,6 +34,34 @@ afterEach(async () => {
 })
 
 describe('nonzero Codex instruction budget', () => {
+  it.each([200, 201])(
+    'respects the project budget with %i body bytes and a final newline',
+    async (size) => {
+      const root = '/project'
+      const path = join(root, 'AGENTS.md')
+      const budget = Buffer.byteLength(`Instructions from: ${path}\n\n`) + 200
+      const bytes = Buffer.from('X'.repeat(size) + '\n')
+      const files = await loadCodexInstructions(
+        '/codex',
+        root,
+        { project_doc_max_bytes: budget },
+        '/dsh',
+        '/agents',
+        {
+          resolve: async (p) => p,
+          stat: async (p) => (p === path ? {} : undefined),
+          readText: vi.fn(),
+          readByteRange: async (_, { length }) => bytes.subarray(0, length),
+        },
+        undefined,
+        [root],
+      )
+      const output = renderCodexInstructions(files, budget)
+      expect(output.includes('Instruction budget reached')).toBe(size > 200)
+      if (size === 200) expect(output).toContain('X'.repeat(200))
+    },
+  )
+
   it.each([' '.repeat(2048) + 'OVERRIDE', '😀'.repeat(1024)])(
     'keeps a clipped override instead of falling back to its base',
     async (text) => {
@@ -166,13 +194,20 @@ describe('nonzero Codex instruction budget', () => {
 
   it('stops scoped filesystem reads once the first source exhausts the budget', async () => {
     const f = fixture(1)
-    f.filesystem.readText.mockResolvedValue('😀'.repeat(262144))
+    f.filesystem.readByteRange.mockImplementation(async (_target, { length }) =>
+      Buffer.from('😀'.repeat(16)).subarray(0, length),
+    )
     const decision = await f.run([
       f.user,
       native('AGENTS.md', '.\0AGENTS.md', 'DROP_NATIVE_PROJECT'),
       native('AGENTS.md', 'user-global\0AGENTS.md', 'DROP_NATIVE_GLOBAL'),
     ])
-    expect(f.filesystem.readText).toHaveBeenCalledTimes(1)
+    expect(f.filesystem.readByteRange).toHaveBeenCalledTimes(1)
+    expect(f.filesystem.readByteRange.mock.calls[0]?.[1]).toEqual({
+      offset: 0,
+      length: 5, // four prefix bytes plus the EOF probe
+    })
+    expect(f.filesystem.readText).not.toHaveBeenCalled()
     expect(baseline(decision).content[0].text).toContain(
       'Instruction budget reached',
     )
@@ -193,6 +228,10 @@ function fixture(initialBudget: number | undefined = 0) {
         : undefined,
     ),
     readText: vi.fn(async () => 'PROJECT_INSTRUCTIONS'),
+    readByteRange: vi.fn(
+      async (_target: string, { length }: { length: number }) =>
+        Buffer.from('PROJECT_INSTRUCTIONS').subarray(0, length),
+    ),
   }
   let budget = initialBudget
   const readConfig = vi.fn(async () => ({
@@ -286,6 +325,7 @@ describe('zero Codex instruction budget', () => {
     expect(JSON.stringify(result.messages)).not.toMatch(/DROP_/)
     expect(hostRead).not.toHaveBeenCalled()
     expect(f.filesystem.readText).not.toHaveBeenCalled()
+    expect(f.filesystem.readByteRange).not.toHaveBeenCalled()
   })
 
   it('revokes an existing baseline when the budget becomes zero and does not repeat it', async () => {
@@ -296,6 +336,7 @@ describe('zero Codex instruction budget', () => {
     f.setBudget(0)
     hostRead.mockClear()
     f.filesystem.readText.mockClear()
+    f.filesystem.readByteRange.mockClear()
     const cleared = await f.run([
       f.user,
       native('AGENTS.md', '.\0AGENTS.md', 'DROP_PROJECT'),
@@ -314,6 +355,7 @@ describe('zero Codex instruction budget', () => {
     expect((await f.run([])).messages).toEqual([])
     expect(hostRead).not.toHaveBeenCalled()
     expect(f.filesystem.readText).not.toHaveBeenCalled()
+    expect(f.filesystem.readByteRange).not.toHaveBeenCalled()
   })
 
   it('does not start an empty first step', async () => {
@@ -323,6 +365,7 @@ describe('zero Codex instruction budget', () => {
     expect(f.readConfig).not.toHaveBeenCalled()
     expect(hostRead).not.toHaveBeenCalled()
     expect(f.filesystem.readText).not.toHaveBeenCalled()
+    expect(f.filesystem.readByteRange).not.toHaveBeenCalled()
   })
 
   it('preserves cancellation before any instruction work', async () => {
@@ -334,6 +377,7 @@ describe('zero Codex instruction budget', () => {
     expect(f.ensure).not.toHaveBeenCalled()
     expect(hostRead).not.toHaveBeenCalled()
     expect(f.filesystem.readText).not.toHaveBeenCalled()
+    expect(f.filesystem.readByteRange).not.toHaveBeenCalled()
   })
 
   it('propagates cancellation during directory discovery without publishing a baseline', async () => {
@@ -348,6 +392,7 @@ describe('zero Codex instruction budget', () => {
     expect(f.warn).not.toHaveBeenCalled()
     expect(hostRead).not.toHaveBeenCalled()
     expect(f.filesystem.readText).not.toHaveBeenCalled()
+    expect(f.filesystem.readByteRange).not.toHaveBeenCalled()
   })
 
   it('propagates cancellation when the repository marker is found', async () => {
@@ -365,5 +410,6 @@ describe('zero Codex instruction budget', () => {
     expect(f.warn).not.toHaveBeenCalled()
     expect(hostRead).not.toHaveBeenCalled()
     expect(f.filesystem.readText).not.toHaveBeenCalled()
+    expect(f.filesystem.readByteRange).not.toHaveBeenCalled()
   })
 })

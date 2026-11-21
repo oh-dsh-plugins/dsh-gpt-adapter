@@ -176,6 +176,11 @@ export type ProjectFileSystem = {
   resolve(path: string, options?: { signal?: AbortSignal }): Promise<any>
   stat(target: any, signal?: AbortSignal): Promise<unknown>
   readText(target: any, signal?: AbortSignal): Promise<string>
+  readByteRange?(
+    target: any,
+    range: { offset: number; length: number },
+    signal?: AbortSignal,
+  ): Promise<Uint8Array>
 }
 
 export async function projectText(
@@ -253,13 +258,30 @@ export async function readCodexConfig(
     })
     .sort(([a], [b]) => b.length - a.length)[0]
   if (object(trust?.[1]).trust_level !== 'trusted') return config
+  const projectCommands = new Set<string>()
   for (const directory of await projectDirectories(cwd, fs, signal)) {
     const layer = await projectText(
       join(directory, '.codex', 'config.toml'),
       fs,
       signal,
     )
-    if (layer !== undefined) config = mergeConfig(config, object(parse(layer)))
+    if (layer === undefined) continue
+    const parsed = object(parse(layer))
+    for (const [name, server] of Object.entries(object(parsed.mcp_servers)))
+      if (typeof object(server).command === 'string') projectCommands.add(name)
+    config = mergeConfig(config, parsed)
+  }
+  // Only project-supplied commands without an explicit working directory use
+  // the Agent cwd. Entries with inherited user commands keep the user base.
+  for (const name of projectCommands) {
+    const entry = object(config.mcp_servers?.[name])
+    if (
+      typeof entry.cwd !== 'string' &&
+      typeof entry.command === 'string' &&
+      entry.command.includes('/') &&
+      !isAbsolute(entry.command)
+    )
+      entry.command = resolve(cwd, entry.command)
   }
   return config
 }
@@ -280,6 +302,20 @@ export function normalizeCodexMcp(
 ): CodexMcpConfig | undefined {
   const raw = object(value)
   if (raw.enabled === false) return undefined
+  if (raw.type !== undefined) {
+    if (!['stdio', 'http', 'streamable-http'].includes(raw.type))
+      throw new Error('unsupported-transport')
+    const [endpoint, conflict] =
+      raw.type === 'stdio'
+        ? (['command', 'url'] as const)
+        : (['url', 'command'] as const)
+    if (
+      typeof raw[endpoint] !== 'string' ||
+      !raw[endpoint].trim() ||
+      Object.hasOwn(raw, conflict)
+    )
+      throw new Error('transport-config-conflict')
+  }
   const headers: Record<string, string> = {}
   const setHeader = (name: string, value: string) => {
     for (const previous of Object.keys(headers))
@@ -302,8 +338,6 @@ export function normalizeCodexMcp(
     if (!token) throw new Error('missing-environment')
     setHeader('Authorization', `Bearer ${token}`)
   }
-  if (raw.type && !['stdio', 'http', 'streamable-http'].includes(raw.type))
-    throw new Error('unsupported-transport')
   const seconds = (value: unknown, fallback: number) => {
     const number = value === undefined ? fallback : Number(value)
     if (!Number.isFinite(number) || number <= 0 || number > 2147483)
@@ -564,8 +598,25 @@ export async function discoverCodexSnapshot(
             entry.source === source &&
             entry.originalName === name,
         )
-        if (previous) retainServer(previous, raw)
+        // An unparseable, untyped URL does not establish a transport change.
+        const transport =
+          raw.type ??
+          (typeof raw.url === 'string' && URL.canParse(raw.url)
+            ? 'http'
+            : typeof raw.command === 'string'
+              ? 'stdio'
+              : undefined)
+        if (
+          previous &&
+          (transport === undefined ||
+            previous.transport ===
+              (transport === 'stdio' ? 'stdio' : 'streamable-http')) &&
+          error.message !== 'transport-config-conflict' &&
+          error.message !== 'unsupported-transport'
+        )
+          retainServer(previous, raw)
         const reason = [
+          'transport-config-conflict',
           'missing-environment',
           'unsupported-transport',
           'namespace-conflict',
@@ -678,6 +729,12 @@ export async function discoverCodexSnapshot(
   return result
 }
 
+function isBundledSkill(path: string): boolean {
+  const nativePath =
+    process.platform === 'win32' ? path.replaceAll('\\', '/') : path
+  return /(?:^|\/)skills\/\.system\//.test(nativePath)
+}
+
 export function skillEnabled(
   config: JsonObject,
   skill: { name: string; path?: string },
@@ -698,7 +755,8 @@ export function skillEnabled(
   }
   if (
     config.skills?.bundled?.enabled === false &&
-    skill.path?.includes(`${join('skills', '.system')}/`)
+    skill.path &&
+    isBundledSkill(skill.path)
   )
     return false
   return enabled
@@ -752,7 +810,8 @@ export async function skillEnabledWithFs(
   }
   if (
     config.skills?.bundled?.enabled === false &&
-    skill.path?.includes(`${join('skills', '.system')}/`)
+    skill.path &&
+    isBundledSkill(skill.path)
   )
     return false
   return enabled

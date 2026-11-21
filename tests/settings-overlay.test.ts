@@ -12,7 +12,15 @@ import { installSettingsOverlay } from '../src/settings-overlay.js'
 const preset = Object.fromEntries(
   GPT_REASONING_LEVELS.map((level) => [level, level]),
 )
-function fixture() {
+const explicit = {
+  reasoningChoices: GPT_REASONING_LEVELS.map((id) => ({
+    id,
+    label: id,
+    wireValue: id,
+    source: 'user' as const,
+  })),
+}
+function fixture(known = true) {
   let enabled = true
   let raw: any = {
     providers: {
@@ -62,7 +70,11 @@ function fixture() {
   const beforeWrite = settings.write
   const resolve = (provider: string, model: Record<string, any>) =>
     enabled && provider === 'gateway' && model.id.startsWith('gpt-')
-      ? resolveCapabilities({ id: model.id }, 'test')
+      ? resolveCapabilities(
+          { id: model.id },
+          'test',
+          known ? explicit : undefined,
+        )
       : undefined
   const dispose = installSettingsOverlay(settings, resolve)
   return {
@@ -85,6 +97,20 @@ function schemaLevels(json: any) {
 }
 
 describe('plugin-owned reasoning on the native Models page', () => {
+  it('keeps the native schema, mappings, and edits when reasoning is unknown', async () => {
+    const f = fixture(false)
+    const row = f.settings.describe()[0]!
+    expect(row.schema).toEqual(f.originalSchema)
+    expect(row.value).toEqual(f.raw())
+    await f.settings.write('llm-pi-ai', (current) => {
+      current.providers.gateway.models[0].reasoningEfforts = { minimal: 'low' }
+      return current
+    })
+    expect(f.raw().providers.gateway.models[0].reasoningEfforts).toEqual({
+      minimal: 'low',
+    })
+    f.dispose()
+  })
   it('keeps prior-model matching linear when saving a large model list', async () => {
     const count = 1000
     let idReads = 0
@@ -249,7 +275,7 @@ describe('plugin-owned reasoning on the native Models page', () => {
     new NativeSettings()
     const service = (ctx as any).overlayFixture
     const dispose = installSettingsOverlay(service, (_provider, model) =>
-      resolveCapabilities({ id: model.id }, 'test'),
+      resolveCapabilities({ id: model.id }, 'test', explicit),
     )
     const other = (ctx.extend({}) as any).overlayFixture
     expect(

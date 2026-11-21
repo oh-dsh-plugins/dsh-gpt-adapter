@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** One plugin-owned JSON file per route/session; no API keys are written here. */
@@ -17,9 +24,37 @@ export class JsonStorage {
     key: string,
     validate?: (value: unknown) => value is T,
   ): Promise<T | undefined> {
+    return this.readPath(this.path(key), validate)
+  }
+
+  async readAll<T>(validate: (value: unknown) => value is T): Promise<T[]> {
+    let names: string[]
+    try {
+      names = await readdir(this.directory)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw error
+    }
+    const values: T[] = []
+    for (const name of names) {
+      if (!/^[0-9a-f]{64}\.json$/.test(name)) continue
+      const value = await this.readPath(join(this.directory, name), validate)
+      if (value !== undefined) values.push(value)
+    }
+    return values
+  }
+
+  async remove(key: string): Promise<void> {
+    await rm(this.path(key), { force: true })
+  }
+
+  private async readPath<T>(
+    path: string,
+    validate?: (value: unknown) => value is T,
+  ): Promise<T | undefined> {
     let source: string
     try {
-      source = await readFile(this.path(key), 'utf8')
+      source = await readFile(path, 'utf8')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw error

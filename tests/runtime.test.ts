@@ -165,6 +165,49 @@ describe('automatic refresh lifecycle', () => {
     runner.dispose()
   })
 
+  it.each([false, true])(
+    'cleans the last snapshot after a failed refresh (write fails: %s)',
+    async (writeFails) => {
+      const local = { ...config, capabilityCatalogUrl: '' }
+      const first = await synchronize(local, undefined, async () =>
+        reply({ data: [{ id: 'gpt-old' }, { id: 'gpt-keep' }] }),
+      )
+      const { snapshot } = await synchronize(local, first.snapshot, async () =>
+        reply({ data: [{ id: 'gpt-keep' }] }),
+      )
+      const runner = new ModelSynchronizer(
+        async () => local,
+        async () => {
+          if (writeFails) throw new Error('write failed')
+        },
+        async () => {
+          throw new Error('offline')
+        },
+        snapshot,
+      )
+      try {
+        const refresh = runner.refresh()
+        const cleanup = runner.removeStale(['gpt-old'])
+        await expect(refresh).rejects.toThrow('offline')
+        expect(runner.getStatus()).toMatchObject({
+          state: 'error',
+          error: 'offline',
+        })
+        if (writeFails) {
+          await expect(cleanup).rejects.toThrow('write failed')
+          expect(runner.current()).toEqual(snapshot)
+        } else {
+          await cleanup
+          expect(runner.current()?.models.map((m) => m.id)).toEqual([
+            'gpt-keep',
+          ])
+        }
+      } finally {
+        runner.dispose()
+      }
+    },
+  )
+
   it('waits for stale cleanup before refreshing from its snapshot', async () => {
     let absent = false,
       pause = false

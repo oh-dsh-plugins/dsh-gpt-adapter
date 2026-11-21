@@ -76,6 +76,7 @@ describe('upstream model synchronization', () => {
   it('ignores unusable structured tier entries without losing recognized tiers or other models', async () => {
     const id = 'gpt-6.2-sol'
     const unrelated = 'gpt-other'
+
     const { snapshot } = await synchronize(
       {
         baseUrl: 'https://fixture.invalid',
@@ -114,6 +115,55 @@ describe('upstream model synchronization', () => {
     ).toEqual(['default', 'priority'])
   })
 
+  it('validates service tiers only for models selected by the route', async () => {
+    const config = {
+      baseUrl: 'https://fixture.invalid',
+      apiKey: 'fixture',
+      cacheIdentity: 'fixture',
+      refreshIntervalMs: 1000,
+    }
+    const { snapshot } = await synchronize(config, undefined, async () =>
+      response(
+        {
+          data: [{ id: 'gpt-good' }, { id: 'other', service_tiers: ['flex'] }],
+        },
+        { headers: { etag: 'fixture' } },
+      ),
+    )
+    expect(snapshot.models.map((model) => model.id)).toEqual(['gpt-good'])
+    expect(restoreSnapshot(config, snapshot)?.models).toEqual(snapshot.models)
+    const all = { ...config, includeModel: () => true }
+    expect(restoreSnapshot(all, snapshot)).toBeUndefined()
+    await expect(
+      synchronize(
+        all,
+        snapshot,
+        async () => new Response(null, { status: 304 }),
+      ),
+    ).rejects.toThrow('model other declares no supported service tiers')
+  })
+
+  it('discovers bare o1 and o3 without matching unrelated prefixes', async () => {
+    const { snapshot } = await synchronize(
+      {
+        baseUrl: 'https://fixture.invalid',
+        apiKey: 'fixture',
+        cacheIdentity: 'fixture',
+        refreshIntervalMs: 1000,
+      },
+      undefined,
+      async () =>
+        response({
+          data: ['o1', 'o3', 'o3-mini', 'o10', 'o3rd'].map((id) => ({ id })),
+        }),
+    )
+    expect(snapshot.models.map((model) => model.id)).toEqual([
+      'o1',
+      'o3',
+      'o3-mini',
+    ])
+  })
+
   it.each(['', ' \t'])(
     'uses the model ID for an empty upstream name (%j)',
     async (displayName) => {
@@ -137,19 +187,63 @@ describe('upstream model synchronization', () => {
     },
   )
 
-  it.each([[[]], [['auto']], [['unknown']]])(
-    'refuses unusable catalog service tiers before publishing them (%j)',
-    async (serviceTiers) => {
-      await expect(
-        fetchCapabilityCatalog('https://catalog.invalid', async () =>
-          response({
-            version: 'fixture',
-            models: { 'gpt-fixture': { service_tiers: serviceTiers } },
-          }),
-        ),
-      ).rejects.toThrow('no supported service tiers')
-    },
-  )
+  it('validates catalog tiers only for selected models on fetch, 304 and restore', async () => {
+    const config = {
+      baseUrl: 'https://gateway.invalid',
+      apiKey: 'fixture',
+      cacheIdentity: 'fixture',
+      refreshIntervalMs: 1000,
+      capabilityCatalogUrl: 'https://catalog.invalid',
+    }
+    const request: FetchLike = async (url, init) => {
+      if (url === config.capabilityCatalogUrl)
+        return response({
+          version: 'v1',
+          models: {
+            'gpt-good': { context_window: 321000 },
+            other: { service_tiers: ['flex'] },
+          },
+        })
+      return new Headers(init?.headers).has('if-none-match')
+        ? new Response(null, { status: 304 })
+        : response(
+            { data: [{ id: 'gpt-good' }, { id: 'other' }] },
+            {
+              headers: { etag: 'v1' },
+            },
+          )
+    }
+    const { snapshot } = await synchronize(config, undefined, request)
+    expect(Object.keys(snapshot.capabilities)).toEqual(['gpt-good'])
+    expect(snapshot.capabilities['gpt-good']?.contextWindow).toBe(321000)
+    const cached = JSON.parse(JSON.stringify(snapshot))
+    expect(restoreSnapshot(config, cached)?.capabilities).toEqual(
+      snapshot.capabilities,
+    )
+    const refreshed = await synchronize(config, cached, request)
+    expect(refreshed.changed).toBe(false)
+    expect(refreshed.snapshot.source).toBe('cache')
+    const widened = { ...config, includeModel: () => true }
+    const error = 'model other declares no supported service tiers'
+    for (const previous of [undefined, cached])
+      await expect(synchronize(widened, previous, request)).rejects.toThrow(
+        error,
+      )
+    expect(() => restoreSnapshot(widened, cached)).toThrow(error)
+  })
+
+  it.each([
+    { version: '', models: {} },
+    { version: 'v1', models: [] },
+    { version: 'v1', models: { other: null } },
+    { version: 'v1', models: { '': {} } },
+  ])('rejects malformed capability catalogs (%j)', async (catalog) => {
+    await expect(
+      fetchCapabilityCatalog('https://catalog.invalid', async () =>
+        response(catalog),
+      ),
+    ).rejects.toThrow('invalid capability catalog')
+  })
 
   it.each([
     { models: [null] },
@@ -228,16 +322,10 @@ describe('upstream model synchronization', () => {
       'test',
     )
     expect(snapshot.models.map((model) => model.id)).toEqual(['gpt-6-astra'])
-    expect(
-      snapshot.capabilities['gpt-6-astra']?.reasoning.choices.some(
-        (choice) => choice.id === 'max',
-      ),
-    ).toBe(true)
-    expect(
-      snapshot.capabilities['gpt-6-astra']?.reasoning.choices.some(
-        (choice) => choice.id === 'ultra',
-      ),
-    ).toBe(true)
+    expect(snapshot.capabilities['gpt-6-astra']?.reasoning).toEqual({
+      status: 'unknown',
+      choices: [],
+    })
   })
 
   it('preserves the previous snapshot on a not-modified response', async () => {

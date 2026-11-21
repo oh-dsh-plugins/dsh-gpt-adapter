@@ -598,7 +598,12 @@ export function apply(ctx: Context): void {
       }
     }, [sessionId, provider, modelId])
     const capability = metadata.value?.enabled ? metadata.value : undefined
-    if (!capability) return null
+    if (!capability)
+      return metadata.error ? (
+        <span className={styles.error} role="alert">
+          {translateOwnedError(metadata.error, t)}
+        </span>
+      ) : null
     async function select(tier: SpeedSelection) {
       const sequence = ++action.current
       setBusy(true)

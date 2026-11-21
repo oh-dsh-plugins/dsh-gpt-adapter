@@ -10,7 +10,7 @@
 ## 功能
 
 - 自动发现上游模型，在原生模型设置页中管理。
-- 提供 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 六档 GPT 思考等级。
+- 使用模型声明或 DSH 已配置的思考等级。
 - 为每个模型选择「默认」「516K」「1M」或「自定义」上下文窗口。
 - 在聊天栏选择 Standard 或 Fast；上游声明支持或在提供商设置中开启后，还可选择 Ultrafast。
 - 复用 Codex 指令文件、本地及插件技能、MCP 服务器。
@@ -27,7 +27,7 @@
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.14
+dsh plugin --profile web add dsh-gpt-adapter@0.2.15
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.14.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.15.tgz
 ```
 
 ## 使用 GPT 模型
@@ -54,6 +54,8 @@ Fast 会请求上游优先档位。上游模型元数据决定是否自动提供
 **从 v0.2.11 升级：** 旧版使用同一个标识保存自动和手动 Ultrafast。为避免误发手动档位，新版不会把这个旧标识恢复为手动选择。如果你以前手动选过 Ultrafast，升级后请重新选择「Ultrafast」。
 
 使用提供商卡片上的「立即同步」刷新模型列表。上游不再列出的模型会保留到主动移除。卡片还可配置同步间隔、可选的能力目录地址和模型能力覆盖。显式能力覆盖优先于上游元数据、外部能力目录和预设，但自动能力解析仍保留上游明确不支持 Ultrafast 的声明。独立的手动选择开关并不表示上游支持此能力。
+
+**从旧版六档预设迁移。** 当网关只列出模型 ID（包括 `gpt-4o`）时，思考等级和请求参数沿用 DSH 的行为，原生思考等级映射仍可编辑。如果网关支持 `max` 或 `ultra`，但未提供推理元数据，可在能力目录或该模型的 `reasoningChoices` 覆盖中声明支持的等级和实际请求值。如果原先选择的是旧预设中的等级，请重新选择可用等级。
 
 ### 上下文窗口
 

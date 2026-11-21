@@ -67,9 +67,9 @@ describe('native GPT parameter contract', () => {
     ])
     expect(caps.defaultServiceTier).toBe('default')
     expect(
-      capabilityForSelection(caps, 'max', 'fast').serviceTier.wireValue,
+      capabilityForSelection(caps, undefined, 'fast').serviceTier.wireValue,
     ).toBe('priority')
-    expect(() => capabilityForSelection(caps, 'max', 'ultrafast')).toThrow(
+    expect(() => capabilityForSelection(caps, undefined, 'ultrafast')).toThrow(
       /unsupported service tier/,
     )
   })
@@ -95,15 +95,16 @@ describe('native GPT parameter contract', () => {
     expect(restricted.serviceTiers.map((choice) => choice.id)).toEqual([
       'default',
     ])
-    expect(() => capabilityForSelection(restricted, 'high', 'fast')).toThrow(
+    expect(() => capabilityForSelection(restricted, undefined, 'fast')).toThrow(
       /unsupported service tier/,
     )
     const alias = result.snapshot.capabilities['gpt-alias']!
     expect(
-      capabilityForSelection(alias, 'high', 'fast').serviceTier.wireValue,
+      capabilityForSelection(alias, undefined, 'fast').serviceTier.wireValue,
     ).toBe('fast')
     expect(
-      capabilityForSelection(alias, 'high', 'ultrafast').serviceTier.wireValue,
+      capabilityForSelection(alias, undefined, 'ultrafast').serviceTier
+        .wireValue,
     ).toBe('ultrafast')
     const user = resolveCapabilities({ id: 'gpt-custom' }, 'test', {
       serviceTiers: [
@@ -206,6 +207,9 @@ describe('native GPT parameter contract', () => {
 
   it('distinguishes configured defaults from explicitly following the upstream default', () => {
     const caps = resolveCapabilities({ id: 'gpt-6-astra' }, 'test', {
+      reasoningChoices: [
+        { id: 'max', label: 'Max', wireValue: 'max', source: 'user' },
+      ],
       defaultReasoningId: 'max',
     })
     const bridge = createRequestBridge({

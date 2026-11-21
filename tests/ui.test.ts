@@ -907,10 +907,15 @@ describe('built client contributions', () => {
       return { ok: true, value: { selected: 'default', last: null } }
     })
     expect(attempts).toBe(1)
+    expect(f.container.querySelector('[role=alert]')?.textContent).toContain(
+      'temporary failure',
+    )
+    expect(f.container.querySelector('[aria-haspopup=menu]')).toBeNull()
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000)
     })
     expect(attempts).toBe(2)
+    expect(f.container.querySelector('[role=alert]')).toBeNull()
     expect(f.container.querySelector('[aria-haspopup=menu]')).not.toBeNull()
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30000)

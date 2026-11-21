@@ -20,8 +20,8 @@ const copy = {
   syncNow: ['Sync now', '立即同步'],
   waiting: ['Waiting to sync', '等待同步'],
   synced: [
-    'Models synced: {count} · GPT presets manage reasoning levels; disable adaptation to restore native reasoning controls',
-    '已同步 {count} 个模型 · GPT 六档预设已接管原生等级；停用自动适配可恢复原生等级编辑',
+    'Models synced: {count} · Models without declared reasoning levels use their native settings',
+    '已同步 {count} 个模型 · 未声明推理等级的模型沿用原生设置',
   ],
   removeStale: [
     'Remove models no longer listed upstream ({count})',

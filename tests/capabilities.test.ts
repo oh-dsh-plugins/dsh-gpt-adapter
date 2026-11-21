@@ -6,26 +6,15 @@ import {
 } from '../src/capabilities.js'
 
 describe('GPT capability resolution', () => {
-  it('uses the six plugin presets for an unlisted GPT model', () => {
-    const codex = resolveCapabilities({ id: 'codex-auto-review' }, 'test')
-    expect(codex.reasoning.choices.map((choice) => choice.id)).toEqual([
-      'low',
-      'medium',
-      'high',
-      'xhigh',
-      'max',
-      'ultra',
-    ])
-    const result = resolveCapabilities({ id: 'gpt-new-family' }, 'test')
-    expect(
-      result.reasoning.choices.map((choice) => [choice.id, choice.wireValue]),
-    ).toEqual(
-      ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((level) => [
-        level,
-        level,
-      ]),
-    )
-  })
+  it.each(['gpt-4o', 'gpt-new-family', 'codex-auto-review'])(
+    'leaves reasoning to the host when only the ID %s is known',
+    (id) => {
+      expect(resolveCapabilities({ id }, 'test').reasoning).toEqual({
+        status: 'unknown',
+        choices: [],
+      })
+    },
+  )
   it('keeps Max and Ultra as separate native choices', () => {
     const capabilities = resolveCapabilities({ id: 'gpt-6-astra' }, 'test', {
       reasoningChoices: [
@@ -73,8 +62,12 @@ describe('GPT capability resolution', () => {
       },
       'test',
     )
-    const selected = capabilityForSelection(capabilities, 'high', 'ultrafast')
-    expect(selected.reasoning?.id).toBe('high')
+    const selected = capabilityForSelection(
+      capabilities,
+      undefined,
+      'ultrafast',
+    )
+    expect(selected.reasoning).toBeUndefined()
     expect(selected.serviceTier.id).toBe('ultrafast')
   })
 
@@ -117,6 +110,9 @@ describe('GPT capability resolution', () => {
 
   it('uses a configured default when no explicit effort is selected', () => {
     const capabilities = resolveCapabilities({ id: 'gpt-6-astra' }, 'test', {
+      reasoningChoices: [
+        { id: 'max', label: 'Max', wireValue: 'max', source: 'user' },
+      ],
       defaultReasoningId: 'max',
     })
     expect(
