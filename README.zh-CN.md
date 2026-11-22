@@ -27,7 +27,7 @@
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.17
+dsh plugin --profile web add dsh-gpt-adapter@0.2.18
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.17.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.18.tgz
 ```
 
 ## 使用 GPT 模型
@@ -93,6 +93,8 @@ Codex 兼容默认开启。目录优先采用插件配置中的 `codexHome`，�
 ### MCP 服务器
 
 支持标准输入输出（stdio）和流式 HTTP（Streamable HTTP）两种传输方式。可以复用已有配置中的命令、参数、工作目录、环境变量、请求头、令牌环境变量、超时，以及工具启用和禁用列表。
+
+同时配置 `url` 和 `command` 且未填写 `type` 时，使用 HTTP。有效的服务器配置中含有另一种传输方式的字段时，适配器会在日志中记录服务器名称和被忽略的字段名。
 
 MCP 连接在代理首次执行模型步骤前建立。每个代理独立持有连接，受信任项目的覆盖配置只在对应代理内生效。未显式配置 `cwd` 时，stdio 服务器使用代理的工作目录。代理空闲一分钟后释放连接，在下一步骤前重新连接。启用配置监听时，正在执行的代理自动更新连接；空闲代理在恢复执行时应用配置变化。
 

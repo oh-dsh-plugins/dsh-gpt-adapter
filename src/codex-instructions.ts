@@ -18,14 +18,20 @@ export type CodexInstructionFile = {
 }
 type InstructionPrefix = { content: string; truncated: boolean }
 type ReadRange = (offset: number, length: number) => Promise<Uint8Array>
+type PrefixOptions = {
+  limit: number
+  previous: readonly CodexInstructionFile[]
+  takeLookahead: (length: number) => number
+  signal?: AbortSignal | undefined
+}
 
 async function instructionPrefix(
   read: ReadRange,
-  limit: number,
-  signal?: AbortSignal,
+  { limit, previous, takeLookahead, signal }: PrefixOptions,
   strict = false,
 ): Promise<InstructionPrefix> {
-  const decode = (decoder: TextDecoder, bytes: Uint8Array, stream: boolean) => {
+  const decoder = new TextDecoder('utf-8', { fatal: strict })
+  const decode = (bytes: Uint8Array, stream: boolean) => {
     if (strict && bytes.includes(0))
       throw new Error('Project instructions contain binary data')
     return decoder.decode(bytes, { stream })
@@ -33,32 +39,57 @@ async function instructionPrefix(
   const window = await read(0, limit + 1)
   signal?.throwIfAborted()
   const truncated = window.length > limit
-  const decoder = new TextDecoder('utf-8', { fatal: strict })
-  const content = decode(decoder, window.subarray(0, limit), truncated)
-  if (!truncated || content.trim()) return { content, truncated }
+  const content = decode(window.subarray(0, limit), truncated)
+  if (!truncated) return { content, truncated }
 
-  // Distinguish a blank file from a nonblank file whose prefix is whitespace.
-  // Scan only until the first nonblank character, in fixed-size chunks.
-  if (decode(decoder, window.subarray(limit), true).trim())
-    return { content, truncated }
-  const chunkSize = 8192
+  // The omitted bytes may be trailing whitespace or the rest of a duplicate.
+  // Confirm at EOF before charging a trimmed body or discarding a duplicate.
+  const clipped = { content, truncated }
+  let body = content.trimStart()
+  let candidates = previous.filter((file) =>
+    file.content.startsWith(body.trimEnd()),
+  )
+  let hasOmittedText = false
+  function examine(text: string) {
+    hasOmittedText ||= text.trim().length > 0
+    if (candidates.length) {
+      body = (body + text).trimStart()
+      const prefix = body.trimEnd()
+      candidates = candidates.filter((file) => file.content.startsWith(prefix))
+    }
+    return hasOmittedText && candidates.length === 0
+  }
+  const probe = decode(window.subarray(limit), true)
+  if (examine(probe)) return clipped
   let offset = window.length
+  // Finish a split UTF-8 character before reading a large chunk for what may
+  // already be a definitely truncated body.
+  let chunkSize = probe ? 8192 : 3
   while (true) {
     signal?.throwIfAborted()
-    const chunk = await read(offset, chunkSize)
+    const length = takeLookahead(chunkSize)
+    if (!length) return clipped
+    const chunk = await read(offset, length)
     signal?.throwIfAborted()
-    const more = chunk.length === chunkSize
-    if (decode(decoder, chunk, more).trim()) return { content, truncated }
-    if (!more) return { content: '', truncated: false }
+    const more = chunk.length === length
+    if (examine(decode(chunk, more))) return clipped
+    if (!more) {
+      if (!hasOmittedText) return { content: content.trim(), truncated: false }
+      const trimmed = body.trimEnd()
+      return candidates.some((file) => file.content === trimmed)
+        ? { content: trimmed, truncated: false }
+        : clipped
+    }
     offset += chunk.length
+    chunkSize = 8192
   }
 }
 
 async function optionalPrefix(
   path: string,
-  limit: number,
-  signal?: AbortSignal,
+  options: PrefixOptions,
 ): Promise<InstructionPrefix | undefined> {
+  const { signal } = options
   signal?.throwIfAborted()
   let file
   try {
@@ -69,22 +100,18 @@ async function optionalPrefix(
     throw error
   }
   try {
-    return await instructionPrefix(
-      async (_offset, length) => {
-        const chunks: Buffer[] = []
-        while (length > 0) {
-          signal?.throwIfAborted()
-          const buffer = Buffer.allocUnsafe(Math.min(8192, length))
-          const { bytesRead } = await file.read(buffer, 0, buffer.length, null)
-          if (!bytesRead) break
-          chunks.push(buffer.subarray(0, bytesRead))
-          length -= bytesRead
-        }
-        return Buffer.concat(chunks)
-      },
-      limit,
-      signal,
-    )
+    return await instructionPrefix(async (_offset, length) => {
+      const chunks: Buffer[] = []
+      while (length > 0) {
+        signal?.throwIfAborted()
+        const buffer = Buffer.allocUnsafe(Math.min(8192, length))
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, null)
+        if (!bytesRead) break
+        chunks.push(buffer.subarray(0, bytesRead))
+        length -= bytesRead
+      }
+      return Buffer.concat(chunks)
+    }, options)
   } finally {
     await file.close()
   }
@@ -138,8 +165,19 @@ export async function loadCodexInstructions(
         (result.length ? 2 : 0) +
         1,
     )
-  const hostRead = (path: string) =>
-    optionalPrefix(path, prefixLimit(path), signal)
+  // Shared across this load, including blank overrides and duplicate checks.
+  let lookahead = 65536
+  const prefixOptions = (path: string): PrefixOptions => ({
+    limit: prefixLimit(path),
+    previous: result,
+    takeLookahead(length) {
+      const allowed = Math.min(length, lookahead)
+      lookahead -= allowed
+      return allowed
+    },
+    signal,
+  })
+  const hostRead = (path: string) => optionalPrefix(path, prefixOptions(path))
   const projectRead = async (path: string) => {
     if (!fs) return hostRead(path)
     signal?.throwIfAborted()
@@ -149,8 +187,7 @@ export async function loadCodexInstructions(
       throw new Error('Project instruction prefix reads unavailable')
     return instructionPrefix(
       (offset, length) => fs.readByteRange!(target, { offset, length }, signal),
-      prefixLimit(path),
-      signal,
+      prefixOptions(path),
       true,
     )
   }

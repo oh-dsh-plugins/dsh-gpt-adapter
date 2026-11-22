@@ -51,7 +51,8 @@ describe('nonzero Codex instruction budget', () => {
           resolve: async (p) => p,
           stat: async (p) => (p === path ? {} : undefined),
           readText: vi.fn(),
-          readByteRange: async (_, { length }) => bytes.subarray(0, length),
+          readByteRange: async (_, { offset, length }) =>
+            bytes.subarray(offset, offset + length),
         },
         undefined,
         [root],
@@ -153,6 +154,106 @@ describe('nonzero Codex instruction budget', () => {
     ).toBe(true)
   })
 
+  it.each([
+    [
+      'trailing whitespace',
+      'ROOT_RULE' + '\u3000'.repeat(300),
+      'ROOT_RULE',
+      false,
+    ],
+    [
+      'complete duplicate',
+      'ROOT_RULE'.repeat(25),
+      'ROOT_RULE'.repeat(25),
+      false,
+    ],
+    [
+      'same prefix with a different tail',
+      'ROOT_RULE'.repeat(25) + 'DIFFERENT',
+      'ROOT_RULE'.repeat(25),
+      true,
+    ],
+  ])(
+    'handles %s before charging the instruction budget',
+    async (label, nested, body, truncated) => {
+      const root = '/project'
+      const child = root + '/child'
+      const files = new Map([
+        [root + '/AGENTS.md', Buffer.from(body)],
+        [child + '/AGENTS.md', Buffer.from(nested)],
+        [child + '/AGENTS.local.md', Buffer.from('CHILD_LOCAL')],
+      ])
+      const budget = label === 'trailing whitespace' ? 200 : 340
+      const loaded = await loadCodexInstructions(
+        '/codex',
+        child,
+        { project_doc_max_bytes: budget },
+        '/dsh',
+        '/agents',
+        {
+          resolve: async (path) => path,
+          stat: async (path) => (files.has(path) ? {} : undefined),
+          readText: vi.fn(),
+          readByteRange: async (path, { offset, length }) =>
+            files.get(path)!.subarray(offset, offset + length),
+        },
+        undefined,
+        [root, child],
+      )
+      const output = renderCodexInstructions(loaded, budget)
+      expect(output.includes('Instruction budget reached')).toBe(truncated)
+      expect(output.includes('CHILD_LOCAL')).toBe(!truncated)
+      expect(loaded).toHaveLength(2)
+      if (truncated) expect(loaded[1]?.truncated).toBe(true)
+    },
+  )
+
+  it('bounds trailing-whitespace lookahead and honors cancellation during scanning', async () => {
+    const root = '/project'
+    const path = join(root, 'AGENTS.md')
+    const bytes = Buffer.from('ROOT_RULE' + ' '.repeat(100_000))
+    const cap = 65536
+    const budget = 256
+    const controller = new AbortController()
+    const reason = new Error('scan cancelled')
+    let abortDuringScan = false
+    const readByteRange = vi.fn(
+      async (
+        _path: string,
+        { offset, length }: { offset: number; length: number },
+      ) => {
+        if (abortDuringScan && offset > 0) controller.abort(reason)
+        return bytes.subarray(offset, offset + length)
+      },
+    )
+    const load = () =>
+      loadCodexInstructions(
+        '/codex',
+        root,
+        { project_doc_max_bytes: budget },
+        '/dsh',
+        '/agents',
+        {
+          resolve: async (key) => key,
+          stat: async (key) => (key === path ? {} : undefined),
+          readText: vi.fn(),
+          readByteRange,
+        },
+        controller.signal,
+        [root],
+      )
+    expect((await load())[0]?.truncated).toBe(true)
+    expect(
+      readByteRange.mock.calls
+        .slice(1)
+        .reduce((total, [, range]) => total + range.length, 0),
+    ).toBe(cap)
+    abortDuringScan = true
+    readByteRange.mockClear()
+    await expect(load()).rejects.toBe(reason)
+    expect(readByteRange).toHaveBeenCalledTimes(2)
+  })
+
   it('closes a host prefix when cancellation wins its read', async () => {
     const controller = new AbortController()
     const reason = new Error('prefix cancelled')
@@ -242,19 +343,21 @@ describe('nonzero Codex instruction budget', () => {
 
   it('stops scoped filesystem reads once the first source exhausts the budget', async () => {
     const f = fixture(1)
-    f.filesystem.readByteRange.mockImplementation(async (_target, { length }) =>
-      Buffer.from('😀'.repeat(16)).subarray(0, length),
+    f.filesystem.readByteRange.mockImplementation(
+      async (_target, { offset, length }) =>
+        Buffer.from('😀'.repeat(16)).subarray(offset, offset + length),
     )
     const decision = await f.run([
       f.user,
       native('AGENTS.md', '.\0AGENTS.md', 'DROP_NATIVE_PROJECT'),
       native('AGENTS.md', 'user-global\0AGENTS.md', 'DROP_NATIVE_GLOBAL'),
     ])
-    expect(f.filesystem.readByteRange).toHaveBeenCalledTimes(1)
-    expect(f.filesystem.readByteRange.mock.calls[0]?.[1]).toEqual({
-      offset: 0,
-      length: 5, // four prefix bytes plus the EOF probe
-    })
+    expect(
+      f.filesystem.readByteRange.mock.calls.map(([, range]) => range),
+    ).toEqual([
+      { offset: 0, length: 5 }, // four prefix bytes plus the EOF probe
+      { offset: 5, length: 3 }, // finish the split UTF-8 character
+    ])
     expect(f.filesystem.readText).not.toHaveBeenCalled()
     expect(baseline(decision).content[0].text).toContain(
       'Instruction budget reached',
@@ -277,8 +380,11 @@ function fixture(initialBudget: number | undefined = 0) {
     ),
     readText: vi.fn(async () => 'PROJECT_INSTRUCTIONS'),
     readByteRange: vi.fn(
-      async (_target: string, { length }: { length: number }) =>
-        Buffer.from('PROJECT_INSTRUCTIONS').subarray(0, length),
+      async (
+        _target: string,
+        { offset, length }: { offset: number; length: number },
+      ) =>
+        Buffer.from('PROJECT_INSTRUCTIONS').subarray(offset, offset + length),
     ),
   }
   let budget = initialBudget

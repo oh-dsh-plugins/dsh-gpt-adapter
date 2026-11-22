@@ -27,7 +27,7 @@ Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`,
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.17
+dsh plugin --profile web add dsh-gpt-adapter@0.2.18
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.17.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.18.tgz
 ```
 
 ## Using GPT models
@@ -93,6 +93,8 @@ Plugin resources must already exist in a configured local marketplace or the Cod
 ### MCP servers
 
 Supported transports are stdio and Streamable HTTP. Existing server configuration can supply commands, arguments, working directories, environment variables, headers, bearer-token environment variables, timeouts, and enabled/disabled tool lists.
+
+A server declared with both `url` and `command` and no explicit `type` uses HTTP. For a valid server with fields from the other transport, the adapter logs the server name and the ignored field names.
 
 MCP connections start before an Agent's first model step. Each Agent owns its connections, and trusted project overrides apply within that Agent's scope. Stdio servers use the Agent's working directory unless an explicit `cwd` is configured. Idle Agents release their connections after one minute and reconnect before the next step. With watching enabled, active Agents update their connections automatically; idle Agents apply configuration changes when they resume.
 

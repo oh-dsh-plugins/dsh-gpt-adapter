@@ -61,8 +61,10 @@ const fixtureFs = {
       return undefined
     }),
   readText: (path: string) => readFile(path, 'utf8'),
-  readByteRange: async (path: string, { length }: { length: number }) =>
-    (await readFile(path)).subarray(0, length),
+  readByteRange: async (
+    path: string,
+    { offset, length }: { offset: number; length: number },
+  ) => (await readFile(path)).subarray(offset, offset + length),
 }
 const skillFs = {
   resolve: async (path: string) => ({ targetKey: path, displayPath: path }),
@@ -2380,6 +2382,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
   it('connects a real HTTP MCP with imported headers and refreshes a disabled server without exposing credentials in status', async () => {
     const home = await directory(),
       seen: Array<string | undefined> = []
+    let initializations = 0
     const server = createServer(async (request, response) => {
       if (request.method !== 'POST') {
         response.writeHead(405).end()
@@ -2389,6 +2392,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
       for await (const chunk of request) text += chunk
       const message = JSON.parse(text)
       seen.push(request.headers.authorization)
+      if (message.method === 'initialize') initializations++
       if (message.id === undefined) {
         response.writeHead(202).end()
         return
@@ -2414,11 +2418,15 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
         }),
     )
     const address = server.address() as { port: number }
-    await put(
-      join(home, 'config.toml'),
-      `[mcp_servers.web]\nurl="http://127.0.0.1:${address.port}/mcp"\n[mcp_servers.web.http_headers]\nAuthorization="Bearer fixture-token"\n`,
-    )
+    const writeConfig = (extra = '') =>
+      put(
+        join(home, 'config.toml'),
+        `[mcp_servers.web]\nurl="http://127.0.0.1:${address.port}/mcp"\n${extra}[mcp_servers.web.http_headers]\nAuthorization="Bearer fixture-token"\n`,
+      )
+    await writeConfig()
     const ctx = new Context()
+    const warn = vi.fn()
+    Object.defineProperty(ctx, 'logger', { value: { warn } })
     cleanup.push(() => ctx.fiber.dispose())
     const tools = new Map<string, any>()
     mcpHost(ctx)
@@ -2440,6 +2448,47 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
     expect([...tools.keys()]).toEqual(['mcp__web__read'])
     expect(seen.every((value) => value === 'Bearer fixture-token')).toBe(true)
     expect(JSON.stringify(runtime.status())).not.toContain('fixture-token')
+    expect(initializations).toBe(1)
+
+    await writeConfig(
+      'command="ignored-fixture-command"\nargs=["ignored-fixture-argument"]\n',
+    )
+    await runtime.refresh()
+    expect(runtime.status().items).toContainEqual({
+      name: 'web',
+      kind: 'mcp',
+      state: 'loaded',
+      ignoredTransportFields: ['command', 'args'],
+    })
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      'Codex MCP ignored transport fields',
+      'web',
+      ['command', 'args'],
+    )
+    expect(JSON.stringify([runtime.status(), warn.mock.calls])).not.toMatch(
+      /fixture-token|ignored-fixture-command|ignored-fixture-argument/,
+    )
+    await runtime.refresh()
+    expect(warn).toHaveBeenCalledTimes(1)
+    await writeConfig('args=["ignored-fixture-argument"]\n')
+    await runtime.refresh()
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(warn).toHaveBeenLastCalledWith(
+      'Codex MCP ignored transport fields',
+      'web',
+      ['args'],
+    )
+    await writeConfig()
+    await runtime.refresh()
+    expect(runtime.status().items).toContainEqual({
+      name: 'web',
+      kind: 'mcp',
+      state: 'loaded',
+    })
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(initializations).toBe(1)
+    expect([...tools.keys()]).toEqual(['mcp__web__read'])
+
     await put(join(home, 'config.toml'), '[mcp_servers.web]\nenabled=false\n')
     await runtime.refresh()
     expect(tools.size).toBe(0)
