@@ -197,6 +197,28 @@ export function installCodexCompatibility(
     idleTimer?: ReturnType<typeof setTimeout> | undefined
   }
   const agents = new Map<any, AgentState>()
+  let reportedMcpWarnings = new Set<string>()
+  function reportMcpWarnings() {
+    const active = new Set<string>()
+    const snapshots = [
+      latest,
+      ...[...agents.values()].map((owner) => owner.snapshot),
+    ]
+    for (const snapshot of snapshots)
+      for (const item of snapshot?.items ?? []) {
+        const fields = item.ignoredTransportFields
+        if (!fields?.length) continue
+        const key = JSON.stringify([item.name, fields])
+        if (!active.has(key) && !reportedMcpWarnings.has(key))
+          ctx.logger?.warn(
+            'Codex MCP ignored transport fields',
+            item.name,
+            fields,
+          )
+        active.add(key)
+      }
+    reportedMcpWarnings = active
+  }
   let skillDispose: (() => void) | undefined
   let skills: Array<
     | FileSystemSkillProvider
@@ -898,6 +920,7 @@ export function installCodexCompatibility(
     if (closed || owner.disposed) return
     owner.snapshot = snapshot
     owner.items = snapshot.items
+    reportMcpWarnings()
     const next = new Map(snapshot.mcp.map((entry) => [entry.serverName, entry]))
     for (const [name, client] of owner.clients) {
       if (!next.has(name) || fingerprint(next.get(name)) !== client.key) {
@@ -1035,6 +1058,7 @@ export function installCodexCompatibility(
         throw new AggregateError(errors, 'Codex MCP client cleanup failed')
       owner.clients.clear()
       if (agents.get(agent) === owner) agents.delete(agent)
+      reportMcpWarnings()
     })()
     return owner.disposal
   }
@@ -1059,6 +1083,7 @@ export function installCodexCompatibility(
       if (closed) return
       latest = snapshot
       items = snapshot.items
+      reportMcpWarnings()
       if (config.importSkills && skillContext) {
         await mountSkills(snapshot)
         items = [
@@ -1223,8 +1248,20 @@ export function installCodexCompatibility(
         const add = (item: CompatibilityItem) => {
           const key = `${item.kind}\0${item.name}`
           const previous = merged.get(key)
-          if (!previous || priority[item.state] > priority[previous.state])
-            merged.set(key, { ...item })
+          const selected =
+            !previous || priority[item.state] > priority[previous.state]
+              ? item
+              : previous
+          const warnings = [
+            ...(previous?.ignoredTransportFields ?? []),
+            ...(item.ignoredTransportFields ?? []),
+          ]
+          merged.set(key, {
+            ...selected,
+            ...(warnings.length
+              ? { ignoredTransportFields: [...new Set(warnings)] }
+              : {}),
+          })
         }
         for (const item of items) add(item)
         for (const owner of agents.values()) {

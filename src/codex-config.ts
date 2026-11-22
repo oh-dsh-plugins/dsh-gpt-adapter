@@ -10,6 +10,7 @@ export type CompatibilityItem = {
   kind: 'config' | 'plugin' | 'mcp' | 'instructions' | 'skills'
   state: 'loading' | 'loaded' | 'disabled' | 'unsupported' | 'failed'
   reason?: string
+  ignoredTransportFields?: string[]
 }
 export type CodexMcpConfig = {
   serverName: string
@@ -631,6 +632,16 @@ export async function discoverCodexSnapshot(
         if (names.has(value.serverName)) throw new Error('namespace-conflict')
         names.add(value.serverName)
         result.mcp.push({ ...value, originalName: name })
+        const ignoredTransportFields = (
+          value.transport === 'stdio' ? httpFields : stdioFields
+        ).filter((field) => Object.hasOwn(raw, field))
+        if (ignoredTransportFields.length)
+          result.items.push({
+            name: publicName,
+            kind: 'mcp',
+            state: 'loaded',
+            ignoredTransportFields,
+          })
       } catch (error: any) {
         const previous = context.previous?.mcp.find(
           (entry) =>

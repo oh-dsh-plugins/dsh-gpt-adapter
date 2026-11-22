@@ -79,10 +79,13 @@ it('refreshes Codex instructions on a real tool continuation without additional 
         [join(cwd, '.git'), join(cwd, 'AGENTS.md')].includes(path)
           ? {}
           : undefined,
-      readByteRange: async (path: string, { length }: { length: number }) =>
+      readByteRange: async (
+        path: string,
+        { offset, length }: { offset: number; length: number },
+      ) =>
         Buffer.from(path === join(cwd, 'AGENTS.md') ? version : '').subarray(
-          0,
-          length,
+          offset,
+          offset + length,
         ),
     } as any)
     ctx.provide('workingDirectory', { ensure: async () => cwd } as any)
