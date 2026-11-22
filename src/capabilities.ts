@@ -28,13 +28,10 @@ export const GPT_REASONING_LEVELS = [
   'ultra',
 ] as const
 
-// Keep existing GPT-6.2 Sol selections working on gateways with ID-only listings.
-const GPT_62_SOL_REASONING: ReasoningChoice[] = [
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-].map((id) => ({ id, label: id, wireValue: id, source: 'catalog' }))
+// Keep existing GPT selections working on ID-only gateways.
+const GPT_REASONING_PRESET: ReasoningChoice[] = GPT_REASONING_LEVELS.map(
+  (id) => ({ id, label: id, wireValue: id, source: 'catalog' }),
+)
 
 const GPT_PRESET = {
   serviceTiers: GPT_SPEED_PRESET,
@@ -62,12 +59,11 @@ export function resolveCapabilities(
   const base = catalogFor(model.id)
   const upstream = model.capabilities
   const displayName = override?.displayName ?? model.displayName ?? model.id
-  const choices =
-    override?.reasoningChoices ??
-    upstream?.reasoningChoices ??
-    (!hasNativeReasoning && model.id === 'gpt-6.2-sol'
-      ? GPT_62_SOL_REASONING
-      : undefined)
+  const declaredChoices =
+    override?.reasoningChoices ?? upstream?.reasoningChoices
+  const fallback =
+    declaredChoices === undefined && !hasNativeReasoning && !!base
+  const choices = fallback ? GPT_REASONING_PRESET : declaredChoices
   const supportsReasoning =
     override?.supportsReasoning ??
     (override?.reasoningChoices === undefined
@@ -81,7 +77,9 @@ export function resolveCapabilities(
         : 'known'
   const finalChoices = status === 'known' ? choices! : []
   const candidateDefaultReasoning =
-    override?.defaultReasoningId ?? upstream?.defaultReasoningId
+    override?.defaultReasoningId ??
+    upstream?.defaultReasoningId ??
+    (fallback ? 'medium' : undefined)
   const defaultReasoningId = finalChoices.some(
     (choice) => choice.id === candidateDefaultReasoning,
   )
@@ -127,6 +125,7 @@ export function resolveCapabilities(
     reasoning: {
       status,
       choices: cloneChoices(finalChoices),
+      ...(fallback && status === 'known' ? { fallback: true as const } : {}),
       ...(defaultReasoningId === undefined
         ? {}
         : { defaultId: defaultReasoningId }),
@@ -150,7 +149,8 @@ export function mergeCapabilities(
   const currentHints: ModelOverride = {
     ...(capabilities.reasoning.status === 'unsupported'
       ? { supportsReasoning: false }
-      : capabilities.reasoning.choices.length > 0
+      : capabilities.reasoning.choices.length > 0 &&
+          !capabilities.reasoning.fallback
         ? {
             supportsReasoning: true,
             reasoningChoices: capabilities.reasoning.choices,
@@ -179,6 +179,8 @@ export function mergeCapabilities(
     },
     revision,
     override,
+    // A partial override must keep reasoning delegated to the native adapter.
+    capabilities.reasoning.status === 'unknown',
   )
 }
 

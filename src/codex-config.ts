@@ -232,6 +232,46 @@ function mergeConfig(base: JsonObject, layer: JsonObject): JsonObject {
   return result
 }
 
+const stdioFields = ['command', 'args', 'cwd', 'env', 'env_vars']
+const httpFields = [
+  'url',
+  'http_headers',
+  'headers',
+  'env_http_headers',
+  'bearer_token_env_var',
+]
+
+function mergeProjectConfig(base: JsonObject, layer: JsonObject): JsonObject {
+  const result = mergeConfig(base, layer)
+  for (const [name, value] of Object.entries(object(layer.mcp_servers))) {
+    const incoming = object(value)
+    const prior = object(base.mcp_servers?.[name])
+    // Explicit types win over inferred endpoints. Leave fields declared in
+    // this layer intact so the normalizer can still reject real conflicts.
+    const stdio =
+      incoming.type === 'stdio' ||
+      (incoming.type === undefined &&
+        Object.hasOwn(incoming, 'command') &&
+        !Object.hasOwn(incoming, 'url'))
+    const http =
+      incoming.type === 'http' ||
+      incoming.type === 'streamable-http' ||
+      (incoming.type === undefined &&
+        Object.hasOwn(incoming, 'url') &&
+        !Object.hasOwn(incoming, 'command'))
+    if (!stdio && !http) continue
+    const entry = result.mcp_servers[name]
+    const oppositeFields = stdio ? httpFields : stdioFields
+    const obsoleteType = stdio
+      ? prior.type === 'http' || prior.type === 'streamable-http'
+      : prior.type === 'stdio'
+    if (obsoleteType && !Object.hasOwn(incoming, 'type')) delete entry.type
+    for (const key of oppositeFields)
+      if (!Object.hasOwn(incoming, key)) delete entry[key]
+  }
+  return result
+}
+
 export async function readCodexConfig(
   home: string,
   cwd?: string,
@@ -269,7 +309,7 @@ export async function readCodexConfig(
     const parsed = object(parse(layer))
     for (const [name, server] of Object.entries(object(parsed.mcp_servers)))
       if (typeof object(server).command === 'string') projectCommands.add(name)
-    config = mergeConfig(config, parsed)
+    config = mergeProjectConfig(config, parsed)
   }
   // Only project-supplied commands without an explicit working directory use
   // the Agent cwd. Entries with inherited user commands keep the user base.

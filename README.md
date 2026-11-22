@@ -27,7 +27,7 @@ Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`,
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.16
+dsh plugin --profile web add dsh-gpt-adapter@0.2.17
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.16.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.17.tgz
 ```
 
 ## Using GPT models
@@ -55,7 +55,7 @@ Fast requests the upstream priority tier. Upstream model metadata controls autom
 
 Use **Sync now** on the provider card to refresh the model list. Models no longer listed upstream are retained until you choose to remove them. You can also configure the sync interval, an optional capability catalog URL, and model capability overrides on that card. Explicit capability overrides take precedence over upstream metadata, external catalogs, and presets, except that an upstream Ultrafast denial is retained for automatic capability resolution. The separate manual-selection switch does not assert upstream support.
 
-**Migrating from the six-level preset.** When the gateway lists only a model ID (including `gpt-4o`), DSH normally controls its reasoning options and request parameters, and native reasoning mappings remain editable. For `gpt-6.2-sol`, the plugin provides `low`, `medium`, `high`, and `xhigh` as a fallback when the gateway, capability catalog, and native model settings omit reasoning choices. If your gateway supports `max` or `ultra` but omits reasoning metadata, declare its supported levels and wire values in a capability catalog or a per-model `reasoningChoices` override. Select an available level again if your previous selection came from the preset.
+For an adapted GPT model with no declared reasoning choices, the plugin supplies the six-level preset `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, with `medium` as the fallback default. Explicit model settings, upstream metadata, the capability catalog, or a per-model `reasoningChoices` override can replace these options. The preset appears in the conversation picker. The Models editor lets you save a native mapping or clear it to restore the preset. Each gateway decides which levels it accepts.
 
 ### Context windows
 
@@ -123,6 +123,8 @@ An empty `mcpAllowlist` imports all enabled declared servers. A nonempty list fi
 ## Data and removal
 
 Model snapshots and saved speed choices are stored under `$DSH_HOME/storages/gpt-adapter`. Codex source files and imported MCP credentials are not copied there.
+
+When switching between v0.2.14 and v0.2.17, stop the running version first. Both versions read the same saved speed preferences, but v0.2.14 does not take the newer writer lock. v0.2.17 imports per-session preferences from intermediate releases on first use.
 
 Disabling GPT adaptation restores native reasoning-level controls. Context window presets remain available and save through DSH's native settings. Disabling or removing the plugin withdraws its runtime registrations without changing Codex source files or deleting DSH conversation history.
 

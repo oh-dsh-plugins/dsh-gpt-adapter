@@ -41,6 +41,8 @@ export type ModelCapabilities = {
     status: 'known' | 'unknown' | 'unsupported'
     choices: ReasoningChoice[]
     defaultId?: string
+    /** Runtime defaults apply only while the native settings omit a mapping. */
+    fallback?: true
   }
   serviceTiers: ServiceTierChoice[]
   defaultServiceTier: ServiceTier

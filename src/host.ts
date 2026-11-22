@@ -393,8 +393,7 @@ export class GptModels extends Service {
   private readonly publications = new Map<string, Promise<void>>()
   private speeds = new Map<string, SpeedSelection>()
   private readonly manualSpeedEpochs = new Map<string, symbol>()
-  private readonly legacySpeedSessions = new Set<string>()
-  private readonly speedStore = new JsonStorage(
+  private readonly previousSpeedStore = new JsonStorage(
     dshHomePath('storages', 'gpt-adapter', 'session-speeds'),
   )
   private readonly results = new Map<
@@ -467,21 +466,39 @@ export class GptModels extends Service {
   }
 
   async initialize(): Promise<void> {
-    const loading = this.speedWrites.then(async () => {
-      const savedSpeeds = await this.store.read('speeds', validSpeedCache)
-      const sessions = await this.speedStore.readAll(validSessionSpeeds)
-      if (this.closed) return
-      const overridden = new Set(sessions.map(({ sessionId }) => sessionId))
-      const next = new Map<string, SpeedSelection>()
-      for (const [key, value] of Object.entries(savedSpeeds ?? {})) {
-        const [sessionId] = JSON.parse(key)
-        this.legacySpeedSessions.add(sessionId)
-        if (!overridden.has(sessionId)) next.set(key, value)
-      }
-      for (const { speeds } of sessions)
-        for (const [key, value] of Object.entries(speeds)) next.set(key, value)
-      this.speeds = next
-    })
+    const loading = this.speedWrites.then(() =>
+      this.store.withLock('speeds', async () => {
+        const saved = await this.store.read('speeds', validSpeedCache)
+        if (this.closed) return
+        const next = new Map(Object.entries(saved ?? {}))
+        if (
+          !(await this.store.read(
+            'session-speeds-migrated',
+            (v): v is true => v === true,
+          ))
+        ) {
+          const sessions =
+            await this.previousSpeedStore.readAll(validSessionSpeeds)
+          if (this.closed) return
+          if (sessions.length) {
+            const overridden = new Set(
+              sessions.map(({ sessionId }) => sessionId),
+            )
+            for (const key of next.keys()) {
+              if (overridden.has(JSON.parse(key)[0])) next.delete(key)
+            }
+            for (const { speeds } of sessions)
+              for (const [key, value] of Object.entries(speeds))
+                next.set(key, value)
+            // The old release also reads this file. Record migration only after
+            // the combined preference map has been committed.
+            await this.store.write('speeds', Object.fromEntries(next))
+            await this.store.write('session-speeds-migrated', true)
+          }
+        }
+        this.speeds = next
+      }),
+    )
     this.speedWrites = loading.catch(() => undefined)
     await loading
     for (const provider of this.enabledProviders()) {
@@ -1241,13 +1258,10 @@ export class GptModels extends Service {
     const tokens = existing
       ? this.editableContextWindow(provider, model, read)
       : model.contextWindow
-    return projectModel(
-      provider,
-      tokens === undefined ? model : { ...model, contextWindow: tokens },
-      () => capability,
-      undefined,
-      false,
-    )
+    const draft =
+      tokens === undefined ? model : { ...model, contextWindow: tokens }
+    if (capability.reasoning.fallback) return draft
+    return projectModel(provider, draft, () => capability, undefined, false)
   }
 
   editableContextWindow(
@@ -1472,44 +1486,18 @@ export class GptModels extends Service {
   private async persistSpeeds(
     change: (next: Map<string, SpeedSelection>) => void,
   ): Promise<void> {
-    const next = new Map(this.speeds)
-    change(next)
-    const changedBySession = new Map<string, string[]>()
-    for (const key of new Set([...this.speeds.keys(), ...next.keys()])) {
-      if (this.speeds.get(key) === next.get(key)) continue
-      const [sessionId] = JSON.parse(key) as [string, string, string]
-      const changed = changedBySession.get(sessionId) ?? []
-      changed.push(key)
-      changedBySession.set(sessionId, changed)
-    }
-    if (!changedBySession.size) return
-
-    let persisted = this.speeds
-    try {
-      for (const [sessionId, changed] of changedBySession) {
-        const entries = [...next].filter(
-          ([key]) => JSON.parse(key)[0] === sessionId,
-        )
-        // An empty override keeps deleted legacy preferences from reappearing.
-        if (entries.length || this.legacySpeedSessions.has(sessionId)) {
-          await this.speedStore.write(sessionId, {
-            sessionId,
-            speeds: Object.fromEntries(entries),
-          })
-        } else {
-          await this.speedStore.remove(sessionId)
-        }
-        if (persisted === this.speeds) persisted = new Map(this.speeds)
-        for (const key of changed) {
-          const value = next.get(key)
-          if (value === undefined) persisted.delete(key)
-          else persisted.set(key, value)
-        }
+    await this.store.withLock('speeds', async () => {
+      const saved = (await this.store.read('speeds', validSpeedCache)) ?? {}
+      const next = new Map(Object.entries(saved))
+      change(next)
+      if (
+        next.size !== Object.keys(saved).length ||
+        [...next].some(([key, value]) => saved[key] !== value)
+      ) {
+        await this.store.write('speeds', Object.fromEntries(next))
       }
-    } finally {
-      // A provider-wide clear may have written only some sessions before failing.
-      this.speeds = persisted
-    }
+      this.speeds = next
+    })
   }
 
   @Remote({ resources: { session: (sessionId: SessionId) => sessionId } })

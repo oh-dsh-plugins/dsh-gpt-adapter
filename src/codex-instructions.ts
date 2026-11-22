@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { open } from 'node:fs/promises'
-import { StringDecoder } from 'node:string_decoder'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   readCodexConfig,
@@ -18,6 +17,42 @@ export type CodexInstructionFile = {
   truncated?: boolean
 }
 type InstructionPrefix = { content: string; truncated: boolean }
+type ReadRange = (offset: number, length: number) => Promise<Uint8Array>
+
+async function instructionPrefix(
+  read: ReadRange,
+  limit: number,
+  signal?: AbortSignal,
+  strict = false,
+): Promise<InstructionPrefix> {
+  const decode = (decoder: TextDecoder, bytes: Uint8Array, stream: boolean) => {
+    if (strict && bytes.includes(0))
+      throw new Error('Project instructions contain binary data')
+    return decoder.decode(bytes, { stream })
+  }
+  const window = await read(0, limit + 1)
+  signal?.throwIfAborted()
+  const truncated = window.length > limit
+  const decoder = new TextDecoder('utf-8', { fatal: strict })
+  const content = decode(decoder, window.subarray(0, limit), truncated)
+  if (!truncated || content.trim()) return { content, truncated }
+
+  // Distinguish a blank file from a nonblank file whose prefix is whitespace.
+  // Scan only until the first nonblank character, in fixed-size chunks.
+  if (decode(decoder, window.subarray(limit), true).trim())
+    return { content, truncated }
+  const chunkSize = 8192
+  let offset = window.length
+  while (true) {
+    signal?.throwIfAborted()
+    const chunk = await read(offset, chunkSize)
+    signal?.throwIfAborted()
+    const more = chunk.length === chunkSize
+    if (decode(decoder, chunk, more).trim()) return { content, truncated }
+    if (!more) return { content: '', truncated: false }
+    offset += chunk.length
+  }
+}
 
 async function optionalPrefix(
   path: string,
@@ -34,23 +69,22 @@ async function optionalPrefix(
     throw error
   }
   try {
-    const decoder = new StringDecoder('utf8')
-    const buffer = Buffer.allocUnsafe(Math.min(8192, limit))
-    const chunks: string[] = []
-    let bytes = 0
-    while (bytes < limit) {
-      signal?.throwIfAborted()
-      const length = Math.min(buffer.length, limit - bytes)
-      const result = await file.read(buffer, 0, length, null)
-      signal?.throwIfAborted()
-      if (!result.bytesRead) {
-        chunks.push(decoder.end())
-        return { content: chunks.join(''), truncated: false }
-      }
-      chunks.push(decoder.write(buffer.subarray(0, result.bytesRead)))
-      bytes += result.bytesRead
-    }
-    return { content: chunks.join(''), truncated: true }
+    return await instructionPrefix(
+      async (_offset, length) => {
+        const chunks: Buffer[] = []
+        while (length > 0) {
+          signal?.throwIfAborted()
+          const buffer = Buffer.allocUnsafe(Math.min(8192, length))
+          const { bytesRead } = await file.read(buffer, 0, buffer.length, null)
+          if (!bytesRead) break
+          chunks.push(buffer.subarray(0, bytesRead))
+          length -= bytesRead
+        }
+        return Buffer.concat(chunks)
+      },
+      limit,
+      signal,
+    )
   } finally {
     await file.close()
   }
@@ -113,28 +147,18 @@ export async function loadCodexInstructions(
     if (!(await fs.stat(target, signal))) return undefined
     if (!fs.readByteRange)
       throw new Error('Project instruction prefix reads unavailable')
-    const limit = prefixLimit(path)
-    // One byte beyond the prefix distinguishes an exact fit from more input.
-    const window = await fs.readByteRange(
-      target,
-      { offset: 0, length: limit + 1 },
+    return instructionPrefix(
+      (offset, length) => fs.readByteRange!(target, { offset, length }, signal),
+      prefixLimit(path),
       signal,
+      true,
     )
-    signal?.throwIfAborted()
-    const bytes = window.subarray(0, limit)
-    if (bytes.includes(0))
-      throw new Error('Project instructions contain binary data')
-    const truncated = window.length > limit
-    const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes, {
-      stream: truncated,
-    })
-    return { content, truncated }
   }
   const add = (file: CodexInstructionFile | undefined) => {
     if (
       file &&
       !result.some((p) => p.path === file.path) &&
-      (file.truncated || result.at(-1)?.content !== file.content)
+      (file.truncated || !result.some((p) => p.content === file.content))
     ) {
       const text = `Instructions from: ${file.path}\n\n${file.content}`
       remaining = file.truncated

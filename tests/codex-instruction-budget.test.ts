@@ -100,10 +100,58 @@ describe('nonzero Codex instruction budget', () => {
       expect(
         hostOpen.mock.calls.some(([path]) => path === `${home}/AGENTS.md`),
       ).toBe(false)
-      expect(position).toBeLessThanOrEqual(102)
+      expect(position).toBeLessThanOrEqual(
+        text.trimStart() === text ? 102 : 8294,
+      )
       expect(close).toHaveBeenCalledTimes(1)
     },
   )
+
+  it('ignores a whitespace-only override and skips non-adjacent duplicate instructions', async () => {
+    const dirs = ['/project', '/project/child', '/project/child/nested']
+    const duplicate = 'ROOT_POLICIES'.repeat(8)
+    const files = new Map(
+      Object.entries({
+        '/project/AGENTS.override.md': ' '.repeat(9000),
+        '/project/AGENTS.md': duplicate,
+        '/project/child/AGENTS.md': 'CHILD_RULE',
+        '/project/child/nested/AGENTS.md': duplicate,
+        '/project/child/nested/AGENTS.local.md': 'LOCAL_RULE',
+      }),
+    )
+    const readByteRange = vi.fn(
+      async (
+        path: string,
+        { offset, length }: { offset: number; length: number },
+      ) => Buffer.from(files.get(path)!).subarray(offset, offset + length),
+    )
+    const loaded = await loadCodexInstructions(
+      '/codex',
+      dirs[2]!,
+      { project_doc_max_bytes: 360 },
+      '/dsh',
+      '/agents',
+      {
+        resolve: async (p) => p,
+        stat: async (p) => (files.has(p) ? {} : undefined),
+        readText: vi.fn(),
+        readByteRange,
+      },
+      undefined,
+      dirs,
+    )
+    expect(loaded.map(({ content }) => content)).toEqual([
+      duplicate,
+      'CHILD_RULE',
+      'LOCAL_RULE',
+    ])
+    expect(readByteRange.mock.calls.some(([, range]) => range.offset > 0)).toBe(
+      true,
+    )
+    expect(
+      readByteRange.mock.calls.every(([, range]) => range.length <= 8192),
+    ).toBe(true)
+  })
 
   it('closes a host prefix when cancellation wins its read', async () => {
     const controller = new AbortController()

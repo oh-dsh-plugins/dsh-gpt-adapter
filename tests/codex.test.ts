@@ -649,6 +649,50 @@ describe('Codex config and plugin resources', () => {
     ).toHaveLength(1)
   })
 
+  it('replaces inherited MCP transport fields when a trusted project changes endpoints', async () => {
+    const home = await directory()
+    const project = join(home, 'project')
+    await mkdir(join(project, '.git'), { recursive: true })
+    await put(
+      join(home, 'config.toml'),
+      `
+[projects.${JSON.stringify(project)}]
+trust_level = "trusted"
+[mcp_servers.to_http]
+type = "stdio"
+command = "fixture"
+enabled_tools = ["allowed"]
+[mcp_servers.to_stdio]
+type = "http"
+url = "https://previous.invalid/mcp"
+bearer_token_env_var = "FIXTURE_MISSING_TOKEN"
+`,
+    )
+    await put(
+      join(project, '.codex/config.toml'),
+      `
+[mcp_servers.to_http]
+type = "http"
+url = "https://fixture.invalid/mcp"
+[mcp_servers.to_stdio]
+command = "fixture"
+`,
+    )
+    const { mcp } = await discoverCodexSnapshot(home, options, {
+      cwd: project,
+      fs: fixtureFs,
+    })
+    expect(mcp).toMatchObject([
+      {
+        serverName: 'to_http',
+        transport: 'streamable-http',
+        url: 'https://fixture.invalid/mcp',
+        enabledTools: ['allowed'],
+      },
+      { serverName: 'to_stdio', transport: 'stdio', command: 'fixture' },
+    ])
+  })
+
   it('matches disabled skill selectors through symlink aliases', async () => {
     const home = await realpath(await directory()),
       target = join(home, 'target/SKILL.md'),
@@ -885,7 +929,7 @@ describe('Codex instruction context', () => {
     ).toContain('<\\/system-reminder>')
   })
 
-  it('keeps a descendant instruction that reinstates an overridden rule', async () => {
+  it('deduplicates identical instruction bodies across non-adjacent directories', async () => {
     const root = await directory(),
       child = join(root, 'child'),
       cwd = join(child, 'leaf')
@@ -902,11 +946,7 @@ describe('Codex instruction context', () => {
       absent,
       fixtureFs,
     )
-    expect(files.map(({ content }) => content)).toEqual([
-      'Rule A',
-      'Rule B',
-      'Rule A',
-    ])
+    expect(files.map(({ content }) => content)).toEqual(['Rule A', 'Rule B'])
   })
 
   it('logs a baseline once, replaces native project candidates, refreshes changes and preserves user messages', async () => {

@@ -252,8 +252,8 @@ export function installSettingsOverlay(
     pendingWrite = work.catch(() => undefined)
     return work
   }
-  // Editable drafts contain manual values only; automatic capacities belong in
-  // the effective view. Otherwise typing the current automatic value is lost.
+  // Keep automatic capacities and compatibility fallbacks in the effective view.
+  // The editable draft exposes native fields so their first manual save sticks.
   function operation(rows?: any[]) {
     const scope = prepare?.(rows ?? originalDescribe.call(settings)) ?? {
       resolve,
@@ -266,41 +266,52 @@ export function installSettingsOverlay(
         ? scope.writes.editableContext(provider, model)
         : model.contextWindow
       const projected = { ...capability }
+      if (capability.reasoning.fallback)
+        projected.reasoning = { status: 'unknown', choices: [] }
       if (manual === undefined) delete projected.contextWindow
       else projected.contextWindow = manual
       return projected
     }
     return { ...scope, editableResolve }
   }
+  function projectLayers(row: any, scope: ReturnType<typeof operation>) {
+    return {
+      value: projectConfiguration(row.value, scope.resolve),
+      base: projectConfiguration(row.base, scope.editableResolve),
+      user: projectConfiguration(row.user, scope.editableResolve),
+    }
+  }
   let viewRevision:
-    { native: number; contexts: string; revision: number } | undefined
-  function revision(row: any, value: any) {
-    // The native revision tracks stored config only. A model-list form also
-    // carries derived capacities; reject its stale draft if those change.
-    const contexts = JSON.stringify(
-      Object.entries(value?.providers ?? {}).map(([provider, profile]) => [
-        provider,
-        (profile as JsonObject).models?.map((model: JsonObject) => [
-          model.id,
-          model.contextWindow,
-          model.reasoningEfforts,
+    { native: number; models: string; revision: number } | undefined
+  function revision(row: any, layers: ReturnType<typeof projectLayers>) {
+    // A fallback can change the editable draft while the effective map stays
+    // identical. Compare both views before accepting a saved model list.
+    const models = JSON.stringify(
+      [layers.value, layers.base, layers.user].map((layer) =>
+        Object.entries(layer?.providers ?? {}).map(([provider, profile]) => [
+          provider,
+          (profile as JsonObject).models?.map((model: JsonObject) => [
+            model.id,
+            model.contextWindow,
+            model.reasoningEfforts,
+          ]),
         ]),
-      ]),
+      ),
     )
     if (typeof row.revision === 'number') {
       if (!viewRevision)
         viewRevision = {
           native: row.revision,
-          contexts,
+          models,
           revision: row.revision,
         }
       else if (
         viewRevision.native !== row.revision ||
-        viewRevision.contexts !== contexts
+        viewRevision.models !== models
       )
         viewRevision = {
           native: row.revision,
-          contexts,
+          models,
           revision: Math.max(row.revision, viewRevision.revision + 1),
         }
     }
@@ -309,12 +320,12 @@ export function installSettingsOverlay(
   function modelRevision(rows: any[]) {
     const row = rows.find((entry) => entry.ns === 'llm-pi-ai')
     if (!row) throw new Error('模型设置暂不可用')
-    const scope = operation(rows)
-    return revision(row, projectConfiguration(row.value, scope.resolve))!
+    return revision(row, projectLayers(row, operation(rows)))!
   }
   function describe(this: SettingsLike, options?: any) {
     const rows = originalDescribe.call(this, options)
-    const { resolve: resolveModel, editableResolve } = operation(rows)
+    const scope = operation(rows)
+    const { resolve: resolveModel } = scope
     return rows.map((row) => {
       if (row.ns !== 'llm-pi-ai') return row
       let managed = false
@@ -330,26 +341,26 @@ export function installSettingsOverlay(
             profile as JsonObject,
           )
           if (capability) managed = true
-          if (!capability || capability.reasoning.status === 'unknown')
+          if (
+            !capability ||
+            capability.reasoning.status === 'unknown' ||
+            capability.reasoning.fallback
+          )
             other = true
-          else
+          if (capability)
             for (const choice of capability.reasoning.choices)
               declared.add(choice.id)
         }
-      const value = managed
-        ? projectConfiguration(row.value, resolveModel)
-        : row.value
-      const projectedRevision = revision(row, value)
+      const layers = projectLayers(row, scope)
+      const projectedRevision = revision(row, layers)
       return {
         ...row,
         ...(managed
           ? {
+              ...layers,
               schema: declared.size
                 ? projectSchema(row.schema, declared, other)
                 : row.schema,
-              value,
-              base: projectConfiguration(row.base, editableResolve),
-              user: projectConfiguration(row.user, editableResolve),
             }
           : {}),
         ...(typeof row.revision === 'number'

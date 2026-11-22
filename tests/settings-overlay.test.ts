@@ -74,6 +74,7 @@ function fixture(known = true) {
           { id: model.id },
           'test',
           known ? explicit : undefined,
+          model.reasoningEfforts !== undefined,
         )
       : undefined
   const dispose = installSettingsOverlay(settings, resolve)
@@ -245,6 +246,34 @@ describe('plugin-owned reasoning on the native Models page', () => {
       expect(raw.providers.gateway.models[0].contextWindow).toBe(516000)
     } finally {
       dispose()
+    }
+  })
+
+  it('uses the same revision when only an inherited row is managed', async () => {
+    const raw = { providers: { gateway: { models: [{ id: 'fixture-text' }] } } }
+    const base = { providers: { gateway: { models: [{ id: 'gpt-example' }] } } }
+    const settings = {
+      describe: () => [
+        { ns: 'llm-pi-ai', value: raw, user: raw, base, revision: 7 },
+      ],
+      async write(_ns: string, _change: unknown, expected?: number) {
+        expect(expected).toBe(settings.describe()[0]!.revision)
+      },
+    }
+    const overlay = installSettingsOverlay(settings, (_provider, model) =>
+      model.id === 'gpt-example'
+        ? resolveCapabilities({ id: model.id }, 'test', explicit)
+        : undefined,
+    )
+    try {
+      expect(settings.describe()[0]!.revision).toBe(7)
+      const expected = overlay.modelRevision([
+        { ns: 'llm-pi-ai', value: raw, user: raw, base, revision: 7 },
+      ])
+      await settings.write('llm-pi-ai', (current: unknown) => current, expected)
+      expect(settings.describe()[0]!.revision).toBe(7)
+    } finally {
+      overlay()
     }
   })
 
