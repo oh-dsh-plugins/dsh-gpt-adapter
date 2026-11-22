@@ -386,7 +386,8 @@ describe('context settings and live model integration', () => {
     const started = new Promise<void>((done) => {
       entered = done
     })
-    vi.spyOn(store, 'read').mockImplementation(async () => {
+    await store.write('speeds', saved)
+    vi.spyOn(store, 'read').mockImplementationOnce(async () => {
       entered()
       await gate
       return structuredClone(saved)
@@ -398,10 +399,7 @@ describe('context settings and live model integration', () => {
     await initializing
     await (service as any).speedWrites
     expect((service as any).speeds.size).toBe(0)
-    expect(await (service as any).speedStore.read('removed')).toEqual({
-      sessionId: 'removed',
-      speeds: {},
-    })
+    expect(await store.read('speeds')).toEqual({})
   })
 
   it('discovers new models into an empty user layer without copying inherited provider options', async () => {
@@ -421,6 +419,102 @@ describe('context settings and live model integration', () => {
         ?.contextWindow,
     ).toBeGreaterThan(0)
   })
+
+  it('lets the native settings editor add and clear a Sol reasoning mapping', async () => {
+    const f = await fixture()
+    const id = 'gpt-6.2-sol'
+    f.models([{ id: 'gpt-5.4' }, { id }])
+    await f.service.refresh('fixture')
+    const rows = (value: any) => value.providers.fixture.models
+    const findModel = (models: any[]) => models.find((model) => model.id === id)
+    const before = f.settings.describe()[0]!
+    const mapping = { high: 'native-high' }
+    const path = ['providers', 'fixture', 'models']
+    expect(findModel(rows(f.raw()))).not.toHaveProperty('reasoningEfforts')
+    expect(findModel(rows(before.user))).not.toHaveProperty('reasoningEfforts')
+    expect(findModel(rows(before.value)).reasoningEfforts).toHaveProperty(
+      'xhigh',
+      'xhigh',
+    )
+    const models = structuredClone(rows(before.user))
+    findModel(models).reasoningEfforts = mapping
+    await f.settings.mutate(
+      'llm-pi-ai',
+      [{ op: 'set', path, value: models }],
+      before.revision,
+    )
+    expect(findModel(rows(f.raw())).reasoningEfforts).toEqual(mapping)
+    expect(
+      findModel(rows(f.settings.describe()[0]!.value)).reasoningEfforts,
+    ).toEqual(mapping)
+    const nativeCall = await f.native().prepareCall('fixture', id)
+    expect(
+      nativeCall.model.reasoning?.efforts.map((effort) => effort.id),
+    ).toContain('high')
+    expect(
+      nativeCall.model.reasoning?.efforts.map((effort) => effort.id),
+    ).not.toContain('xhigh')
+
+    const edited = rows(f.settings.describe()[0]!.user)
+    delete findModel(edited).reasoningEfforts
+    await f.settings.mutate('llm-pi-ai', [{ op: 'set', path, value: edited }])
+    expect(findModel(rows(f.raw()))).not.toHaveProperty('reasoningEfforts')
+    expect(
+      findModel(rows(f.settings.describe()[0]!.value)).reasoningEfforts,
+    ).toHaveProperty('xhigh', 'xhigh')
+  })
+
+  it.each(['gpt-6.2-sol', 'gpt-6.2-astra'])(
+    'rejects a stale %s model draft when an identical reasoning fallback takes over',
+    async (id) => {
+      const f = await fixture()
+      f.models([{ id: 'gpt-5.4' }, { id }])
+      await f.service.refresh('fixture')
+      const levels = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+      await f.legacy({
+        [id]: {
+          reasoningChoices: levels.map((level) => ({
+            id: level,
+            label: level,
+            wireValue: level,
+          })),
+        },
+      })
+      const models = (value: any) => value.providers.fixture.models
+      const findModel = (list: any[]) => list.find((model) => model.id === id)
+      const path = ['providers', 'fixture', 'models']
+      const before = f.settings.describe()[0]!
+      const staleDraft = structuredClone(models(before.user))
+      expect(findModel(staleDraft).reasoningEfforts).toHaveProperty('xhigh')
+      findModel(staleDraft).name = 'Renamed'
+
+      await f.legacy({})
+      const after = f.settings.describe()[0]!
+      expect(after.value).toEqual(before.value)
+      expect(findModel(models(after.user))).not.toHaveProperty(
+        'reasoningEfforts',
+      )
+      await expect(
+        f.settings.mutate(
+          'llm-pi-ai',
+          [{ op: 'set', path, value: staleDraft }],
+          before.revision,
+        ),
+      ).rejects.toThrow('revision conflict')
+      expect(findModel(models(f.raw()))).not.toHaveProperty('reasoningEfforts')
+      expect(f.service.status('fixture').contextRevision).toBe(after.revision)
+
+      const freshDraft = structuredClone(models(after.user))
+      findModel(freshDraft).name = 'Renamed'
+      await f.settings.mutate(
+        'llm-pi-ai',
+        [{ op: 'set', path, value: freshDraft }],
+        after.revision,
+      )
+      expect(findModel(models(f.raw())).name).toBe('Renamed')
+      expect(findModel(models(f.raw()))).not.toHaveProperty('reasoningEfforts')
+    },
+  )
 
   it('serializes context saves through legacy cleanup without rolling back a later save', async () => {
     const f = await fixture()
@@ -917,7 +1011,11 @@ describe('context settings and live model integration', () => {
       },
     })
     const current = f.service.capability('fixture', 'gpt-5.4')!
-    expect(current.reasoning).toEqual({ status: 'unknown', choices: [] })
+    expect(current.reasoning).toMatchObject({
+      status: 'known',
+      fallback: true,
+      defaultId: 'medium',
+    })
     expect(current.serviceTiers.map((choice) => choice.id)).toEqual([
       'default',
       'fast',
@@ -1091,7 +1189,7 @@ describe('context settings and live model integration', () => {
     await f.legacy({})
     expect(f.service.capability('fixture', 'gpt-5.4')).toMatchObject({
       displayName: 'gpt-5.4',
-      reasoning: { status: 'unknown', choices: [] },
+      reasoning: { status: 'known', defaultId: 'medium', fallback: true },
       defaultServiceTier: 'default',
     })
     expect(
@@ -1099,6 +1197,7 @@ describe('context settings and live model integration', () => {
     ).toEqual({
       model: 'gpt-5.4',
       service_tier: 'default',
+      reasoning: { effort: 'medium' },
     })
     expect(captured.prepare({}).payload).toMatchObject({
       reasoning: { effort: 'ultra' },
@@ -1571,6 +1670,36 @@ describe('context settings and live model integration', () => {
     ])
   })
 
+  it('migrates per-session speeds once and accepts changes made during a rollback', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'dsh-speed-rollback-'))
+    cleanup.push(() => rm(home, { recursive: true, force: true }))
+    const root = join(home, 'storages', 'gpt-adapter')
+    const legacy = new JsonStorage(root)
+    const previous = new JsonStorage(join(root, 'session-speeds'))
+    const key = JSON.stringify(['keep', 'fixture', 'gpt-5.4'])
+    const deleted = JSON.stringify(['deleted', 'fixture', 'gpt-5.4'])
+    await legacy.write('speeds', { [key]: 'fast', [deleted]: 'fast' })
+    await previous.write('keep', {
+      sessionId: 'keep',
+      speeds: { [key]: 'default' },
+    })
+    await previous.write('deleted', { sessionId: 'deleted', speeds: {} })
+    const open = () =>
+      fixture(undefined, false, false, undefined, undefined, home)
+    const selected = (f: Awaited<ReturnType<typeof open>>) =>
+      f.service.speed('keep' as any, 'fixture', 'gpt-5.4').selected
+    const upgrade = await open()
+    expect(selected(upgrade)).toBe('default')
+    expect(await legacy.read('speeds')).toEqual({ [key]: 'default' })
+    await upgrade.service.setSpeed('keep' as any, 'fixture', 'gpt-5.4', 'fast')
+    expect(await legacy.read('speeds')).toEqual({ [key]: 'fast' })
+    // v0.2.14 writes the same aggregate and can remove entries altogether.
+    await legacy.write('speeds', {})
+    expect(selected(await open())).toBe('default')
+    await legacy.write('speeds', { [key]: 'fast' })
+    expect(selected(await open())).toBe('fast')
+  })
+
   it('replaces speed snapshots only after a successful write and keeps previously captured calls stable', async () => {
     const f = await fixture()
     await f.service.setSpeed(
@@ -1585,7 +1714,7 @@ describe('context settings and live model integration', () => {
       name: 'GPT',
     })!
     const before = (f.service as any).speeds
-    vi.spyOn((f.service as any).speedStore, 'write').mockRejectedValueOnce(
+    vi.spyOn((f.service as any).store, 'write').mockRejectedValueOnce(
       new Error('disk full'),
     )
     await expect(
@@ -1620,7 +1749,7 @@ describe('context settings and live model integration', () => {
   it('removes deleted session speeds after pending writes without losing other sessions', async () => {
     const f = await fixture()
     await f.service.setSpeed('keep' as any, 'fixture', 'gpt-5.4', 'fast')
-    const store = (f.service as any).speedStore as JsonStorage
+    const store = (f.service as any).store as JsonStorage
     const write = store.write.bind(store)
     let release!: () => void, entered!: () => void
     const gate = new Promise<void>((done) => {
@@ -1648,10 +1777,8 @@ describe('context settings and live model integration', () => {
     expect([
       ...((f.service as any).speeds as Map<string, unknown>).keys(),
     ]).toEqual([JSON.stringify(['keep', 'fixture', 'gpt-5.4'])])
-    expect(await store.read('removed')).toBeUndefined()
-    expect(await store.read('keep')).toEqual({
-      sessionId: 'keep',
-      speeds: { [JSON.stringify(['keep', 'fixture', 'gpt-5.4'])]: 'fast' },
+    expect(await store.read('speeds')).toEqual({
+      [JSON.stringify(['keep', 'fixture', 'gpt-5.4'])]: 'fast',
     })
   })
   it.each([
@@ -1678,9 +1805,12 @@ describe('context settings and live model integration', () => {
         ),
       ).rejects.toThrow()
       expect(f.options()).toEqual(before)
-      expect(f.service.capability('fixture', 'gpt-5.4')!.reasoning.status).toBe(
-        'unknown',
-      )
+      expect(
+        f.service.capability('fixture', 'gpt-5.4')!.reasoning,
+      ).toMatchObject({
+        fallback: true,
+        defaultId: 'medium',
+      })
       await expect(
         f.native().prepareCall('fixture', 'gpt-5.4'),
       ).resolves.toBeDefined()
@@ -2173,7 +2303,7 @@ describe('context settings and live model integration', () => {
       const call = await adapter.prepareCall('fixture', 'gpt-5.4')
       expect(call.model.context).toEqual({ contextWindow: 516000 })
       const snapshot = (adapter as any).current()
-      const sdk = vi.spyOn(snapshot.models, 'streamSimple')
+      const sdk = vi.spyOn(snapshot.models, 'stream')
       const nativeCapacity = snapshot.models.getModel(
         'fixture',
         'gpt-5.4',

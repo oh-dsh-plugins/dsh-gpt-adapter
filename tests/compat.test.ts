@@ -579,6 +579,7 @@ describe('built plugin and official transport integration', () => {
           },
           { id: 'gpt-4o' },
           { id: 'gpt-6.2-sol' },
+          { id: 'gpt-6.2-astra' },
         ],
       }
       const options = {
@@ -645,6 +646,7 @@ describe('built plugin and official transport integration', () => {
                   { id: 'gpt-unreported' },
                   { id: 'gpt-4o' },
                   { id: 'gpt-6.2-sol' },
+                  { id: 'gpt-6.2-astra' },
                 ],
               }),
             )
@@ -774,8 +776,18 @@ describe('built plugin and official transport integration', () => {
         ],
       })) {
       }
-      expect(requests.at(-1)).not.toHaveProperty('reasoning')
-      expect(requests.at(-1)).not.toHaveProperty('reasoning_effort')
+      if (protocol === 'openai-responses')
+        expect(requests.at(-1)!.reasoning).toMatchObject({ effort: 'medium' })
+      else expect(requests.at(-1)!.reasoning_effort).toBe('medium')
+      expect(plain.model.reasoning?.defaultEffort).toBe('medium')
+      expect(plain.model.reasoning?.efforts.map(({ id }) => id)).toEqual([
+        'low',
+        'medium',
+        'high',
+        'xhigh',
+        'max',
+        'ultra',
+      ])
       // A user override can supply all six levels for a configured-only model.
       await service.setSpeed(sessionId, 'fixture', 'gpt-local-only', 'fast')
       const local = await adapter!.prepareCall('fixture', 'gpt-local-only')
@@ -857,6 +869,29 @@ describe('built plugin and official transport integration', () => {
       expect(sol.model.reasoning?.efforts.map((effort) => effort.id)).toContain(
         'xhigh',
       )
+      const astra = await adapter!.prepareCall('fixture', 'gpt-6.2-astra')
+      for (const effort of ['high', 'xhigh', 'max', 'ultra']) {
+        const chunks = []
+        for await (const chunk of astra.stream({
+          provider: 'fixture',
+          model: 'gpt-6.2-astra',
+          sessionId,
+          reasoningEffort: ReasoningEffortId(effort),
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+          ],
+        }))
+          chunks.push(chunk)
+        expect(chunks.at(-1)).toMatchObject({
+          type: 'finish',
+          reason: { kind: 'stop' },
+        })
+        const payload = requests.at(-1)!
+        expect(payload.model).toBe('gpt-6.2-astra')
+        if (protocol === 'openai-responses')
+          expect(payload.reasoning).toMatchObject({ effort })
+        else expect(payload.reasoning_effort).toBe(effort)
+      }
       const solRow = profile.models.find(({ id }) => id === 'gpt-6.2-sol')!
       Object.assign(solRow, { reasoningEfforts: { high: 'native-high' } })
       expect(

@@ -8,6 +8,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { withFileLock } from '@deepseek-ai/dsh-atomic-write'
 
 /** One plugin-owned JSON file per route/session; no API keys are written here. */
 export class JsonStorage {
@@ -18,6 +19,11 @@ export class JsonStorage {
       this.directory,
       `${createHash('sha256').update(key).digest('hex')}.json`,
     )
+  }
+
+  async withLock<T>(key: string, work: () => Promise<T>): Promise<T> {
+    await mkdir(this.directory, { recursive: true })
+    return withFileLock(this.path(key), work)
   }
 
   async read<T>(

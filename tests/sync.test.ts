@@ -322,9 +322,10 @@ describe('upstream model synchronization', () => {
       'test',
     )
     expect(snapshot.models.map((model) => model.id)).toEqual(['gpt-6-astra'])
-    expect(snapshot.capabilities['gpt-6-astra']?.reasoning).toEqual({
-      status: 'unknown',
-      choices: [],
+    expect(snapshot.capabilities['gpt-6-astra']?.reasoning).toMatchObject({
+      status: 'known',
+      fallback: true,
+      defaultId: 'medium',
     })
   })
 
