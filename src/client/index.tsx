@@ -218,7 +218,7 @@ export function apply(ctx: Context): void {
         ctx.on('connection/reset', reset),
         ctx.remote.$on('settings/document-updated', invalidate),
         ctx.remote.$on('llm/adapters-updated', invalidate),
-        ctx.remote.$on('llm/models-updated', (provider) => {
+        ctx.remote.$on('llm/models-updated', (provider?: string) => {
           if (!provider || provider === parameters.provider) invalidate()
         }),
       ]

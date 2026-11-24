@@ -86,18 +86,34 @@ for (const version of versions) {
       if (archive && (name === 'lib' || name === 'dist')) continue
       await cp(join(root, name), join(fixture, name), { recursive: true })
     }
-    await run(
-      'npm',
-      [
-        'install',
-        '--ignore-scripts',
-        '--no-audit',
-        '--no-fund',
-        '--package-lock=false',
-        '--registry=https://registry.npmjs.org/',
-      ],
-      fixture,
-    )
+    if (version === '0.2.3-alpha.1') {
+      await cp(
+        join(root, 'scripts', 'alpha1-host', 'pnpm-workspace.yaml'),
+        join(fixture, 'pnpm-workspace.yaml'),
+      )
+      await run(
+        'pnpm',
+        [
+          'install',
+          '--ignore-scripts',
+          '--registry=https://registry.npmjs.org/',
+        ],
+        fixture,
+      )
+    } else {
+      await run(
+        'npm',
+        [
+          'install',
+          '--ignore-scripts',
+          '--no-audit',
+          '--no-fund',
+          '--package-lock=false',
+          '--registry=https://registry.npmjs.org/',
+        ],
+        fixture,
+      )
+    }
     // Source-only fixtures must not introduce another runtime's peer graph.
     for (const name of sourceAliases)
       await symlink(

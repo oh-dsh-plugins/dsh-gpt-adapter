@@ -34,6 +34,16 @@ export const compatibilityTargets = [
     settings: 'dsh-rc5-model-settings',
   },
   {
+    version: '0.2.3-alpha.1',
+    adapter: 'dsh-alpha1-pi-ai',
+    menu: 'dsh-alpha1-model-selection',
+    settings: 'dsh-alpha1-model-settings',
+    peers: {
+      '@deepseek-ai/cordis': '4.2.0-alpha.1',
+      '@deepseek-ai/schemastery': '3.20.0-alpha.1',
+    },
+  },
+  {
     version: '0.2.3-alpha.2',
     adapter: 'dsh-alpha2-pi-ai',
     menu: 'dsh-alpha2-model-selection',
