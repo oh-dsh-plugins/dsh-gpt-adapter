@@ -115,6 +115,22 @@ async function verifyModels(url) {
     await panel
       .getByRole('textbox', { name: 'Display name 1' })
       .fill('GPT compatibility fixture')
+    const testReasoning = version === '0.2.3-alpha.2'
+    if (testReasoning) {
+      await panel
+        .getByRole('button', { name: 'Add model', exact: true })
+        .click()
+      await panel.getByRole('textbox', { name: 'Model ID 2' }).fill('gpt-5.5')
+      await panel
+        .getByRole('textbox', { name: 'Display name 2' })
+        .fill('GPT reasoning fixture B')
+      await panel
+        .getByLabel('Base URL', { exact: true })
+        .fill('http://127.0.0.1:1/v1')
+      await panel
+        .getByLabel('API key', { exact: true })
+        .fill('fixture-only-not-a-real-credential')
+    }
     await expand()
     assert.deepEqual(await preset().locator('option').allTextContents(), [
       'Default',
@@ -139,6 +155,57 @@ async function verifyModels(url) {
       await openCustomized()
       await expand()
       assert.equal(await preset().inputValue(), '516k')
+      if (testReasoning) {
+        await page.keyboard.press('Escape')
+        await settings.waitFor({ state: 'hidden' })
+        const trigger = page.getByRole('button', {
+          name: /^Select model(?:,|$)/,
+        })
+        if (!(await trigger.count()))
+          await page
+            .getByRole('button', { name: /^New (session|chat)/i })
+            .first()
+            .click()
+        const choose = async (label) => {
+          await trigger.click()
+          const models = page.getByRole('menuitem', { name: /^Model(?:\s|$)/ })
+          if (await models.count()) await models.click()
+          await page.getByRole('menuitemradio', { name: label }).click()
+        }
+        const effort = async (label) => {
+          await trigger.click()
+          await page.getByRole('menuitem', { name: /^Effort(?:\s|$)/ }).click()
+          await page.getByRole('menuitemradio', { name: label }).click()
+        }
+        await choose(/GPT compatibility fixture/)
+        if (
+          !(await trigger.getAttribute('aria-label'))?.includes(
+            'GPT compatibility fixture',
+          )
+        )
+          await page
+            .getByRole('button', {
+              name: /Select model, current GPT compatibility fixture/,
+            })
+            .waitFor()
+        await effort(/^ultra(?:\s|$)/i)
+        await page
+          .getByRole('button', { name: /GPT compatibility fixture.*ultra/i })
+          .waitFor()
+        await choose(/GPT reasoning fixture B/)
+        await page
+          .getByRole('button', { name: /GPT reasoning fixture B.*ultra/i })
+          .waitFor()
+        await effort(/^low(?:\s|$)/i)
+        await page
+          .getByRole('button', { name: /GPT reasoning fixture B.*low/i })
+          .waitFor()
+        await choose(/GPT compatibility fixture/)
+        await page
+          .getByRole('button', { name: /GPT compatibility fixture.*low/i })
+          .waitFor()
+        return '516K persisted and latest effort followed both model switches'
+      }
       return 'presets visible, saved and reopened at 516K'
     }
     return 'presets visible'

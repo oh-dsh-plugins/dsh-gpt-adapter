@@ -461,9 +461,10 @@ describe('context settings and live model integration', () => {
     expect(
       nativeCall.model.reasoning?.efforts.map((effort) => effort.id),
     ).toContain('high')
-    expect(
-      nativeCall.model.reasoning?.efforts.map((effort) => effort.id),
-    ).not.toContain('xhigh')
+    expect(nativeCall.model.reasoning?.efforts).toContainEqual({
+      id: 'xhigh',
+      name: 'xhigh → High',
+    })
 
     const edited = rows(f.settings.describe()[0]!.user)
     delete findModel(edited).reasoningEfforts

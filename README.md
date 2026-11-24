@@ -22,6 +22,8 @@ Plugin UI text, context presets, configuration descriptions, and plugin-owned va
 
 ## Installation
 
+**Minimum version `DSH >=0.2.2-rc.1`.** The verified versions are listed below.
+
 Version `0.2.20` supports DSH `0.2.2-rc.1` through `0.2.2-rc.5` with Node.js `>=24.9.0` and DSH `0.2.3-alpha.2` with Node.js `^24.22.3 || >=26.13.1`. DSH `0.2.3-alpha.1` requires the [isolated host setup](scripts/alpha1-host/README.md) to correct its published startup dependencies before installing the plugin.
 
 Install the npm package in your DSH web profile:
@@ -55,7 +57,9 @@ Fast requests the upstream priority tier. Upstream model metadata controls autom
 
 Use **Sync now** on the provider card to refresh the model list. Models no longer listed upstream are retained until you choose to remove them. You can also configure the sync interval, an optional capability catalog URL, and model capability overrides on that card. Explicit capability overrides take precedence over upstream metadata, external catalogs, and presets, except that an upstream Ultrafast denial is retained for automatic capability resolution. The separate manual-selection switch does not assert upstream support.
 
-For an adapted GPT model with no declared reasoning choices, the plugin supplies the six-level preset `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, with `medium` as the fallback default. Explicit model settings, upstream metadata, the capability catalog, or a per-model `reasoningChoices` override can replace these options. The preset appears in the conversation picker. The Models editor lets you save a native mapping or clear it to restore the preset. Each gateway decides which levels it accepts.
+The conversation picker offers `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` for adapted GPT models with usable reasoning mappings. When a gateway accepts fewer levels, the picker shows the mapped level, for example `ultra → Xhigh`, and the request uses that supported value. Explicit model settings, upstream metadata, the capability catalog, and per-model `reasoningChoices` overrides determine the available mappings. Gateways without effort metadata keep the existing GPT preset and a fallback default of `medium`.
+
+The most recent reasoning choice follows the conversation when switching to an adapted model that can use it. The browser remembers that choice through a reload, including when the current model has no reasoning controls. Models that explicitly disable reasoning keep their native behavior.
 
 ### Context windows
 

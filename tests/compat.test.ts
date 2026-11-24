@@ -676,6 +676,10 @@ describe('built plugin and official transport integration', () => {
             id: 'gpt-unreported',
             reasoningEfforts: { low: 'low', high: 'high' },
           },
+          {
+            id: 'gpt-native-disabled-effort',
+            reasoningEfforts: { medium: 'medium', high: 'none' },
+          },
           { id: 'gpt-4o' },
           { id: 'gpt-6.2-sol' },
           { id: 'gpt-6.2-astra' },
@@ -688,6 +692,7 @@ describe('built plugin and official transport integration', () => {
             enabled: true,
             refreshIntervalMs: 1800000,
             overridesJSON: JSON.stringify({
+              'gpt-custom': { defaultReasoningId: 'high' },
               'gpt-local-only': {
                 reasoningChoices: [
                   'low',
@@ -771,6 +776,11 @@ describe('built plugin and official transport integration', () => {
       const sessionId = 'test-session' as SessionId
       native.apply(ctx, native.Config({ providers: { fixture: profile } }))
       expect(adapter).toBeDefined()
+      expect(service.reasoningManaged('fixture', 'gpt-custom')).toBe(true)
+      expect(service.reasoningManaged('fixture', 'legacy-model')).toBe(false)
+      expect(service.reasoningManaged('fixture', 'gpt-not-configured')).toBe(
+        false,
+      )
       await service.setSpeed(sessionId, 'fixture', 'gpt-custom', 'fast')
       const preserved = await adapter!.prepareCall('fixture', 'gpt-unreported')
       expect(
@@ -782,7 +792,12 @@ describe('built plugin and official transport integration', () => {
       const call = await adapter!.prepareCall('fixture', 'gpt-custom')
       expect(
         call.model.reasoning?.efforts.map((effort) => String(effort.id)),
-      ).toEqual(['max', 'ultra'])
+      ).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+      expect(call.model.reasoning?.efforts).toContainEqual({
+        id: 'high',
+        name: 'high → Max',
+      })
+      expect(call.model.reasoning?.defaultEffort).toBe('high')
       const tools = [
         {
           name: 'list_subagent_models',
@@ -833,6 +848,30 @@ describe('built plugin and official transport integration', () => {
           summary: 'auto',
         })
       else expect(requests[0]!.reasoning_effort).toBe('ultra')
+      for (const [model, selection, expected] of [
+        ['gpt-custom', 'high', 'max'],
+        ['gpt-custom', undefined, 'max'],
+        ['gpt-unreported', 'ultra', 'high'],
+        ['gpt-native-disabled-effort', 'ultra', 'medium'],
+      ]) {
+        const alias = await adapter!.prepareCall('fixture', model!)
+        for await (const _ of alias.stream({
+          provider: 'fixture',
+          model: model!,
+          sessionId,
+          ...(selection === undefined
+            ? {}
+            : { reasoningEffort: ReasoningEffortId(selection) }),
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+          ],
+        })) {
+        }
+        const payload = requests.at(-1)!
+        if (protocol === 'openai-responses')
+          expect(payload.reasoning).toMatchObject({ effort: expected })
+        else expect(payload.reasoning_effort).toBe(expected)
+      }
       const wireTools = requests[0]!.tools as any[]
       for (const [index, tool] of tools.entries()) {
         const wire =
@@ -865,10 +904,11 @@ describe('built plugin and official transport integration', () => {
         ],
       })) {
       }
-      expect(requests[1]!.service_tier).toBe('priority')
+      const fallbackPayload = requests.at(-1)!
+      expect(fallbackPayload.service_tier).toBe('priority')
       if (protocol === 'openai-responses')
-        expect(requests[1]!.reasoning).toMatchObject({ effort: 'high' })
-      else expect(requests[1]!.reasoning_effort).toBe('high')
+        expect(fallbackPayload.reasoning).toMatchObject({ effort: 'high' })
+      else expect(fallbackPayload.reasoning_effort).toBe('high')
       const plain = await adapter!.prepareCall('fixture', 'gpt-4o')
       for await (const _chunk of plain.stream({
         provider: 'fixture',

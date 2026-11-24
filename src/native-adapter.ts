@@ -8,8 +8,30 @@ type Snapshot = {
   profiles: Map<string, Record<string, any>>
   models: {
     stream(model: any, context: any, options: any): any
+    getModel?(provider: string, model: string): NativeModel | undefined
     [key: string]: any
   }
+}
+type NativeModel = {
+  api?: string
+  thinkingLevelMap?: Record<string, string | null>
+}
+
+/** Read the same resolved model descriptor used by the verified native adapter. */
+export function nativeModelOf(
+  snapshot: object | undefined,
+  provider: string,
+  model: string,
+) {
+  return (snapshot as Snapshot | undefined)?.models?.getModel?.(provider, model)
+}
+
+export function registeredNativeModel(
+  adapter: unknown,
+  provider: string,
+  model: string,
+) {
+  return nativeModelOf((adapter as NativeAdapter).current(), provider, model)
 }
 type NativeAdapter = {
   current(): Snapshot
@@ -78,7 +100,7 @@ function patch(prototype: NativeAdapter) {
     return undefined
   }
   const protocolOf = (snapshot: Snapshot, provider: string, model: string) => {
-    const api = snapshot.models.getModel?.(provider, model)?.api
+    const api = nativeModelOf(snapshot, provider, model)?.api
     return typeof api === 'string' ? api : null
   }
   const original = {
@@ -112,9 +134,10 @@ function patch(prototype: NativeAdapter) {
       })
     const models = new Proxy(snapshot.models, {
       get(target, key) {
-        if (key === 'getModel' && typeof target.getModel === 'function')
+        const getModel = key === 'getModel' ? target.getModel : undefined
+        if (typeof getModel === 'function')
           return (provider: string, modelId: string) => {
-            const model = target.getModel(provider, modelId)
+            const model = getModel.call(target, provider, modelId)
             const capacity = extension.model.context as
               { contextWindow?: number } | undefined
             return model &&
@@ -197,11 +220,17 @@ function patch(prototype: NativeAdapter) {
         return typeof value === 'function' ? value.bind(target) : value
       },
     })
+    const requested = options.reasoningEffort
+    const nativeEffort = extension.preserveReasoning
+      ? typeof requested === 'string'
+        ? (extension.nativeReasoningId?.(requested) ?? requested)
+        : requested
+      : fallback
     return original.streamWithSnapshot.call(
       adapter,
-      extension.preserveReasoning
+      nativeEffort === requested
         ? options
-        : { ...options, reasoningEffort: fallback },
+        : { ...options, reasoningEffort: nativeEffort },
       { ...snapshot, profiles, models },
     )
   }
