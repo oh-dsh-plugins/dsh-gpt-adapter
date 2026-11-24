@@ -158,14 +158,13 @@ async function verifyModels(url) {
       if (testReasoning) {
         await page.keyboard.press('Escape')
         await settings.waitFor({ state: 'hidden' })
-        const trigger = page.getByRole('button', {
+        const composer = page.locator('[data-composer-card]')
+        const trigger = composer.getByRole('button', {
           name: /^Select model(?:,|$)/,
         })
-        if (!(await trigger.count()))
-          await page
-            .getByRole('button', { name: /^New (session|chat)/i })
-            .first()
-            .click()
+        // The Host opens its first session after the workspace feed settles.
+        // Clicking New session before that would cancel the startup navigation.
+        await trigger.waitFor({ state: 'visible', timeout: 30000 })
         const choose = async (label) => {
           await trigger.click()
           const models = page.getByRole('menuitem', { name: /^Model(?:\s|$)/ })
@@ -278,6 +277,16 @@ try {
           codexCompatibility: { enabled: true, codexHome },
         },
       },
+      // The isolated Alpha.2 browser test needs a real conversation. Linux CI
+      // need not have an XDG Documents directory for the first-use Workspace.
+      ...(version === '0.2.3-alpha.2'
+        ? [
+            {
+              id: 'workspace-controller',
+              config: { documentsDirectory: fixture },
+            },
+          ]
+        : []),
     ]),
   )
   host = spawn(
