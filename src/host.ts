@@ -24,11 +24,15 @@ import {
 } from './context-window.js'
 import {
   installNativeAdapterBridge,
+  nativeModelOf,
   registeredAdapter,
+  registeredNativeModel,
 } from './native-adapter.js'
 import {
+  activeReasoning,
   isGptModel,
   GPT_REASONING_LEVELS,
+  reasoningAliases,
   resolveCapabilities,
 } from './capabilities.js'
 import {
@@ -360,13 +364,17 @@ type BaseModelInfo = {
   provider: string
   id: string
   name: string
-  reasoning?: unknown
+  reasoning?: {
+    efforts: readonly { id: string; name: string }[]
+    defaultEffort?: string
+  }
   [key: string]: unknown
 }
 type NativeRequest = { reasoningEffort?: string; sessionId?: string }
 export type NativeExtension = {
   model: BaseModelInfo
   preserveReasoning?: boolean
+  nativeReasoningId?(selected: string): string
   tierOnly?: boolean
   prepare(options: NativeRequest): {
     payload: Record<string, unknown>
@@ -979,6 +987,22 @@ export class GptModels extends Service {
   }
 
   @Remote
+  reasoningManaged(provider: string, modelId: string): boolean {
+    if (this.adapterState(provider) !== 'ready') return false
+    const adapter = registeredAdapter(this.ctx.llm, provider)
+    if (!adapter) return false
+    const protocol = registeredNativeModel(adapter, provider, modelId)?.api
+    return !!this.capability(
+      provider,
+      modelId,
+      undefined,
+      undefined,
+      undefined,
+      protocol ?? null,
+    )
+  }
+
+  @Remote
   async configure(provider: string, enabled: boolean): Promise<void> {
     const read = this.readSettings()
     this.profile(provider, read)
@@ -1546,6 +1570,7 @@ export class GptModels extends Service {
     },
     read?: SettingsRead,
     nativeProtocol?: string | null,
+    includeReasoningAliases = false,
   ): ModelCapabilities | undefined {
     if (this.adapterState(provider) !== 'ready' || !isGptModel({ id: modelId }))
       return undefined
@@ -1593,6 +1618,7 @@ export class GptModels extends Service {
       snapshot?.capabilities[modelId]?.capabilityRevision ?? 'gpt-preset',
       override,
       nativeModel?.reasoningEfforts !== undefined,
+      includeReasoningAliases,
     )
     return {
       ...result,
@@ -1636,6 +1662,7 @@ export class GptModels extends Service {
       profile,
       read,
       protocol,
+      true,
     )
     const manualEnabled =
       protocol === 'openai-responses' &&
@@ -1644,8 +1671,23 @@ export class GptModels extends Service {
     if (!current && !manualEnabled) return undefined
     // Outside GPT adaptation, the manual switch only forwards a selected tier.
     const tierOnly = !current
-    const preserveReasoning = tierOnly || current.reasoning.status === 'unknown'
+    const nativeChoices = base.reasoning?.efforts ?? []
+    const preserveReasoning =
+      tierOnly ||
+      current.reasoning.status === 'unknown' ||
+      (current.reasoning.fallback === true && nativeChoices.length > 0)
     const capabilities = current && structuredClone(current)
+    const nativeThinking =
+      preserveReasoning && capabilities
+        ? nativeModelOf(nativeSnapshot, provider, modelId)?.thinkingLevelMap
+        : undefined
+    const nativeAliases =
+      capabilities && preserveReasoning
+        ? reasoningAliases(
+            nativeChoices.map(({ id, name }) => ({ id, label: name })),
+            ({ id }) => activeReasoning(id, nativeThinking?.[id]),
+          )
+        : []
     const speeds = this.speeds
     const manualEpoch = this.manualSpeedEpochs.get(provider)
     const model = capabilities
@@ -1669,6 +1711,11 @@ export class GptModels extends Service {
         }
       : base
     if (!preserveReasoning) delete model.reasoning
+    if (nativeAliases.length && base.reasoning)
+      model.reasoning = {
+        ...base.reasoning,
+        efforts: nativeAliases.map(({ id, label }) => ({ id, name: label })),
+      }
     if (!preserveReasoning && capabilities?.reasoning.choices.length)
       model.reasoning = {
         efforts: capabilities.reasoning.choices.map((choice) => ({
@@ -1688,6 +1735,8 @@ export class GptModels extends Service {
     return {
       model,
       preserveReasoning,
+      nativeReasoningId: (selected) =>
+        nativeAliases.find(({ id }) => id === selected)?.target.id ?? selected,
       tierOnly,
       prepare: (options) => {
         const key = JSON.stringify([options.sessionId ?? '', provider, modelId])

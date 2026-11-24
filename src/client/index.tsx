@@ -31,6 +31,7 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import styles from 'dsh-gpt-adapter/native-settings-styles'
 import { installNativeContextPresets } from './native-context-settings.js'
+import { installReasoningSelection } from './reasoning-selection.js'
 import {
   NS,
   dictionaries,
@@ -52,6 +53,17 @@ export const inject = [
 
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, dictionaries))
+  ctx.effect(() =>
+    installReasoningSelection(
+      ctx.get('modelDirectories'),
+      ({ provider, model }) =>
+        call<boolean>(
+          'reasoningManaged',
+          { provider, modelId: model },
+          AbortSignal.timeout(3000),
+        ),
+    ),
+  )
   const translate = ctx.locale.bind(NS)
   async function call<T>(
     method: string,

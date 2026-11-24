@@ -33,6 +33,44 @@ const GPT_REASONING_PRESET: ReasoningChoice[] = GPT_REASONING_LEVELS.map(
   (id) => ({ id, label: id, wireValue: id, source: 'catalog' }),
 )
 
+export const activeReasoning = (id: string, wire?: string | null) =>
+  id !== 'off' &&
+  id !== 'none' &&
+  wire !== null &&
+  wire !== 'none' &&
+  wire !== 'off'
+
+/** Add selectable aliases without changing the provider's physical effort map. */
+export function reasoningAliases<T extends { id: string; label: string }>(
+  choices: readonly T[],
+  canMap: (choice: T) => boolean,
+): Array<{ id: string; label: string; target: T }> {
+  const direct = choices.map((target) => ({
+    id: target.id,
+    label: target.label,
+    target,
+  }))
+  const eligible = choices.filter(canMap)
+  const ranks = ['minimal', ...GPT_REASONING_LEVELS]
+  const ranked = ranks.flatMap(
+    (id) => eligible.find((choice) => choice.id === id) ?? [],
+  )
+  for (const id of GPT_REASONING_LEVELS) {
+    if (choices.some((choice) => choice.id === id)) continue
+    const rank = ranks.indexOf(id)
+    const target =
+      ranked.filter((choice) => ranks.indexOf(choice.id) <= rank).at(-1) ??
+      ranked[0] ??
+      (eligible.length === 1 ? eligible[0] : undefined)
+    if (target) direct.push({ id, label: `${id} → ${target.label}`, target })
+  }
+  return direct.sort((left, right) => {
+    const l = ranks.indexOf(left.id)
+    const r = ranks.indexOf(right.id)
+    return l < 0 || r < 0 ? Number(l >= 0) - Number(r >= 0) : l - r
+  })
+}
+
 const GPT_PRESET = {
   serviceTiers: GPT_SPEED_PRESET,
   defaultServiceTier: 'default' as const,
@@ -55,6 +93,7 @@ export function resolveCapabilities(
   revision: string,
   override?: ModelOverride,
   hasNativeReasoning = false,
+  includeReasoningAliases = false,
 ): ModelCapabilities {
   const base = catalogFor(model.id)
   const upstream = model.capabilities
@@ -75,7 +114,12 @@ export function resolveCapabilities(
       : choices === undefined
         ? 'unknown'
         : 'known'
-  const finalChoices = status === 'known' ? choices! : []
+  const physicalChoices = status === 'known' ? choices! : []
+  const finalChoices = includeReasoningAliases
+    ? reasoningAliases(physicalChoices, ({ id, wireValue }) =>
+        activeReasoning(id, wireValue),
+      ).map(({ id, label, target }) => ({ ...target, id, label }))
+    : physicalChoices
   const candidateDefaultReasoning =
     override?.defaultReasoningId ??
     upstream?.defaultReasoningId ??
