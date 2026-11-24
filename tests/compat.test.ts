@@ -262,10 +262,14 @@ describe('built plugin and official transport integration', () => {
         resolve: async () => ({ value: 'fixture-key' }),
       })
       let adapter: LlmAdapter | undefined
+      const adapters = new Map<string, { adapter: LlmAdapter }>()
       ctx.provide('llm', {
+        adapters,
         listConfigurableProviders: () => [],
-        registerAdapter: (_providers: unknown, value: LlmAdapter) => {
+        registerAdapter: (providers: string[], value: LlmAdapter) => {
           adapter = value
+          for (const provider of providers)
+            adapters.set(provider, { adapter: value })
           return Object.assign(() => {}, { replace() {} })
         },
         registerConfigurableProviders: () =>
@@ -325,9 +329,17 @@ describe('built plugin and official transport integration', () => {
       )
       const service = ctx.get('gptModels') as GptModels
       if (!tierOnly) await service.refresh('fixture')
-      expect(service.status('fixture').canConfigureUltrafastFallback).toBe(true)
+      expect(service.status('fixture').adapter).toBe('pending')
+      expect(service.status('fixture').canConfigureUltrafastFallback).toBe(
+        false,
+      )
       native.apply(ctx, native.Config({ providers: { fixture: profile } }))
       expect(adapter).toBeDefined()
+      expect(service.status('fixture').canConfigureUltrafastFallback).toBe(true)
+      adapters.set('fixture', { adapter: {} as LlmAdapter })
+      expect(service.status('fixture').adapter).toBe('native')
+      expect(service.modelStatus('fixture', modelId).enabled).toBe(false)
+      adapters.set('fixture', { adapter: adapter! })
       const sessionId = 'ultrafast-session' as SessionId
       const send = async () => {
         const call = await adapter!.prepareCall('fixture', modelId)
@@ -443,10 +455,14 @@ describe('built plugin and official transport integration', () => {
         resolve: async () => ({ value: 'fixture-key' }),
       })
       let adapter: LlmAdapter | undefined
+      const adapters = new Map<string, { adapter: LlmAdapter }>()
       ctx.provide('llm', {
+        adapters,
         listConfigurableProviders: () => [],
-        registerAdapter: (_providers: unknown, value: LlmAdapter) => {
+        registerAdapter: (providers: string[], value: LlmAdapter) => {
           adapter = value
+          for (const provider of providers)
+            adapters.set(provider, { adapter: value })
           return Object.assign(() => {}, { replace() {} })
         },
         registerConfigurableProviders: () =>
@@ -552,6 +568,89 @@ describe('built plugin and official transport integration', () => {
       expect(runtime[field!]).toBe(hash)
     }
   })
+  it('uses the implicit Cerebras Chat Completions protocol in the SDK payload', async () => {
+    const native = await import('@deepseek-ai/dsh-llm-pi-ai')
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-gpt-test-'))
+    cleanup.push(() => rm(directory, { recursive: true, force: true }))
+    vi.stubEnv('DSH_HOME', directory)
+    const ctx = new Context()
+    cleanup.push(() => ctx.fiber.dispose())
+    const provider = 'cerebras'
+    const model = 'gpt-oss-120b'
+    const providers = {
+      [provider]: {
+        baseURL: 'https://fixture.invalid/v1',
+        apiKeyEnv: 'TEST_API_KEY',
+        models: [{ id: model }],
+      },
+    }
+    ctx.provide('settings', {
+      configure: () => () => {},
+      describe: () => [{ ns: 'llm-pi-ai', value: { providers }, revision: 1 }],
+    })
+    ctx.provide('credentials', {
+      resolve: async () => ({ value: 'fixture-key' }),
+    })
+    const adapters = new Map<string, { adapter: LlmAdapter }>()
+    ctx.provide('llm', {
+      adapters,
+      listConfigurableProviders: () => [],
+      registerAdapter: (routes: string[], adapter: LlmAdapter) => {
+        for (const route of routes) adapters.set(route, { adapter })
+        return Object.assign(() => {}, { replace() {} })
+      },
+      registerConfigurableProviders: () =>
+        Object.assign(() => {}, { replace() {} }),
+      registerModelDiscovery: () => () => {},
+    })
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      const { pathname } = new URL(String(url))
+      if (pathname.endsWith('/models')) return Response.json({ data: [] })
+      requests.push({ path: pathname, body: JSON.parse(String(init?.body)) })
+      return streamResponse('openai-completions')
+    })
+    await (
+      await import('../lib/index.js')
+    ).apply(
+      ctx,
+      Config({
+        codexCompatibility: { enabled: false },
+        routes: {
+          [provider]: {
+            enabled: true,
+            refreshIntervalMs: 1800000,
+            overridesJSON: JSON.stringify({
+              [model]: {
+                reasoningChoices: [
+                  { id: 'high', label: 'High', wireValue: 'high' },
+                ],
+              },
+            }),
+          },
+        },
+      }),
+    )
+    native.apply(ctx, native.Config({ providers }))
+    const call = await adapters
+      .get(provider)!
+      .adapter.prepareCall(provider, model)
+    for await (const _ of call.stream({
+      provider,
+      model,
+      reasoningEffort: ReasoningEffortId('high'),
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    })) {
+      /* Drain the native stream. */
+    }
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({
+      path: '/v1/chat/completions',
+      body: { model, reasoning_effort: 'high' },
+    })
+    expect(requests[0]!.body).not.toHaveProperty('reasoning')
+  })
+
   it.each(['openai-responses', 'openai-completions'] as const)(
     'sends the native effort and priority through the actual %s implementation',
     async (protocol) => {
@@ -620,10 +719,14 @@ describe('built plugin and official transport integration', () => {
         resolve: async () => ({ value: 'fixture-key' }),
       })
       let adapter: LlmAdapter | undefined
+      const adapters = new Map<string, { adapter: LlmAdapter }>()
       ctx.provide('llm', {
+        adapters,
         listConfigurableProviders: () => [],
-        registerAdapter: (_providers: unknown, value: LlmAdapter) => {
+        registerAdapter: (providers: string[], value: LlmAdapter) => {
           adapter = value
+          for (const provider of providers)
+            adapters.set(provider, { adapter: value })
           return Object.assign(() => {}, { replace() {} })
         },
         registerConfigurableProviders: () =>
@@ -666,9 +769,9 @@ describe('built plugin and official transport integration', () => {
       const service = ctx.get('gptModels') as GptModels
       await service.refresh('fixture')
       const sessionId = 'test-session' as SessionId
-      await service.setSpeed(sessionId, 'fixture', 'gpt-custom', 'fast')
       native.apply(ctx, native.Config({ providers: { fixture: profile } }))
       expect(adapter).toBeDefined()
+      await service.setSpeed(sessionId, 'fixture', 'gpt-custom', 'fast')
       const preserved = await adapter!.prepareCall('fixture', 'gpt-unreported')
       expect(
         preserved.model.reasoning?.efforts.map((effort) => String(effort.id)),

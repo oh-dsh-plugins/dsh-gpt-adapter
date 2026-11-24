@@ -204,6 +204,7 @@ export function nativeContextSettingsSource(
     source,
     body,
     settingsStyles,
+    factorySource: factory.getText(ast),
     expectedModelsSectionSource: models.getText(ast),
   }
 }

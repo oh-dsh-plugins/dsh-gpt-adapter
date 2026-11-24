@@ -22,12 +22,12 @@ Plugin UI text, context presets, configuration descriptions, and plugin-owned va
 
 ## Installation
 
-Requires Node.js `>=24.9.0`, Cordis `4.1.0`, and DSH `0.2.2-rc.1`, `0.2.2-rc.2`, `0.2.2-rc.3`, `0.2.2-rc.4`, or `0.2.2-rc.5`.
+Version `0.2.19` supports DSH `0.2.2-rc.1` through `0.2.2-rc.5` with Node.js `>=24.9.0` and DSH `0.2.3-alpha.2` with Node.js `^24.22.3 || >=26.13.1`. DSH `0.2.3-alpha.1` fails before plugin loading because its published Loader dependency lacks required exports.
 
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.18
+dsh plugin --profile web add dsh-gpt-adapter@0.2.19
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -40,7 +40,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.18.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.19.tgz
 ```
 
 ## Using GPT models

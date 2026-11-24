@@ -28,10 +28,19 @@ type Capture = (
   model: string,
   base: any,
   snapshot: Snapshot,
+  protocol: string | null,
 ) => NativeExtension | undefined
 // Isolated Cordis services and separately loaded plugin modules can share a prototype.
 const bridgeOwner = Symbol.for('dsh-gpt-adapter.native-adapter.owner')
 type Runtime = { adapters?: ReadonlyMap<string, { adapter: unknown }> }
+
+function nativeRuntime(llm: object): Runtime {
+  return Reflect.get(llm, symbols.original) ?? llm
+}
+
+export function registeredAdapter(llm: object, provider: string): unknown {
+  return nativeRuntime(llm).adapters?.get(provider)?.adapter
+}
 
 /** Install one dispatcher per prototype and one capture per LLM service. */
 export function installNativeAdapterBridge(
@@ -39,7 +48,7 @@ export function installNativeAdapterBridge(
   capture: Capture,
   llm: object = prototype,
 ): () => void {
-  const runtime: Runtime = Reflect.get(llm, symbols.original) ?? llm
+  const runtime = nativeRuntime(llm)
   const state =
     (Reflect.get(prototype, bridgeOwner) as
       ReturnType<typeof patch> | undefined) ?? patch(prototype)
@@ -67,6 +76,10 @@ function patch(prototype: NativeAdapter) {
       if (!runtime.adapters && owners.size === 1) return capture
     }
     return undefined
+  }
+  const protocolOf = (snapshot: Snapshot, provider: string, model: string) => {
+    const api = snapshot.models.getModel?.(provider, model)?.api
+    return typeof api === 'string' ? api : null
   }
   const original = {
     modelInfo: prototype.modelInfo,
@@ -201,7 +214,13 @@ function patch(prototype: NativeAdapter) {
   ) {
     const base = original.modelInfo.call(this, snapshot, provider, model)
     return (
-      owner(this, provider)?.(provider, model, base, snapshot)?.model ?? base
+      owner(this, provider)?.(
+        provider,
+        model,
+        base,
+        snapshot,
+        protocolOf(snapshot, provider, model),
+      )?.model ?? base
     )
   }
   function prepareCall(
@@ -215,7 +234,15 @@ function patch(prototype: NativeAdapter) {
       return original.prepareCall.call(this, provider, model, signal)
     const snapshot = this.current()
     const base = original.modelInfo.call(this, snapshot, provider, model)
-    const extension = capture(provider, model, base, snapshot)
+    const extension = capture(
+      provider,
+      model,
+      base,
+      snapshot,
+      protocolOf(snapshot, provider, model),
+    )
+    if (!extension)
+      return original.prepareCall.call(this, provider, model, signal)
     return Promise.resolve({
       model: extension?.model ?? base,
       stream: (options: any) =>
@@ -236,7 +263,13 @@ function patch(prototype: NativeAdapter) {
       this,
       options,
       snapshot,
-      capture(options.provider, options.model, base, snapshot),
+      capture(
+        options.provider,
+        options.model,
+        base,
+        snapshot,
+        protocolOf(snapshot, options.provider, options.model),
+      ),
       base,
     )
   }

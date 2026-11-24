@@ -61,9 +61,26 @@ jobs:
       - name: Build, type-check, and run the full suite
         run: pnpm test
 
+      - name: Pack the candidate once
+        run: |
+          mkdir -p .generated/candidate
+          npm pack --ignore-scripts --pack-destination .generated/candidate
+          cd .generated/candidate
+          sha256sum ./*.tgz > SHA256SUMS
+
+      - name: Upload the candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-gpt-adapter-candidate
+          path: |
+            .generated/candidate/*.tgz
+            .generated/candidate/SHA256SUMS
+          include-hidden-files: true
+          if-no-files-found: error
+
   compatibility:
-    name: Compatibility (DSH ${{ matrix.dsh }})
-    needs: versions
+    name: Compatibility (DSH ${{ matrix.dsh.version }})
+    needs: [versions, test]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -84,16 +101,31 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ matrix.dsh.node }}
           cache: pnpm
 
-      - name: Install build dependencies
+      - name: Install fixture source dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build the shipped bundle
-        run: pnpm build
+      - name: Download the candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-gpt-adapter-candidate
+          path: .generated/candidate
 
-      - name: Type-check and test the selected DSH runtime
+      - name: Verify the candidate checksum
+        working-directory: .generated/candidate
+        run: sha256sum --check SHA256SUMS
+
+      - name: Install Chromium for the browser checks
+        run: pnpm exec playwright-core install --with-deps chromium
+
+      - name: Verify the official DSH CLI and model settings
         env:
-          DSH_VERSION: ${{ matrix.dsh }}
-        run: node scripts/test-compat.mjs "$DSH_VERSION"
+          DSH_VERSION: ${{ matrix.dsh.version }}
+        run: node scripts/test-host-compat.mjs "$DSH_VERSION" .generated/candidate/*.tgz
+
+      - name: Type-check and exercise the candidate with the selected runtime
+        env:
+          DSH_VERSION: ${{ matrix.dsh.version }}
+        run: node scripts/test-compat.mjs --archive .generated/candidate/*.tgz "$DSH_VERSION"

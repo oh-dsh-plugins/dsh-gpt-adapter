@@ -59,13 +59,27 @@ type PrepareSkills = <T>(
   action: (options: any) => Promise<T>,
 ) => Promise<T>
 type McpClosure = { closeConfirmed: boolean; cleanupError?: string }
-type McpStatus = { closure(): McpClosure }
-// rc.2+ reports incomplete cleanup through a retained status handle.
-const mcpStatusOf = (
+type McpStatus = {
+  closure(): McpClosure
+  current?(): { state: string; reason?: string }
+}
+type McpInstance = {
+  ready: Promise<McpStatus>
+  dispose(): Promise<McpClosure | undefined>
+}
+// The installed MCP package owns the connection in every mode.
+const { connectionStatusOf: mcpStatusOf, McpClientHost } =
   McpClient as unknown as {
     connectionStatusOf?: (fiber: any) => McpStatus | undefined
+    McpClientHost?: new (ctx: any) => {
+      validate(input: object, path: string[]): unknown
+      mount(config: unknown): McpInstance
+    }
   }
-).connectionStatusOf
+
+async function joinDisposal(fiber: { inertia?: Promise<void> }) {
+  while (fiber.inertia !== undefined) await fiber.inertia
+}
 const skillAllowed = (
   config: CodexSnapshot['config'],
   skill: any,
@@ -178,7 +192,8 @@ export function installCodexCompatibility(
     state: CompatibilityItem
     attempts: number
     retryAt: number
-    closure(): McpClosure | undefined
+    nativeFailure(): string | undefined
+    closeConnection(): Promise<McpClosure | undefined>
     disposal?: Promise<void>
   }
   type AgentState = {
@@ -706,10 +721,7 @@ export function installCodexCompatibility(
   const closeClient = (client: Client): Promise<void> =>
     (client.disposal ??= Promise.resolve()
       .then(async () => {
-        await client.fiber.dispose()
-        // Agent-scope teardown may already have claimed the raw disposer.
-        while (client.fiber.inertia !== undefined) await client.fiber.inertia
-        const closure = client.closure()
+        const closure = await client.closeConnection()
         if (
           closure &&
           (!closure.closeConfirmed || closure.cleanupError !== undefined)
@@ -747,10 +759,14 @@ export function installCodexCompatibility(
         state: 'loading',
       }
       let nativeStatus: McpStatus | undefined
+      let nativeInstance: McpInstance | undefined
+      let nativeFiber: { inertia?: Promise<void> } | undefined
+      let stopping = false
       const plugin = {
         name: `codex-mcp-${entry.serverName}`,
         inject: ['tools'],
-        async apply(child: any) {
+        apply(child: any) {
+          if (stopping) return
           const registry = child.tools
           const tools = new Proxy(registry, {
             get(target, key) {
@@ -800,19 +816,35 @@ export function installCodexCompatibility(
                   url: entry.url!,
                   headers: entry.headers ?? {},
                 }
-          const ready = McpClient.apply(
-            child.extend({ tools }),
-            McpClient.Config({
-              ...connection,
-              serverName: entry.serverName,
-              toolCallTimeoutMs: entry.toolCallTimeoutMs,
-              ...(mcpStatusOf ? { startupTimeoutMs } : {}),
-              failOnStartupError: true,
-              reconnect: { enabled: true },
-            }),
-          )
+          const options = {
+            ...connection,
+            serverName: entry.serverName,
+            toolCallTimeoutMs: entry.toolCallTimeoutMs,
+            ...(mcpStatusOf || McpClientHost ? { startupTimeoutMs } : {}),
+            failOnStartupError: true,
+            reconnect: { enabled: true },
+          }
+          const scoped = child.extend({ tools })
+          if (McpClientHost) {
+            const host = new McpClientHost(scoped.isolate('mcpClientHost'))
+            nativeInstance = host.mount(
+              host.validate(options, ['mcp_servers', entry.serverName]),
+            )
+            // Observe a rejected start even when cancellation wins the race.
+            void nativeInstance.ready.catch(() => {})
+            const runtime = child.registry.get(McpClient.apply)
+            const matches = Array.from(runtime?.fibers ?? []).filter(
+              (fiber: any) => fiber.parent?.fiber === child.fiber,
+            )
+            if (matches.length !== 1)
+              throw new Error('Cannot identify the native MCP connection')
+            nativeFiber = matches[0] as typeof nativeFiber
+            // Waiting here would hold the parent open during a stalled startup.
+            return
+          }
+          const ready = McpClient.apply(scoped, McpClient.Config(options))
           nativeStatus = mcpStatusOf?.(child.fiber)
-          await ready
+          return ready
         },
       }
       const fiber = owner.agent.ctx.plugin(plugin)
@@ -822,14 +854,48 @@ export function installCodexCompatibility(
         state,
         attempts,
         retryAt: 0,
-        closure: () => nativeStatus?.closure(),
+        nativeFailure() {
+          if (stopping || state.state !== 'loaded') return undefined
+          const status = nativeStatus?.current?.()
+          if (status?.state !== 'failed') return undefined
+          return status.reason === 'gave-up' ||
+            status.reason === 'reconnect-disabled' ||
+            status.reason === 'unclosed-generation'
+            ? status.reason
+            : undefined
+        },
+        async closeConnection() {
+          stopping = true
+          try {
+            if (nativeInstance) {
+              // Stop the child first. Disposing its parent may otherwise wait
+              // for startup work that only the child's unload can interrupt.
+              const initial = await nativeInstance.dispose()
+              if (!nativeFiber)
+                throw new Error(
+                  'Cannot confirm the native MCP connection closed',
+                )
+              await joinDisposal(nativeFiber)
+              return initial?.closeConfirmed &&
+                initial.cleanupError === undefined
+                ? initial
+                : await nativeInstance.dispose()
+            }
+          } finally {
+            await fiber.dispose()
+            await joinDisposal(fiber)
+          }
+          return nativeStatus?.closure()
+        },
       }
       owner.clients.set(entry.serverName, client)
       let timer: ReturnType<typeof setTimeout> | undefined
       let cancel = () => {}
       try {
         await Promise.race([
-          Promise.resolve(fiber),
+          Promise.resolve(fiber).then(async () => {
+            if (nativeInstance) nativeStatus = await nativeInstance.ready
+          }),
           new Promise((_, reject) => {
             cancel = () => {
               void closeClient(client).catch(() => {})
@@ -1266,26 +1332,48 @@ export function installCodexCompatibility(
         for (const item of items) add(item)
         for (const owner of agents.values()) {
           for (const item of owner.items) add(item)
-          for (const client of owner.clients.values()) add(client.state)
+          for (const client of owner.clients.values()) {
+            const reason = client.nativeFailure()
+            add(
+              reason
+                ? { ...client.state, state: 'failed', reason }
+                : client.state,
+            )
+          }
         }
         return [...merged.values()]
       })(),
     }),
     refresh: async () => {
       await tail
+      const failedOwners = new Set<AgentState>()
       for (const owner of agents.values()) {
         await owner.tail
-        for (const client of owner.clients.values())
+        if (owner.disposed) continue
+        for (const client of owner.clients.values()) {
+          const reason = client.nativeFailure()
+          if (reason) {
+            client.state.state = 'failed'
+            client.state.reason = reason
+            failedOwners.add(owner)
+          }
           if (client.state.state === 'failed') {
             client.attempts = 0
             client.retryAt = 0
           }
+        }
       }
       await refresh()
       await Promise.all(
         [...agents.values()]
-          .filter((owner) => owner.running && !owner.disposed)
-          .map((owner) => owner.tail),
+          .filter((owner) => !owner.disposed)
+          .map((owner) =>
+            owner.running
+              ? owner.tail
+              : failedOwners.has(owner)
+                ? refreshAgent(owner)
+                : undefined,
+          ),
       )
     },
     dispose,

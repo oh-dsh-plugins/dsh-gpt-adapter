@@ -33,7 +33,27 @@ export const compatibilityTargets = [
     menu: 'dsh-rc5-model-selection',
     settings: 'dsh-rc5-model-settings',
   },
-]
+  {
+    version: '0.2.3-alpha.2',
+    adapter: 'dsh-alpha2-pi-ai',
+    menu: 'dsh-alpha2-model-selection',
+    settings: 'dsh-alpha2-model-settings',
+    node: '24.22.3',
+    nodeRange: '^24.22.3 || >=26.13.1',
+    peers: {
+      '@deepseek-ai/cordis': '4.2.0-alpha.1',
+      '@deepseek-ai/schemastery': '3.20.0-alpha.1',
+    },
+  },
+].map((target) => ({
+  node: '24.22.3',
+  nodeRange: '>=24.9.0',
+  peers: {
+    '@deepseek-ai/cordis': '4.1.0',
+    '@deepseek-ai/schemastery': '3.19.0',
+  },
+  ...target,
+}))
 
 export const supportedDshVersions = compatibilityTargets.map(
   ({ version }) => version,
@@ -78,7 +98,13 @@ export function compatibilityManifest(
     peerDependencies: Object.fromEntries(
       Object.entries(manifest.peerDependencies).map(([name, value]) => [
         name,
-        name.startsWith('@deepseek-ai/dsh-') ? range : value,
+        name.startsWith('@deepseek-ai/dsh-')
+          ? range
+          : [
+              ...new Set(
+                targets.map((target) => target.peers?.[name] ?? value),
+              ),
+            ].join(' || '),
       ]),
     ),
   }

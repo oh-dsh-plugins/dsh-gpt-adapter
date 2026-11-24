@@ -22,7 +22,10 @@ import {
   type ContextWindowMode,
   type ContextWindowResolution,
 } from './context-window.js'
-import { installNativeAdapterBridge } from './native-adapter.js'
+import {
+  installNativeAdapterBridge,
+  registeredAdapter,
+} from './native-adapter.js'
 import {
   isGptModel,
   GPT_REASONING_LEVELS,
@@ -416,6 +419,9 @@ export class GptModels extends Service {
     ctx: Context,
     private readonly options: PluginConfig,
     private readonly settingsNs: string,
+    private readonly adapterState: (
+      provider: string,
+    ) => 'pending' | 'native' | 'ready' = () => 'ready',
   ) {
     super(ctx, 'gptModels')
     this.nativeDescribe = ctx.settings.describe.bind(ctx.settings)
@@ -903,7 +909,9 @@ export class GptModels extends Service {
   status(provider: string) {
     const read = this.readSettings()
     const snapshot = read.snapshots.get(provider)
-    const capabilities = { ...snapshot?.capabilities }
+    const adapter = this.adapterState(provider)
+    const capabilities =
+      adapter === 'ready' ? { ...snapshot?.capabilities } : {}
     const profile = this.configuredProfiles(read)[provider]
     const options = this.routeOptions(provider, profile, read)
     const contextWindows: Record<string, ContextWindowResolution> = {}
@@ -930,6 +938,7 @@ export class GptModels extends Service {
     }
     return {
       enabled: options?.enabled ?? false,
+      adapter,
       status: this.runners.get(provider)?.getStatus() ?? { state: 'idle' },
       models:
         snapshot?.models.map((model) => ({
@@ -994,27 +1003,36 @@ export class GptModels extends Service {
     )
   }
 
+  private modelProtocol(
+    provider: string,
+    modelId: string,
+    explicit: string | undefined,
+    read: SettingsRead,
+  ): string | undefined {
+    if (explicit !== undefined) return explicit
+    const builtin = this.builtinIndex(read, provider)
+    const exact = builtin.get(modelId)?.api
+    if (exact !== undefined) return exact
+    const protocols = new Set([...builtin.values()].map((model) => model.api))
+    return protocols.size === 1 ? protocols.values().next().value : undefined
+  }
+
   private supportsManualUltrafast(
     provider: string,
     profile: { api?: string; models?: readonly { id: string }[] } | undefined,
     read: SettingsRead,
     modelId?: string,
   ): boolean {
-    if (!profile) return false
+    if (!profile || this.adapterState(provider) !== 'ready') return false
     if (profile.api !== undefined) return profile.api === 'openai-responses'
-    // Match the native catalog: an explicit route API wins, followed by the
-    // model's API and then the catalog's single shared API, if it has one.
-    const builtin = this.builtinIndex(read, provider)
-    const protocols = new Set([...builtin.values()].map((model) => model.api))
-    const shared =
-      protocols.size === 1 ? protocols.values().next().value : undefined
     const usesResponses = (id: string) =>
-      (builtin.get(id)?.api ?? shared) === 'openai-responses'
+      this.modelProtocol(provider, id, profile.api, read) === 'openai-responses'
     return modelId !== undefined
       ? usesResponses(modelId)
-      : (profile.models?.length ? profile.models : [...builtin.values()]).some(
-          (model) => usesResponses(model.id),
-        )
+      : (profile.models?.length
+          ? profile.models
+          : [...this.builtinIndex(read, provider).values()]
+        ).some((model) => usesResponses(model.id))
   }
 
   private manualUltrafastConfigured(
@@ -1527,17 +1545,19 @@ export class GptModels extends Service {
       modelOverrides?: Record<string, { reasoningEfforts?: unknown }>
     },
     read?: SettingsRead,
+    nativeProtocol?: string | null,
   ): ModelCapabilities | undefined {
-    if (!isGptModel({ id: modelId })) return undefined
+    if (this.adapterState(provider) !== 'ready' || !isGptModel({ id: modelId }))
+      return undefined
     read ??= this.readSettings()
     const profile = profileOverride ?? this.profile(provider, read).profile
     const options = this.routeOptions(provider, profile, read)
     if (!options?.enabled) return undefined
-    if (
-      !['openai-responses', 'openai-completions'].includes(
-        profile.api ?? 'openai-responses',
-      )
-    )
+    const protocol =
+      nativeProtocol === undefined
+        ? this.modelProtocol(provider, modelId, profile.api, read)
+        : nativeProtocol
+    if (protocol !== 'openai-responses' && protocol !== 'openai-completions')
       return undefined
     const overrides = this.modelOverrides(read, provider, profile)
     const override = {
@@ -1592,6 +1612,7 @@ export class GptModels extends Service {
     modelId: string,
     base: BaseModelInfo,
     nativeSnapshot?: object,
+    nativeProtocol?: string | null,
   ): NativeExtension | undefined {
     let read: SettingsRead
     if (nativeSnapshot && this.nativeRead?.snapshot === nativeSnapshot) {
@@ -1602,13 +1623,24 @@ export class GptModels extends Service {
     }
     const profile = this.configuredProfiles(read)[provider]
     if (!profile) return undefined
-    const current = this.capability(provider, modelId, base.name, profile, read)
-    const manualEnabled = this.manualUltrafastEnabled(
+    const protocol =
+      nativeProtocol === undefined
+        ? this.modelProtocol(provider, modelId, profile.api, read)
+        : nativeProtocol
+    if (protocol !== 'openai-responses' && protocol !== 'openai-completions')
+      return undefined
+    const current = this.capability(
       provider,
       modelId,
+      base.name,
       profile,
       read,
+      protocol,
     )
+    const manualEnabled =
+      protocol === 'openai-responses' &&
+      this.adapterState(provider) === 'ready' &&
+      this.manualUltrafastConfigured(provider, read)
     if (!current && !manualEnabled) return undefined
     // Outside GPT adaptation, the manual switch only forwards a selected tier.
     const tierOnly = !current
@@ -1616,7 +1648,6 @@ export class GptModels extends Service {
     const capabilities = current && structuredClone(current)
     const speeds = this.speeds
     const manualEpoch = this.manualSpeedEpochs.get(provider)
-    const protocol = (profile.api ?? 'openai-responses') as GptProtocol
     const model = capabilities
       ? {
           ...base,
@@ -1758,6 +1789,14 @@ export async function apply(
       },
     },
     ctx.fiber.entry?.options.id ?? name,
+    (provider) => {
+      const adapter = registeredAdapter(ctx.llm, provider)
+      if (adapter === undefined) return 'pending'
+      return adapter !== null &&
+        Object.prototype.isPrototypeOf.call(PiAiAdapter.prototype, adapter)
+        ? 'ready'
+        : 'native'
+    },
   )
   service.codex = installCodexCompatibility(ctx, config.codexCompatibility)
   ctx.effect(() =>
@@ -1765,8 +1804,8 @@ export async function apply(
       PiAiAdapter.prototype as unknown as Parameters<
         typeof installNativeAdapterBridge
       >[0],
-      (provider, model, base, snapshot) =>
-        service.capture(provider, model, base, snapshot),
+      (provider, model, base, snapshot, protocol) =>
+        service.capture(provider, model, base, snapshot, protocol),
       ctx.llm,
     ),
   )

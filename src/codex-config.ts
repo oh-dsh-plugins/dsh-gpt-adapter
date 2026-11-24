@@ -357,28 +357,6 @@ export function normalizeCodexMcp(
     )
       throw new Error('transport-config-conflict')
   }
-  const headers: Record<string, string> = {}
-  const setHeader = (name: string, value: string) => {
-    for (const previous of Object.keys(headers))
-      if (previous.toLowerCase() === name.toLowerCase())
-        delete headers[previous]
-    headers[name] = value
-  }
-  for (const [header, value] of Object.entries(
-    record(raw.http_headers ?? raw.headers),
-  ))
-    setHeader(header, value)
-  for (const [header, variable] of Object.entries(
-    record(raw.env_http_headers),
-  )) {
-    if (!environment[variable]) throw new Error('missing-environment')
-    setHeader(header, environment[variable]!)
-  }
-  if (typeof raw.bearer_token_env_var === 'string') {
-    const token = environment[raw.bearer_token_env_var]
-    if (!token) throw new Error('missing-environment')
-    setHeader('Authorization', `Bearer ${token}`)
-  }
   const seconds = (value: unknown, fallback: number) => {
     const number = value === undefined ? fallback : Number(value)
     if (!Number.isFinite(number) || number <= 0 || number > 2147483)
@@ -406,6 +384,28 @@ export function normalizeCodexMcp(
     const url = new URL(raw.url)
     if (!['https:', 'http:'].includes(url.protocol))
       throw new Error('unsupported-transport')
+    const headers: Record<string, string> = {}
+    const setHeader = (name: string, value: string) => {
+      for (const previous of Object.keys(headers))
+        if (previous.toLowerCase() === name.toLowerCase())
+          delete headers[previous]
+      headers[name] = value
+    }
+    for (const [header, value] of Object.entries(
+      record(raw.http_headers ?? raw.headers),
+    ))
+      setHeader(header, value)
+    for (const [header, variable] of Object.entries(
+      record(raw.env_http_headers),
+    )) {
+      if (!environment[variable]) throw new Error('missing-environment')
+      setHeader(header, environment[variable]!)
+    }
+    if (typeof raw.bearer_token_env_var === 'string') {
+      const token = environment[raw.bearer_token_env_var]
+      if (!token) throw new Error('missing-environment')
+      setHeader('Authorization', `Bearer ${token}`)
+    }
     return { ...common, transport: 'streamable-http', url: raw.url, headers }
   }
   if (typeof raw.command !== 'string' || !raw.command)
@@ -555,7 +555,11 @@ function restrictMcpFallback(entry: CodexMcpConfig, policy: JsonObject) {
 
 export async function discoverCodexSnapshot(
   home: string,
-  options: { importPluginResources: boolean; mcpAllowlist: string[] },
+  options: {
+    importPluginResources: boolean
+    mcpAllowlist: string[]
+    importMcpServers?: boolean
+  },
   context: {
     cwd?: string
     fs?: ProjectFileSystem
@@ -684,13 +688,15 @@ export async function discoverCodexSnapshot(
       }
     }
   }
-  addServers(object(config.mcp_servers), 'config.toml', home)
+  const importMcp = options.importMcpServers !== false
+  if (importMcp) addServers(object(config.mcp_servers), 'config.toml', home)
   if (options.importPluginResources) {
     for (const [id, setting] of Object.entries(object(config.plugins))) {
       if (object(setting).enabled === false) {
         result.items.push({ name: id, kind: 'plugin', state: 'disabled' })
         continue
       }
+      let readManifest = false
       try {
         const plugin = await resolvePlugin(home, id, config, context.resources)
         if (!plugin) {
@@ -702,6 +708,7 @@ export async function discoverCodexSnapshot(
           })
           continue
         }
+        readManifest = true
         const { root, manifest, portable } = plugin
         const name = String(manifest.name ?? id.split('@')[0])
         const declared = portable ? './skills' : (manifest.skills ?? './skills')
@@ -714,38 +721,41 @@ export async function discoverCodexSnapshot(
               pluginId: id,
             })
         }
-        let servers = manifest.mcpServers
-        if (portable) {
-          servers = await optionalJson(
-            join(root, 'mcp.json'),
-            context.resources,
+        result.skillRoots.push(...skillRoots)
+        if (importMcp) {
+          let servers = manifest.mcpServers
+          if (portable) {
+            servers = await optionalJson(
+              join(root, 'mcp.json'),
+              context.resources,
+            )
+          } else if (typeof servers === 'string') {
+            servers = await optionalJson(
+              resolve(root, servers),
+              context.resources,
+            )
+            if (servers === undefined)
+              throw new Error('missing-plugin-mcp-file')
+          } else if (!servers) {
+            servers = await optionalJson(
+              join(root, '.mcp.json'),
+              context.resources,
+              true,
+            )
+          }
+          const expanded = expandPlugin(
+            object(servers).mcpServers ?? servers,
+            root,
+            home,
           )
-        } else if (typeof servers === 'string') {
-          servers = await optionalJson(
-            resolve(root, servers),
-            context.resources,
-          )
-          if (servers === undefined) throw new Error('missing-plugin-mcp-file')
-        } else if (!servers) {
-          servers = await optionalJson(
-            join(root, '.mcp.json'),
-            context.resources,
-            true,
+          addServers(
+            object(expanded),
+            `plugin:${id}`,
+            root,
+            name,
+            object(object(setting).mcp_servers),
           )
         }
-        const expanded = expandPlugin(
-          object(servers).mcpServers ?? servers,
-          root,
-          home,
-        )
-        result.skillRoots.push(...skillRoots)
-        addServers(
-          object(expanded),
-          `plugin:${id}`,
-          root,
-          name,
-          object(object(setting).mcp_servers),
-        )
         result.items.push({ name: id, kind: 'plugin', state: 'loaded' })
         for (const field of ['hooks', 'apps', 'commands']) {
           if (manifest[field])
@@ -757,17 +767,20 @@ export async function discoverCodexSnapshot(
             })
         }
       } catch {
-        const policies = object(object(setting).mcp_servers)
-        for (const entry of context.previous?.mcp ?? []) {
-          if (entry.source !== `plugin:${id}`) continue
-          if (!entry.originalName && Object.keys(policies).length) continue
-          retainServer(entry, object(policies[entry.originalName ?? '']))
+        if (importMcp) {
+          const policies = object(object(setting).mcp_servers)
+          for (const entry of context.previous?.mcp ?? []) {
+            if (entry.source !== `plugin:${id}`) continue
+            if (!entry.originalName && Object.keys(policies).length) continue
+            retainServer(entry, object(policies[entry.originalName ?? '']))
+          }
         }
-        result.skillRoots.push(
-          ...(context.previous?.skillRoots.filter(
-            (entry) => entry.pluginId === id,
-          ) ?? []),
-        )
+        if (!readManifest)
+          result.skillRoots.push(
+            ...(context.previous?.skillRoots.filter(
+              (entry) => entry.pluginId === id,
+            ) ?? []),
+          )
         result.items.push({
           name: id,
           kind: 'plugin',

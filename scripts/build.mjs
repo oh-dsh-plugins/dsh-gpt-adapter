@@ -43,6 +43,7 @@ const runtimes = compatibilityTargets.map((target) => {
     )
   return { adapter, menu, settings }
 })
+const sha256 = (source) => createHash('sha256').update(source).digest('hex')
 const settingsStyles = runtimes[0].settings.settingsStyles
 const nativeContextSettings = []
 for (const { settings } of runtimes) {
@@ -50,14 +51,24 @@ for (const { settings } of runtimes) {
     JSON.stringify(settings.settingsStyles) !== JSON.stringify(settingsStyles)
   )
     throw new Error('Unsupported native Models styles for ' + settings.version)
+  const factorySha256 = sha256(settings.factorySource)
   const existing = nativeContextSettings.find(
-    (candidate) =>
-      candidate.expectedModelsSectionSource ===
-      settings.expectedModelsSectionSource,
+    (candidate) => candidate.factorySha256 === factorySha256,
   )
-  if (existing && existing.body !== settings.body)
-    throw new Error('Ambiguous native Models renderer for ' + settings.version)
-  if (!existing) nativeContextSettings.push(settings)
+  if (existing) {
+    if (
+      existing.body !== settings.body ||
+      existing.factorySource !== settings.factorySource
+    )
+      throw new Error('Ambiguous native Models factory for ' + settings.version)
+    existing.versions.push(settings.version)
+  } else {
+    nativeContextSettings.push({
+      ...settings,
+      factorySha256,
+      versions: [settings.version],
+    })
+  }
 }
 await build({
   entryPoints: ['src/client/index.tsx'],
@@ -102,6 +113,8 @@ await build({
                 (settings) => `(() => {
               let component;
               return {
+                versions: ${JSON.stringify(settings.versions)},
+                factorySha256: ${JSON.stringify(settings.factorySha256)},
                 expectedModelsSectionSource: ${JSON.stringify(settings.expectedModelsSectionSource)},
                 getComponent() {
                   if (!component) component = ((require) => { ${settings.body} })(nativeRequire).ModelsSection;
@@ -139,7 +152,6 @@ await build({
   },
   footer: { js: 'return module.exports; }});' },
 })
-const sha256 = (source) => createHash('sha256').update(source).digest('hex')
 await writeFile(
   'lib/compatibility.json',
   JSON.stringify(

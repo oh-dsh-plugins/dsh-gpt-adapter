@@ -927,6 +927,30 @@ describe('built client contributions', () => {
     expect(attempts).toBe(3)
   })
 
+  it('updates the speed menu when the adapter changes for the same model', async () => {
+    let compatible = false
+    const f = await composerFixture(async (endpoint) => ({
+      ok: true,
+      value: endpoint.endsWith('/modelStatus')
+        ? compatible
+          ? modelMetadata
+          : { enabled: false, serviceTiers: [] }
+        : { selected: 'default', last: null },
+    }))
+    const menu = () => f.container.querySelector('[aria-haspopup=menu]')
+    expect(menu()).toBeNull()
+    await act(async () => {
+      compatible = true
+      f.emit('llm/adapters-updated')
+    })
+    expect(menu()).not.toBeNull()
+    await act(async () => {
+      compatible = false
+      f.emit('llm/adapters-updated')
+    })
+    expect(menu()).toBeNull()
+  })
+
   it('ignores metadata from a previously selected model', async () => {
     let finish: (value: unknown) => void
     const f = await composerFixture(async (endpoint, args) => {

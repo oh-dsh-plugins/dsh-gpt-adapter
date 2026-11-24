@@ -1,4 +1,9 @@
-import { supportedDshVersions } from './compat.mjs'
+import { compatibilityTargets } from './compat.mjs'
 
-// GitHub Actions job output; the full suite covers the baseline runtime.
-console.log('dsh=' + JSON.stringify(supportedDshVersions.slice(1)))
+// The packed candidate is installed in every target, including the baseline.
+console.log(
+  'dsh=' +
+    JSON.stringify(
+      compatibilityTargets.map(({ version, node }) => ({ version, node })),
+    ),
+)
