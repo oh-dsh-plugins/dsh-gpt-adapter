@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { once } from 'node:events'
@@ -22,9 +22,9 @@ const env = {
   DSH_AGENTS_HOME: join(fixture, 'agents'),
   npm_config_cache: process.env.npm_config_cache ?? join(fixture, 'npm-cache'),
 }
-const run = (command, args) => {
+const run = (command, args, cwd = fixture) => {
   const result = spawnSync(command, args, {
-    cwd: fixture,
+    cwd,
     env,
     stdio: 'inherit',
     timeout: 300000,
@@ -122,7 +122,11 @@ async function verifyModels(url) {
       '1M',
       'Custom',
     ])
-    if (['0.2.2-rc.1', '0.2.2-rc.5', '0.2.3-alpha.2'].includes(version)) {
+    if (
+      ['0.2.2-rc.1', '0.2.2-rc.5', '0.2.3-alpha.1', '0.2.3-alpha.2'].includes(
+        version,
+      )
+    ) {
       await preset().selectOption('516k')
       await panel.getByRole('button', { name: 'Apply', exact: true }).click()
       await page
@@ -146,17 +150,45 @@ let host
 let exited
 let output = ''
 try {
-  run('npm', [
-    'install',
-    '--ignore-scripts',
-    '--no-audit',
-    '--no-fund',
-    '--save-exact',
-    '--prefer-offline',
-    '--registry=https://registry.npmjs.org/',
-    `@deepseek-ai/dsh@${version}`,
-  ])
-  const dsh = join(fixture, 'node_modules', '.bin', 'dsh')
+  const hostRoot = version === '0.2.3-alpha.1' ? join(fixture, 'host') : fixture
+  if (version === '0.2.3-alpha.1') {
+    await mkdir(hostRoot)
+    for (const name of [
+      'package.json',
+      'pnpm-workspace.yaml',
+      'pnpm-lock.yaml',
+    ])
+      await cp(
+        new URL(`./alpha1-host/${name}`, import.meta.url),
+        join(hostRoot, name),
+      )
+    run(
+      'pnpm',
+      [
+        'install',
+        '--frozen-lockfile',
+        '--ignore-scripts',
+        '--registry=https://registry.npmjs.org/',
+        '--prefer-offline',
+        '--store-dir',
+        join(fixture, 'store'),
+      ],
+      hostRoot,
+    )
+  } else {
+    run('npm', [
+      'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--save-exact',
+      '--prefer-offline',
+      '--registry=https://registry.npmjs.org/',
+      `@deepseek-ai/dsh@${version}`,
+    ])
+  }
+  const dsh = join(hostRoot, 'node_modules', '.bin', 'dsh')
+  run(dsh, ['--version'])
   run(dsh, [
     'plugin',
     '--profile',

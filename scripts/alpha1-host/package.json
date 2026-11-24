@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "dependencies": {
+    "@deepseek-ai/cordis-plugin-group": "1.2.0-alpha.1",
+    "@deepseek-ai/dsh": "0.2.3-alpha.1"
+  }
+}

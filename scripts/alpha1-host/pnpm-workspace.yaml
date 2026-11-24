@@ -1,0 +1,8 @@
+nodeLinker: hoisted
+autoInstallPeers: true
+overrides:
+  '@deepseek-ai/cordis': 4.2.0-alpha.1
+  '@deepseek-ai/cordis-plugin-include': 1.2.0-alpha.1
+  '@deepseek-ai/cordis-plugin-loader': 1.2.0-alpha.1
+  '@deepseek-ai/schemastery': 3.20.0-alpha.1
+  '@deepseek-ai/cosmokit': 1.10.0-alpha.1
