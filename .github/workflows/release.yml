@@ -57,9 +57,17 @@ jobs:
         if: steps.version.outputs.release == 'true'
         run: npm install --global --ignore-scripts --no-audit --no-fund npm@11.19.1
 
-      - name: Install dependencies
+      - name: Download the verified candidate
         if: steps.version.outputs.release == 'true'
-        run: pnpm install --frozen-lockfile
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-gpt-adapter-candidate
+          path: .generated/candidate
+
+      - name: Verify the candidate checksum
+        if: steps.version.outputs.release == 'true'
+        working-directory: .generated/candidate
+        run: sha256sum --check SHA256SUMS
 
       - name: Create the version tag
         if: steps.version.outputs.release == 'true'
@@ -105,5 +113,5 @@ jobs:
           if npm view "dsh-gpt-adapter@$VERSION" version >/dev/null 2>&1; then
             echo "dsh-gpt-adapter@$VERSION is already published"
           else
-            npm publish --access public --provenance --registry https://registry.npmjs.org/
+            npm publish ".generated/candidate/dsh-gpt-adapter-$VERSION.tgz" --access public --provenance --registry https://registry.npmjs.org/
           fi

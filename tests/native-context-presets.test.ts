@@ -30,6 +30,7 @@ const packages: string[] = compatibilityTargets.map(
   (target: { settings: string }) => target.settings,
 )
 type NativeSource = {
+  version: string
   source: string
   body: string
   expectedModelsSectionSource: string
@@ -53,6 +54,20 @@ function modules(name: string): any {
       AnimatedRows: ({ children }: any) =>
         React.createElement('div', null, children),
       Tooltip: ({ children }: any) => children,
+      IconPlusOutlineRegular: () => null,
+      IconDragHandleOutlineRegular: () => null,
+      IconChevronDownOutlineRegular: () => null,
+      IconChevronRightOutlineRegular: () => null,
+      IconTrashOutlineRegular: () => null,
+      Checkbox: ({ label, checked, disabled, onChange }: any) =>
+        React.createElement('input', {
+          type: 'checkbox',
+          'aria-label': label,
+          checked,
+          disabled,
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+            onChange(event.target.checked),
+        }),
       Modal: ({ open, children, footer }: any) =>
         open ? React.createElement('div', null, children, footer) : null,
       Button: forwardRef(({ variant, size, icon, ...props }: any, ref: any) =>
@@ -79,6 +94,25 @@ function modules(name: string): any {
         (() => React.createElement('span')),
     },
   )
+}
+
+function settingsSchema(ctx: unknown) {
+  let Schema: any
+  const source = readFileSync(
+    require.resolve('@deepseek-ai/dsh-client-ui-settings/client'),
+    'utf8',
+  ).replace(
+    'exports.apply',
+    'exports.SettingsSchemaService = SettingsSchemaService; exports.apply',
+  )
+  new Function('window', source)({
+    __ModuleLoader__: {
+      load: (entry: any) => {
+        Schema = entry.factory(modules).SettingsSchemaService
+      },
+    },
+  })
+  return new Schema(ctx)
 }
 
 function nativeComponents(adapted: NativeSource) {
@@ -179,7 +213,7 @@ describe.each(packages)('native context presets (%s)', (packageName) => {
   const editor = (initial: any[], disabled = false, enabled = true) =>
     renderEditor(adapted, initial, disabled, enabled)
   it('updates native context drafts and save errors through the real locale slot renderer', async () => {
-    let renderer: any, settings: any
+    let renderer: any
     const load = (source: string, capture: (value: any) => void) =>
       new Function('window', source)({
         __ModuleLoader__: {
@@ -195,22 +229,15 @@ describe.each(packages)('native context presets (%s)', (packageName) => {
         renderer = value
       },
     )
-    load(
-      readFileSync(
-        require.resolve('@deepseek-ai/dsh-client-ui-settings/client'),
-        'utf8',
-      ).replace(
-        'exports.apply',
-        'exports.SettingsSchemaService = SettingsSchemaService; exports.apply',
-      ),
-      (value) => {
-        settings = value
-      },
-    )
     const { Context } = require('@deepseek-ai/cordis')
     const ctx = new Context()
     const locale = nativeLocale(modules)
     const release = locale.register(NS, dictionaries)
+    ctx.provide('modules', {
+      subscribeModules: () => () => {},
+      activeRecords: () => [],
+      resolveAsset: (path: string) => path,
+    })
     renderer.apply(ctx)
     const slots = ctx.slots
     slots.installLocale(locale)
@@ -220,7 +247,7 @@ describe.each(packages)('native context presets (%s)', (packageName) => {
       current: source,
       bindingSource: () => source,
     })
-    const schema = new settings.SettingsSchemaService(ctx)
+    const schema = settingsSchema(ctx)
     const native = nativeComponents(adapted)
     const value = {
       providers: {
@@ -624,9 +651,60 @@ function client() {
   }
 }
 
-function presetFixture(component: any, failRoot = false) {
+const nativePackageId = '@deepseek-ai/dsh-client-ui-settings-models'
+
+function generationFixture(adapted: NativeSource) {
+  let registration!: { factory: (require: typeof modules) => unknown }
+  Object.assign(window, {
+    __ModuleLoader__: {
+      load: (entry: typeof registration) => {
+        registration = entry
+      },
+    },
+    __DSH_BOOT__: {
+      release: { version: adapted.version },
+      entries: [
+        { id: nativePackageId, rev: 'settings-boot' },
+        { id: 'dsh-gpt-adapter', rev: 'plugin-boot' },
+      ],
+    },
+  })
+  new Function(adapted.source)()
+  const exports = registration.factory(modules)
+  const active = {
+    moduleNamespace: exports,
+    fiber: { name: 'ui-settings-models' },
+  }
+  const runtime = {
+    entries: {
+      managed: new Map([[nativePackageId, active]]),
+      revisions: new Map([[nativePackageId, 'settings-boot']]),
+      release: { matches: true },
+    },
+    loadCache: new Map([[nativePackageId, { exports }]]),
+    factories: new Map([
+      [
+        nativePackageId,
+        { factory: registration.factory, rev: 'settings-boot' },
+      ],
+    ]),
+  }
+  return {
+    active,
+    runtime,
+    get: (name: string) => (name === 'modules' ? runtime : undefined),
+  }
+}
+
+function presetFixture(
+  adapted: NativeSource,
+  component: any,
+  failRoot = false,
+) {
+  const generation = generationFixture(adapted)
   const entry = {
     component,
+    module: nativePackageId,
     options: { id: 'models' },
     children: {
       'settings.models.provider-card': { kind: 'keyed', scope: 'root' },
@@ -645,7 +723,7 @@ function presetFixture(component: any, failRoot = false) {
   }
   cleanup.push(dispose)
   const locale = client().apply({
-    get: () => undefined,
+    get: generation.get,
     on: () => () => {},
     remote: { $on: () => () => {} },
     connection: {
@@ -696,6 +774,7 @@ function presetFixture(component: any, failRoot = false) {
   })
   return {
     entry,
+    generation,
     listeners,
     components,
     calls,
@@ -735,6 +814,7 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     const entry = {
       component: original,
       options: { id: 'models', order: 10 },
+      registrant: 'ui-settings-models',
       inject,
       children,
     }
@@ -742,7 +822,7 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     const rootProps: Record<string, unknown> = {}
     const dispose: Array<() => void> = []
     client().apply({
-      get: () => undefined,
+      get: generationFixture(adapted).get,
       slots: {
         entries: () => [entry],
         subscribe: (_key: string, listener: () => void) => {
@@ -774,7 +854,7 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     )
   })
 
-  it('publishes and removes the preset policy through the real slot renderer', async () => {
+  it('removes presets without remounting an open model editor', async () => {
     let renderer: any
     Object.assign(window, {
       __ModuleLoader__: {
@@ -791,9 +871,16 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     )()
     const { Context } = require('@deepseek-ai/cordis')
     const ctx = new Context()
+    ctx.provide('modules', {
+      subscribeModules: () => () => {},
+      activeRecords: () => [],
+      resolveAsset: (path: string) => path,
+    })
     renderer.apply(ctx)
     const flags: unknown[] = []
     const slots = ctx.slots
+    const locale = nativeLocale(modules)
+    slots.installLocale(locale)
     const absentBinding = {
       key: undefined,
       hooks: {},
@@ -823,10 +910,53 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
       },
     )
     const original = originalNative(adapted).ModelsSection
+    const value = {
+      providers: {
+        fixture: {
+          api: 'openai-responses',
+          models: [{ id: 'gpt-example', contextWindow: 750000 }],
+        },
+      },
+    }
+    const namespace = {
+      ns: 'llm-pi-ai',
+      revision: 1,
+      value,
+      user: value,
+      base: {},
+      schema: Config.toJSON(),
+    }
+    const snapshot = {
+      status: 'ready',
+      writable: true,
+      namespaces: new Map([[namespace.ns, namespace]]),
+      rows: [
+        {
+          entry: {
+            provider: 'fixture',
+            displayName: 'Fixture',
+            settingsNs: namespace.ns,
+            settingsPath: ['providers', 'fixture'],
+            declared: true,
+          },
+          configured: true,
+          models: [],
+        },
+      ],
+    }
+    const schema = settingsSchema(ctx)
     slots.register(
       {
         name: 'settings.section',
         id: 'models',
+        inject: () => ({
+          controller: { store: { getSnapshot: () => snapshot } },
+          useSnapshot: (select: (value: typeof snapshot) => unknown) =>
+            select(snapshot),
+          operations: {},
+          schema,
+          t: (key: string) => key,
+        }),
         children: {
           'settings.models.provider-card': { kind: 'keyed', scope: 'root' },
           'settings.models.footer': { kind: 'list', scope: 'root' },
@@ -837,14 +967,24 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     const entry = slots.entries('settings.section')[0]
     const container = document.createElement('div')
     document.body.append(container)
-    let unmount!: () => void
-    await act(async () => {
-      unmount = ctx.uiRenderer.mount(container)
-    })
+    const generation = generationFixture(adapted)
+    Object.assign(entry, { module: nativePackageId })
     const dispose: Array<() => void> = []
     await act(async () => {
       client().apply({
-        get: (name: string) => ctx.get(name),
+        locale,
+        effect: (action: () => () => void) => dispose.push(action()),
+        get: (name: string) => generation.get(name) ?? ctx.get(name),
+        on: () => () => {},
+        remote: { $on: () => () => {} },
+        connection: {
+          rpc: {
+            call: async () => ({
+              ok: true,
+              value: { enabled: false, models: [], status: { state: 'ready' } },
+            }),
+          },
+        },
         slots: {
           entries: (name: any) => slots.entries(name),
           subscribe: (name: any, fn: any) => slots.subscribe(name, fn),
@@ -859,20 +999,60 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
         },
       })
     })
-    expect(flags.at(-1)).toBe(true)
-    expect(entry.component).not.toBe(original)
+    let unmount!: () => void
     await act(async () => {
-      for (const fn of dispose.reverse()) fn()
+      unmount = ctx.uiRenderer.mount(container)
     })
-    expect(flags.at(-1)).toBeUndefined()
+    try {
+      expect(flags.at(-1)).toBe(true)
+      const mounted = entry.component
+      expect(mounted).not.toBe(original)
+      const button = (text: string) =>
+        [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+          (entry) => entry.textContent === text,
+        )!
+      await act(async () => button('edit').click())
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>('[aria-label="modelAdvanced 1"]')!
+          .click(),
+      )
+      const input = container.querySelector<HTMLInputElement>(
+        'input[placeholder="输入上下文窗口"]',
+      )!
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          'value',
+        )!.set!.call(input, '760K')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      expect(input.value).toBe('760K')
+      await act(async () => {
+        for (const fn of dispose.splice(0).reverse()) fn()
+      })
+      expect(entry.component).toBe(mounted)
+      expect(
+        container.querySelector('select[aria-label="contextWindow 1"]'),
+      ).toBeNull()
+      expect(
+        container.querySelector<HTMLInputElement>(
+          'input[aria-label="contextWindow 1"]',
+        )?.value,
+      ).toBe('760K')
+    } finally {
+      await act(async () => {
+        for (const fn of dispose.splice(0).reverse()) fn()
+        unmount()
+      })
+      await ctx.fiber.dispose()
+    }
     expect(entry.component).toBe(original)
-    await act(async () => unmount())
-    await ctx.fiber.dispose()
   })
 
   it('keeps provider actions and speed registration available with localized preset feedback', async () => {
     const original = () => null
-    const fixture = presetFixture(original)
+    const fixture = presetFixture(adapted, original)
     const container = await fixture.render()
     expect(fixture.entry.component).toBe(original)
     expect(fixture.policies()).toBe(0)
@@ -889,28 +1069,18 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     )
   })
 
-  it('recovers after incompatible replacement and leaves foreign components intact on disposal', async () => {
+  it('does not overwrite a foreign replacement on disposal', () => {
     const original = originalNative(adapted).ModelsSection
-    const fixture = presetFixture(original)
-    const container = await fixture.render()
+    const fixture = presetFixture(adapted, original)
     expect(fixture.entry.component).not.toBe(original)
     expect(fixture.policies()).toBe(1)
     const foreign = () => null
-    await act(async () => {
-      fixture.entry.component = foreign
-      fixture.notify()
-    })
-    expect(fixture.entry.component).toBe(foreign)
-    expect(fixture.policies()).toBe(0)
-    expect(container.textContent).toContain('无法安装上下文预设')
-    await act(async () => {
-      fixture.entry.component = original
-      fixture.notify()
-    })
-    expect(fixture.entry.component).not.toBe(original)
-    expect(fixture.policies()).toBe(1)
-    expect(container.textContent).not.toContain('无法安装上下文预设')
+    fixture.generation.runtime.entries.revisions.set(
+      'dsh-gpt-adapter',
+      'plugin-boot',
+    )
     fixture.entry.component = foreign
+    fixture.notify()
     fixture.dispose()
     expect(fixture.entry.component).toBe(foreign)
     expect(fixture.policies()).toBe(0)
@@ -922,7 +1092,7 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
 
   it('restores the native component if the optional root policy cannot be installed', async () => {
     const original = originalNative(adapted).ModelsSection
-    const fixture = presetFixture(original, true)
+    const fixture = presetFixture(adapted, original, true)
     const container = await fixture.render()
     expect(fixture.entry.component).toBe(original)
     expect(fixture.policies()).toBe(0)

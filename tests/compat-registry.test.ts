@@ -36,7 +36,7 @@ describe('verified DSH version registry', () => {
     expect(next.engines).toEqual({ node: '>=24.9.0', dsh: range })
     expect(next.peerDependencies).toEqual({
       '@deepseek-ai/dsh-llm': range,
-      '@deepseek-ai/cordis': '4.1.0',
+      '@deepseek-ai/cordis': '4.1.0 || 4.2.0-alpha.1',
     })
     expect(next.devDependencies).toMatchObject({
       '@deepseek-ai/dsh-llm': supportedDshVersions[0],
@@ -51,7 +51,7 @@ describe('verified DSH version registry', () => {
     expect(manifest.engines.dsh).toBe('old')
   })
 
-  it('feeds every non-baseline runtime to the CI matrix without a separate list', () => {
+  it('feeds every packed-artifact target to the CI matrix', () => {
     const output = execFileSync(
       process.execPath,
       ['scripts/compat-matrix.mjs'],
@@ -60,12 +60,17 @@ describe('verified DSH version registry', () => {
       },
     ).trim()
     expect(JSON.parse(output.slice('dsh='.length))).toEqual(
-      supportedDshVersions.slice(1),
+      compatibilityTargets.map(
+        ({ version, node }: { version: string; node: string }) => ({
+          version,
+          node,
+        }),
+      ),
     )
     const workflow = YAML.parse(
       readFileSync('.github/workflows/ci.yml', 'utf8'),
     )
-    expect(workflow.jobs.compatibility.needs).toBe('versions')
+    expect(workflow.jobs.compatibility.needs).toEqual(['versions', 'test'])
     expect(workflow.jobs.compatibility.strategy.matrix.dsh).toBe(
       '${{ fromJSON(needs.versions.outputs.dsh) }}',
     )

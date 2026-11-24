@@ -65,8 +65,9 @@ function fixture(
     },
     { ns: 'compaction-basic', value: { headroomTokens: 65536 } },
   ]
-  // These service methods need only settings and snapshot metadata.
+  // Exercise settings and snapshot metadata for a registered native route.
   const service: any = Object.create(GptModels.prototype)
+  service.adapterState = () => 'ready'
   service.nativeDescribe = settings.describe.bind(settings)
   service.options = {
     routes: {

@@ -182,10 +182,20 @@ async function fixture(
   }
   ctx.provide('credentials', credentialService)
   let adapter: LlmAdapter | undefined
+  const mountedAdapter: LlmAdapter = Object.create(native.PiAiAdapter.prototype)
+  const adapters = new Map(
+    Object.keys(effective().providers ?? {}).map((provider) => [
+      provider,
+      { adapter: mountedAdapter },
+    ]),
+  )
   ctx.provide('llm', {
+    adapters,
     listConfigurableProviders: () => [],
-    registerAdapter: (_providers: unknown, value: LlmAdapter) => {
+    registerAdapter: (providers: string[], value: LlmAdapter) => {
       adapter = value
+      for (const provider of providers)
+        adapters.set(provider, { adapter: value })
       return Object.assign(() => {}, { replace() {} })
     },
     registerConfigurableProviders: () =>
@@ -1593,6 +1603,8 @@ describe('context settings and live model integration', () => {
         },
       },
     ])
+    expect(f.service.status(provider).canConfigureUltrafastFallback).toBe(false)
+    f.native()
     const status = f.service.status(provider)
     expect(status.canConfigureUltrafastFallback).toBe(true)
     await f.service.setUltrafastFallback(provider, true, status.optionsRevision)

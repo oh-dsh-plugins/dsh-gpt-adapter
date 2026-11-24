@@ -217,6 +217,7 @@ export function apply(ctx: Context): void {
       const disposers = [
         ctx.on('connection/reset', reset),
         ctx.remote.$on('settings/document-updated', invalidate),
+        ctx.remote.$on('llm/adapters-updated', invalidate),
         ctx.remote.$on('llm/models-updated', (provider) => {
           if (!provider || provider === parameters.provider) invalidate()
         }),
@@ -701,7 +702,9 @@ export function apply(ctx: Context): void {
     )
   }
   ctx.slots.inject('settings.models.provider-card', () => {
-    const presets = installNativeContextPresets(ctx.slots, translate)
+    const presets = installNativeContextPresets(ctx.slots, translate, () =>
+      ctx.get('modules' as never),
+    )
     contextPresets = presets
     try {
       const dispose = ctx.slots.register(

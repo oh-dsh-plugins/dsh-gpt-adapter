@@ -126,6 +126,8 @@ async function preStep(ctx: Context, agent: any, signal?: AbortSignal) {
 async function httpMcp() {
   const fixture = {
     healthy: true,
+    stallInitialize: false,
+    closedInitializations: 0,
     calls: [] as number[],
     messages: [] as any[],
   }
@@ -143,6 +145,10 @@ async function httpMcp() {
     for await (const chunk of request) body += chunk
     const message = JSON.parse(body)
     fixture.messages.push(message)
+    if (fixture.stallInitialize && message.method === 'initialize') {
+      response.once('close', () => fixture.closedInitializations++)
+      return
+    }
     if (message.id === undefined) {
       response.writeHead(202).end()
       return
@@ -521,6 +527,31 @@ describe('Codex config and plugin resources', () => {
     ).toThrow('missing-environment')
   })
 
+  it('ignores stale HTTP authentication fields on a stdio server', async () => {
+    const home = await directory()
+    const snapshot = await discoverCodexSnapshot(home, options, {
+      config: {
+        mcp_servers: {
+          local: {
+            type: 'stdio',
+            command: 'fixture',
+            bearer_token_env_var: '__DSH_FIXTURE_MISSING_TOKEN__',
+            env_http_headers: { 'X-Fixture': '__DSH_FIXTURE_MISSING_HEADER__' },
+          },
+        },
+      },
+    })
+    expect(snapshot.mcp).toMatchObject([
+      { transport: 'stdio', command: 'fixture' },
+    ])
+    expect(snapshot.items).toContainEqual({
+      name: 'local',
+      kind: 'mcp',
+      state: 'loaded',
+      ignoredTransportFields: ['env_http_headers', 'bearer_token_env_var'],
+    })
+  })
+
   it('loads only enabled plugins from their selected marketplace, including referenced MCP files', async () => {
     const home = await directory()
     const plugin = join(home, 'plugins/cache/sample/active/1.0.0')
@@ -584,6 +615,35 @@ describe('Codex config and plugin resources', () => {
     })
     expect(invalid.mcp).toEqual(snapshot.mcp)
     expect(invalid.skillRoots).toEqual(snapshot.skillRoots)
+    expect((await discoverCodexSnapshot(home, options)).skillRoots).toEqual(
+      snapshot.skillRoots,
+    )
+    await put(
+      join(plugin, '.codex-plugin/plugin.json'),
+      JSON.stringify({
+        name: 'active',
+        skills: [],
+        mcpServers: './.mcp.json',
+      }),
+    )
+    const changed = await discoverCodexSnapshot(home, options, {
+      previous: snapshot,
+    })
+    expect(
+      changed.skillRoots.some((root) => root.pluginId === 'active@sample'),
+    ).toBe(false)
+    expect(changed.mcp).toEqual(snapshot.mcp)
+    const skillsOnly = await discoverCodexSnapshot(
+      home,
+      { ...options, importMcpServers: false },
+      { previous: snapshot },
+    )
+    expect(skillsOnly.mcp).toEqual([])
+    expect(skillsOnly.items).toContainEqual({
+      name: 'active@sample',
+      kind: 'plugin',
+      state: 'loaded',
+    })
     expect(invalid.items).toContainEqual({
       name: 'active@sample',
       kind: 'plugin',
@@ -2306,7 +2366,7 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
   })
 
   it
-    .runIf('connectionStatusOf' in McpClient)
+    .runIf('connectionStatusOf' in McpClient || 'McpClientHost' in McpClient)
     .each(['idle', 'replace', 'remove'] as const)(
     'blocks admission when native MCP disposal reports incomplete cleanup after %s',
     async (change) => {
@@ -2377,6 +2437,159 @@ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');});`,
         'MCP connection cleanup is incomplete',
       )
     },
+  )
+
+  it.runIf('McpClientHost' in McpClient)(
+    'refreshes a formerly loaded MCP connection for an idle Agent only after a terminal failure',
+    async () => {
+      const home = await directory()
+      const upstream = await httpMcp()
+      await put(
+        join(home, 'config.toml'),
+        `[mcp_servers.fixture]\nurl=${JSON.stringify(upstream.url)}\n`,
+      )
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      mcpHost(ctx)
+      const tools = new Set<string>()
+      ctx.provide('tools', {
+        resolve: async () => ({ dispose() {} }),
+        register(tool: { name: string }) {
+          tools.add(tool.name)
+          return () => tools.delete(tool.name)
+        },
+      } as any)
+      // Use the actual native mount and teardown. Inject the reported state
+      // to exercise adapter recovery without waiting out the native backoff.
+      const { McpClientHost } = McpClient as unknown as {
+        McpClientHost: { prototype: { mount(config: unknown): any } }
+      }
+      const mount = McpClientHost.prototype.mount
+      let reported: { state: string; reason?: string } | undefined
+      let nativeMounts = 0
+      vi.spyOn(McpClientHost.prototype, 'mount').mockImplementation(function (
+        this: unknown,
+        config: unknown,
+      ) {
+        const instance = mount.call(this, config)
+        if (++nativeMounts !== 1) return instance
+        return {
+          ...instance,
+          ready: instance.ready.then((handle: { current(): unknown }) => ({
+            current: () => reported ?? handle.current(),
+          })),
+        }
+      })
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importSkills: false,
+        importInstructions: false,
+        mcpIdleTimeoutMs: 0,
+      })
+      const agent = await attachAgent(ctx, home)
+      ctx.emit('agent/status', { agent, status: 'idle' } as any)
+      expect(tools.has('mcp__fixture__read')).toBe(true)
+      reported = { state: 'reconnecting' }
+      await runtime.refresh()
+      expect(nativeMounts).toBe(1)
+      reported = { state: 'failed', reason: 'gave-up' }
+      expect(runtime.status().items).toContainEqual({
+        name: 'fixture',
+        kind: 'mcp',
+        state: 'failed',
+        reason: 'gave-up',
+      })
+      await runtime.refresh()
+      expect(nativeMounts).toBe(2)
+      expect(
+        upstream.messages.filter((message) => message.method === 'initialize'),
+      ).toHaveLength(2)
+      expect(tools.has('mcp__fixture__read')).toBe(true)
+      expect(runtime.status().items).toContainEqual({
+        name: 'fixture',
+        kind: 'mcp',
+        state: 'loaded',
+      })
+      await runtime.dispose()
+    },
+  )
+
+  it.runIf('McpClientHost' in McpClient).each(['cancel', 'timeout'] as const)(
+    'closes a stalled native MCP handshake on %s and permits a fresh connection',
+    async (operation) => {
+      const home = await directory()
+      const upstream = await httpMcp()
+      upstream.stallInitialize = true
+      const configPath = join(home, 'config.toml')
+      const config = `[mcp_servers.fixture]\nurl=${JSON.stringify(upstream.url)}\n`
+      await put(
+        configPath,
+        config + `startup_timeout_sec=${operation === 'cancel' ? 4 : 0.75}\n`,
+      )
+      const ctx = new Context()
+      cleanup.push(() => ctx.fiber.dispose())
+      mcpHost(ctx)
+      const tools = new Set<string>()
+      ctx.provide('tools', {
+        resolve: async () => ({ dispose() {} }),
+        register(tool: { name: string }) {
+          tools.add(tool.name)
+          return () => tools.delete(tool.name)
+        },
+      } as any)
+      const runtime = installCodexCompatibility(ctx, {
+        ...options,
+        codexHome: home,
+        importInstructions: false,
+        importSkills: false,
+      })
+      await new Promise<void>((done) => setImmediate(done))
+      const scope = createScope(ctx, {})
+      const agent = { cwd: home, ctx: scope.ctx }
+      await ctx.serial('agent/created', { agent, source: 'create' } as any)
+      const startup = preStep(ctx, agent).then(
+        () => {},
+        () => {},
+      )
+      await vi.waitFor(() => {
+        expect(
+          upstream.messages.filter((m) => m.method === 'initialize'),
+        ).toHaveLength(1)
+      })
+      if (operation === 'cancel') {
+        const closed = Promise.all([
+          scope.dispose(),
+          ctx.serial('agent/disposed', { agent } as any),
+          startup,
+        ])
+        const completed = vi.fn()
+        void closed.then(completed, () => {})
+        await vi.waitFor(() => expect(completed).toHaveBeenCalledOnce(), {
+          timeout: 2000,
+        })
+        await closed
+      } else {
+        await startup
+        expect(runtime.status().items).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ name: 'fixture', state: 'failed' }),
+          ]),
+        )
+        await ctx.serial('agent/disposed', { agent } as any)
+        await scope.dispose()
+      }
+      await vi.waitFor(() => expect(upstream.closedInitializations).toBe(1))
+      expect(tools.size).toBe(0)
+
+      upstream.stallInitialize = false
+      await put(configPath, config)
+      await attachAgent(ctx, home)
+      expect(tools).toEqual(new Set(['mcp__fixture__read']))
+      await runtime.dispose()
+      expect(tools.size).toBe(0)
+    },
+    8000,
   )
 
   it('connects a real HTTP MCP with imported headers and refreshes a disabled server without exposing credentials in status', async () => {

@@ -4,17 +4,26 @@ import {
   mkdtemp,
   readFile,
   rm,
+  realpath,
   symlink,
   writeFile,
 } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import { sourceAliases, supportedDshVersions } from './compat.mjs'
+import {
+  compatibilityTargets,
+  sourceAliases,
+  supportedDshVersions,
+} from './compat.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const versions = process.argv.slice(2)
+const archive =
+  versions[0] === '--archive'
+    ? await realpath(versions.splice(0, 2)[1])
+    : undefined
 if (!versions.length) versions.push(...supportedDshVersions.slice(1))
 for (const version of versions)
   if (!supportedDshVersions.includes(version))
@@ -36,17 +45,28 @@ for (const version of versions) {
   const fixture = await mkdtemp(join(root, '.generated', 'compat-'))
   try {
     console.log(`Testing the existing build with DSH ${version}`)
+    const target = compatibilityTargets.find(
+      (target) => target.version === version,
+    )
     const dependencies = {
       ...manifest.dependencies,
       ...manifest.devDependencies,
+      ...target.peers,
     }
     for (const name of sourceAliases) delete dependencies[name]
     for (const name of Object.keys(dependencies))
       if (name.startsWith('@deepseek-ai/dsh-')) dependencies[name] = version
+    if (archive)
+      await run('tar', ['-xzf', archive, '--strip-components=1'], fixture)
+    const builtManifest = archive
+      ? JSON.parse(await readFile(join(fixture, 'package.json'), 'utf8'))
+      : manifest
+    if (builtManifest.engines.dsh !== manifest.engines.dsh)
+      throw new Error('The archive and source declare different DSH targets')
     await writeFile(
       join(fixture, 'package.json'),
       JSON.stringify({
-        ...manifest,
+        ...builtManifest,
         private: true,
         devDependencies: {},
         dependencies,
@@ -62,8 +82,10 @@ for (const version of versions) {
       'tsconfig.json',
       'vitest.config.ts',
       'cordis.patch.yml',
-    ])
+    ]) {
+      if (archive && (name === 'lib' || name === 'dist')) continue
       await cp(join(root, name), join(fixture, name), { recursive: true })
+    }
     await run(
       'npm',
       [
