@@ -1003,7 +1003,11 @@ export class GptModels extends Service {
   }
 
   @Remote
-  async configure(provider: string, enabled: boolean): Promise<void> {
+  async configure(
+    provider: string,
+    enabled: boolean,
+    overwriteReasoning = false,
+  ): Promise<void> {
     const read = this.readSettings()
     this.profile(provider, read)
     const descriptor = read.rows.find((entry) => entry.ns === this.settingsNs)
@@ -1025,6 +1029,7 @@ export class GptModels extends Service {
       ],
       descriptor.revision,
     )
+    if (enabled && overwriteReasoning) await this.refresh(provider, true)
   }
 
   private modelProtocol(
@@ -1213,10 +1218,87 @@ export class GptModels extends Service {
   }
 
   @Remote
-  async refresh(provider: string): Promise<void> {
+  async refresh(provider: string, overwriteReasoning = false): Promise<void> {
     const runner = this.runners.get(provider)
     if (!runner) throw new Error('Enable GPT adaptation first')
-    await runner.refresh()
+    const snapshot = await runner.refresh()
+    if (!overwriteReasoning) return
+    const read = this.readSettings()
+    const state = this.routeState(provider, read)
+    const published = read.snapshots.get(provider)
+    const assertCurrent = () => {
+      if (
+        this.closed ||
+        this.runners.get(provider) !== runner ||
+        runner.getStatus().state === 'stopped'
+      )
+        throw new Error('synchronizer stopped')
+      if (
+        this.routeState(provider, this.readSettings()) !== state ||
+        this.snapshots.get(provider) !== published
+      )
+        throw new Error(
+          'configuration changed during refresh; retry with the current provider settings',
+        )
+    }
+    assertCurrent()
+    const { profile } = this.profile(provider, read)
+    const options = this.routeOptions(provider, profile, read)!
+    const overrides = structuredClone(
+      this.modelOverrides(read, provider, profile),
+    )
+    const upstream = new Map(
+      snapshot.upstreamModels?.map((model) => [model.id, model]),
+    )
+    let changed = false
+    for (const model of snapshot.models) {
+      if (model.stale || !isGptModel(model)) continue
+      const protocol = this.modelProtocol(provider, model.id, profile.api, read)
+      if (protocol !== 'openai-responses' && protocol !== 'openai-completions')
+        continue
+      // Rebuild from automatic sources, excluding both native and plugin manual
+      // reasoning overrides. Keep every unrelated override and native field.
+      const raw = upstream.get(model.id) ?? { id: model.id }
+      const { reasoning } = resolveCapabilities(
+        {
+          ...raw,
+          capabilities: {
+            ...snapshot.catalog?.models[model.id],
+            ...raw.capabilities,
+          },
+        },
+        snapshot.capabilities[model.id]?.capabilityRevision ?? 'gpt-preset',
+      )
+      if (reasoning.status === 'unknown') continue
+      const override = (overrides[model.id] ??= {})
+      override.supportsReasoning = reasoning.status === 'known'
+      override.reasoningChoices = reasoning.choices
+      delete override.defaultReasoningId
+      if (reasoning.defaultId !== undefined)
+        override.defaultReasoningId = reasoning.defaultId
+      changed = true
+    }
+    if (!changed) return
+    const descriptor = read.rows.find((row) => row.ns === this.settingsNs)
+    if (!descriptor) throw new Error('GPT plugin settings unavailable')
+    const settings = this.ctx.settings as unknown as Parameters<
+      typeof installSettingsOverlay
+    >[0]
+    await settings.write!(
+      this.settingsNs,
+      (current) => {
+        assertCurrent()
+        current.routes ??= {}
+        current.routes[provider] = {
+          ...options,
+          ...current.routes[provider],
+          overridesJSON: JSON.stringify(overrides),
+        }
+        return current
+      },
+      descriptor.revision,
+      [['routes', provider, 'overridesJSON']],
+    )
   }
 
   @Remote

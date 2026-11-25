@@ -267,6 +267,15 @@ async function providerFixture(
           endpoint: string,
           payload: { args: Record<string, unknown> },
         ) => {
+          if (
+            endpoint.endsWith('/refresh') ||
+            endpoint.endsWith('/configure')
+          ) {
+            writes.push(payload.args)
+            if (endpoint.endsWith('/configure'))
+              options = { ...options, enabled: payload.args.enabled === true }
+            return { ok: true }
+          }
           if (endpoint.endsWith('/setUltrafastFallback')) {
             writes.push(payload.args)
             if (payload.args.expectedRevision !== revision)
@@ -377,6 +386,50 @@ async function providerFixture(
 }
 
 describe('built client contributions', () => {
+  it.each(['enable', 'refresh'])(
+    'asks before %s replaces custom reasoning and cancel makes no write',
+    async (action) => {
+      const f = await providerFixture({
+        initialAdaptationEnabled: action !== 'enable',
+      })
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+      const button =
+        action === 'enable'
+          ? f.container.querySelector<HTMLButtonElement>('[role=switch]')!
+          : [...f.container.querySelectorAll('button')].find(
+              (button) => button.textContent === '立即同步',
+            )!
+      await act(async () => button.click())
+      expect(confirm).toHaveBeenCalledWith(
+        expect.stringContaining('自定义思考等级可能被覆盖'),
+      )
+      expect(f.writes).toEqual([])
+      confirm.mockReturnValue(true)
+      await act(async () => f.locale.setLocale('en'))
+      await act(async () => button.click())
+      expect(confirm).toHaveBeenLastCalledWith(
+        expect.stringContaining('custom reasoning settings may be overwritten'),
+      )
+      expect(f.writes).toEqual([
+        {
+          provider: 'fixture',
+          overwriteReasoning: true,
+          ...(action === 'enable' ? { enabled: true } : {}),
+        },
+      ])
+      if (action === 'enable') {
+        confirm.mockClear()
+        await act(async () => button.click())
+        expect(confirm).not.toHaveBeenCalled()
+        expect(f.writes.at(-1)).toEqual({
+          provider: 'fixture',
+          enabled: false,
+          overwriteReasoning: false,
+        })
+      }
+    },
+  )
+
   it('shows the default-off Ultrafast switch with upstream caveat and saves it', async () => {
     const find = (container: HTMLElement, label: string) =>
       container.querySelector<HTMLButtonElement>(

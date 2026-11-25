@@ -430,6 +430,189 @@ describe('context settings and live model integration', () => {
     ).toBeGreaterThan(0)
   })
 
+  it.each(['openai-responses', 'openai-completions'])(
+    'refreshes custom reasoning only on confirmed sync and sends ultra unchanged (%s)',
+    async (protocol) => {
+      const f = await fixture(protocol)
+      const models = structuredClone(f.raw().providers.fixture.models)
+      Object.assign(models[0], {
+        name: 'My GPT',
+        contextWindow: 900000,
+        reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' },
+      })
+      models[1].reasoningEfforts = false
+      await f.settings.mutate('llm-pi-ai', [
+        {
+          op: 'set',
+          path: ['providers', 'fixture', 'models'],
+          value: models,
+        },
+      ])
+      const other = structuredClone(f.raw().providers.other)
+      await f.service.refresh('fixture')
+      expect(f.model().reasoningEfforts).toEqual(models[0].reasoningEfforts)
+
+      await f.service.refresh('fixture', true)
+      expect(f.model()).toEqual(models[0])
+      const effective =
+        f.settings.describe()[0]!.value.providers.fixture.models[0]
+      expect(effective.reasoningEfforts).toEqual(
+        Object.fromEntries(
+          ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((id) => [
+            id,
+            id,
+          ]),
+        ),
+      )
+      expect(f.raw().providers.fixture.models[1]).toEqual(models[1])
+      expect(f.raw().providers.other).toEqual(other)
+      const call = await f.native().prepareCall('fixture', 'gpt-5.4')
+      expect(
+        call.model.reasoning?.efforts.map((effort) => effort.id),
+      ).toContain('ultra')
+      expect(
+        call.model.reasoning?.efforts.find((effort) => effort.id === 'ultra')
+          ?.name,
+      ).not.toContain('→')
+      for await (const _ of call.stream({
+        provider: 'fixture',
+        model: 'gpt-5.4',
+        reasoningEffort: 'ultra',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      } as any)) {
+      }
+      const payload = f.requests.at(-1)
+      if (protocol === 'openai-responses')
+        expect(payload.reasoning).toMatchObject({ effort: 'ultra' })
+      else expect(payload.reasoning_effort).toBe('ultra')
+      await f.service.configure('fixture', false)
+      expect(
+        f.settings.describe()[0]!.value.providers.fixture.models[0]
+          .reasoningEfforts,
+      ).toEqual(models[0].reasoningEfforts)
+    },
+  )
+
+  it('syncs reasoning when adaptation is explicitly enabled and leaves failures untouched', async () => {
+    const f = await fixture()
+    await f.service.configure('fixture', false)
+    f.model().reasoningEfforts = { high: 'high' }
+    await f.service.configure('fixture', true, true)
+    expect(
+      f.settings.describe()[0]!.value.providers.fixture.models[0]
+        .reasoningEfforts,
+    ).toHaveProperty('ultra', 'ultra')
+    await f.service.refresh('fixture')
+    const before = structuredClone({ raw: f.raw(), options: f.options() })
+    f.fail()
+    await expect(f.service.refresh('fixture', true)).rejects.toThrow('offline')
+    expect({ raw: f.raw(), options: f.options() }).toEqual(before)
+  })
+
+  it('keeps native catalog mode and inherited fields on confirmed reasoning sync', async () => {
+    const f = await fixture('openai-responses', true, 'empty-user')
+    const before = structuredClone(f.raw())
+    await f.service.refresh('openai', true)
+    await f.service.refresh('fixture', true)
+    expect(f.raw()).toEqual(before)
+    const overrides = JSON.parse(f.options().routes.openai.overridesJSON)
+    expect(overrides['gpt-5.4'].reasoningChoices).toContainEqual(
+      expect.objectContaining({ id: 'ultra', wireValue: 'ultra' }),
+    )
+    expect(
+      f.settings.describe()[0]!.value.providers.fixture.models[0],
+    ).toMatchObject({
+      maxTokens: 2048,
+      reasoningEfforts: { ultra: 'ultra' },
+    })
+  })
+
+  it('replaces manual reasoning with declared upstream levels while preserving other overrides', async () => {
+    const f = await fixture()
+    const manual = {
+      'gpt-5.4': {
+        contextWindow: 950000,
+        displayName: 'My model',
+        reasoningChoices: [
+          { id: 'ultra', label: 'Custom', wireValue: 'high', source: 'user' },
+        ],
+        defaultReasoningId: 'ultra',
+        supportsReasoning: true,
+      },
+      'gpt-retired': { supportsReasoning: false },
+    }
+    await f.settings.mutate('gpt-adapter', [
+      {
+        op: 'set',
+        path: ['routes', 'fixture', 'overridesJSON'],
+        value: JSON.stringify(manual),
+      },
+    ])
+    await f.service.refresh('fixture')
+    f.models([
+      {
+        id: 'gpt-5.4',
+        supported_reasoning_efforts: ['high', 'xhigh'],
+        reasoning_default_effort: 'xhigh',
+      },
+    ])
+    await f.service.refresh('fixture', true)
+    const saved = JSON.parse(f.options().routes.fixture.overridesJSON)
+    expect(saved['gpt-5.4']).toMatchObject({
+      contextWindow: 950000,
+      displayName: 'My model',
+      defaultReasoningId: 'xhigh',
+    })
+    expect(
+      saved['gpt-5.4'].reasoningChoices.map((choice: any) => [
+        choice.id,
+        choice.wireValue,
+      ]),
+    ).toEqual([
+      ['high', 'high'],
+      ['xhigh', 'xhigh'],
+    ])
+    expect(saved['gpt-retired']).toEqual(manual['gpt-retired'])
+    const call = await f.native().prepareCall('fixture', 'gpt-5.4')
+    expect(
+      call.model.reasoning?.efforts.find((effort) => effort.id === 'ultra')
+        ?.name,
+    ).toBe('ultra → XHigh')
+  })
+
+  it.each(['revision', 'stopped'])(
+    'rejects a confirmed sync if its queued save becomes stale (%s)',
+    async (cause) => {
+      const f = await fixture()
+      const before = structuredClone(f.options())
+      const resume = f.pauseWrites()
+      const write = vi.spyOn(f.settings, 'write')
+      const pending = f.service.refresh('fixture', true).catch((error) => error)
+      try {
+        await vi.waitFor(() =>
+          expect(write).toHaveBeenCalledWith(
+            'gpt-adapter',
+            expect.any(Function),
+            expect.any(Number),
+            expect.any(Array),
+          ),
+        )
+        if (cause === 'revision') f.revisions['gpt-adapter']!++
+        else {
+          const runners = (f.service as any).runners
+          runners.get('fixture').dispose()
+          runners.delete('fixture')
+        }
+      } finally {
+        resume()
+      }
+      expect(await pending).toBeInstanceOf(Error)
+      expect(f.options()).toEqual(before)
+    },
+  )
+
   it('lets the native settings editor add and clear a Sol reasoning mapping', async () => {
     const f = await fixture()
     const id = 'gpt-6.2-sol'

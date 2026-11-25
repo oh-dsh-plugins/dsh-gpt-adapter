@@ -483,7 +483,15 @@ export function apply(ctx: Context): void {
                 size="sm"
                 disabled={busy || value.status.state === 'refreshing'}
                 onClick={() => {
-                  void act('refresh', { provider: provider.provider })
+                  if (!window.confirm(t('confirmSync'))) return
+                  void act(
+                    'refresh',
+                    {
+                      provider: provider.provider,
+                      overwriteReasoning: true,
+                    },
+                    true,
+                  )
                 }}
               >
                 {t(value.status.state === 'refreshing' ? 'syncing' : 'syncNow')}
@@ -494,7 +502,16 @@ export function apply(ctx: Context): void {
               checked={value?.enabled ?? false}
               disabled={!configured || !value || busy}
               onChange={(enabled) => {
-                void act('configure', { provider: provider.provider, enabled })
+                if (enabled && !window.confirm(t('confirmSync'))) return
+                void act(
+                  'configure',
+                  {
+                    provider: provider.provider,
+                    enabled,
+                    overwriteReasoning: enabled,
+                  },
+                  true,
+                )
               }}
             />
           </div>

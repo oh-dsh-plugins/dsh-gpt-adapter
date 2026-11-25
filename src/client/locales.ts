@@ -18,10 +18,14 @@ const copy = {
   reloadSync: ['Reload saved settings', '重新载入已保存设置'],
   syncing: ['Syncing…', '正在同步…'],
   syncNow: ['Sync now', '立即同步'],
+  confirmSync: [
+    'Sync the model list and reasoning levels now? Conflicting custom reasoning settings may be overwritten. Models without declared levels use the plugin preset. Background sync keeps your custom settings.',
+    '立即同步模型列表和思考等级？冲突的自定义思考等级可能被覆盖；未声明等级的模型使用插件预设。后台定时同步仍会保留自定义设置。',
+  ],
   waiting: ['Waiting to sync', '等待同步'],
   synced: [
-    'Models synced: {count} · Models without declared reasoning levels use their native settings',
-    '已同步 {count} 个模型 · 未声明推理等级的模型沿用原生设置',
+    'Models synced: {count} · Sync now refreshes reasoning levels; background sync keeps custom settings',
+    '已同步 {count} 个模型 · 立即同步会刷新思考等级，后台同步保留自定义设置',
   ],
   removeStale: [
     'Remove models no longer listed upstream ({count})',
