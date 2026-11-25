@@ -5,7 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Config } from '@deepseek-ai/dsh-llm-pi-ai'
 import { SettingsForms } from '@deepseek-ai/dsh-settings'
 import { isGptModel, resolveCapabilities } from '../src/capabilities.js'
@@ -1061,7 +1061,12 @@ describe.each(packages)('native Models entry (%s)', (packageName) => {
     const toggle =
       container.querySelector<HTMLButtonElement>('[role="switch"]')!
     expect(toggle.disabled).toBe(false)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    cleanup.push(() => confirm.mockRestore())
     await act(async () => toggle.click())
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining('自定义思考等级可能被覆盖'),
+    )
     expect(fixture.calls).toContain('gptModels/configure')
     await act(async () => fixture.locale.setLocale('en'))
     expect(container.textContent).toContain(

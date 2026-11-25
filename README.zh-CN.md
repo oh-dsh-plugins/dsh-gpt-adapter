@@ -24,12 +24,12 @@
 
 **最低版本 `DSH >=0.2.2-rc.1`。** 已验证的版本如下。
 
-`0.2.20` 支持 DSH `0.2.2-rc.1` 至 `0.2.2-rc.5`（Node.js `>=24.9.0`），以及 DSH `0.2.3-alpha.2`（Node.js `^24.22.3 || >=26.13.1`）。使用 DSH `0.2.3-alpha.1` 时，请先按 [Alpha.1 隔离安装说明](scripts/alpha1-host/README.md) 修正宿主依赖，再安装插件。
+`0.2.22` 支持 DSH `0.2.2-rc.1` 至 `0.2.2-rc.5`（Node.js `>=24.9.0`），以及 DSH `0.2.3-alpha.2`（Node.js `^24.22.3 || >=26.13.1`）。使用 DSH `0.2.3-alpha.1` 时，请先按 [Alpha.1 隔离安装说明](scripts/alpha1-host/README.md) 修正宿主依赖，再安装插件。
 
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.20
+dsh plugin --profile web add dsh-gpt-adapter@0.2.22
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -42,7 +42,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.20.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.22.tgz
 ```
 
 ## 使用 GPT 模型
@@ -55,7 +55,7 @@ Fast 会请求上游优先档位。上游模型元数据决定是否自动提供
 
 **从 v0.2.11 升级：** 旧版使用同一个标识保存自动和手动 Ultrafast。为避免误发手动档位，新版不会把这个旧标识恢复为手动选择。如果你以前手动选过 Ultrafast，升级后请重新选择「Ultrafast」。
 
-使用提供商卡片上的「立即同步」刷新模型列表。上游不再列出的模型会保留到主动移除。卡片还可配置同步间隔、可选的能力目录地址和模型能力覆盖。显式能力覆盖优先于上游元数据、外部能力目录和预设，但自动能力解析仍保留上游明确不支持 Ultrafast 的声明。独立的手动选择开关并不表示上游支持此能力。
+启用「GPT 自动适配」或点击「立即同步」时，会先提示并确认：同步模型列表和思考等级可能覆盖冲突的自定义思考设置。确认后按上游元数据、能力目录或 GPT 预设刷新生效的思考等级；后台定时同步仍保留自定义设置。同步只替换插件的思考等级覆盖，其他设置保留；停用适配后恢复原生思考设置。上游不再列出的模型会保留到主动移除。卡片还可配置同步间隔、可选的能力目录地址和模型能力覆盖。显式能力覆盖优先于上游元数据、外部能力目录和预设，但自动能力解析仍保留上游明确不支持 Ultrafast 的声明。独立的手动选择开关并不表示上游支持此能力。
 
 启用适配且有可用思考档位映射的 GPT 模型，可在对话中选择 `low`、`medium`、`high`、`xhigh`、`max`、`ultra` 六档。网关只接受部分档位时，菜单会显示实际对应的档位，例如 `ultra → Xhigh`，请求使用网关接受的值。原生模型设置、上游元数据、能力目录和单模型 `reasoningChoices` 覆盖提供映射。缺少档位元数据时沿用原有 GPT 预设，后备默认档位为 `medium`。
 
