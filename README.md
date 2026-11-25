@@ -24,12 +24,12 @@ Plugin UI text, context presets, configuration descriptions, and plugin-owned va
 
 **Minimum version `DSH >=0.2.2-rc.1`.** The verified versions are listed below.
 
-Version `0.2.22` supports DSH `0.2.2-rc.1` through `0.2.2-rc.5` with Node.js `>=24.9.0` and DSH `0.2.3-alpha.2` with Node.js `^24.22.3 || >=26.13.1`. DSH `0.2.3-alpha.1` requires the [isolated host setup](scripts/alpha1-host/README.md) to correct its published startup dependencies before installing the plugin.
+Version `0.2.23` supports DSH `0.2.2-rc.1` through `0.2.2-rc.5` with Node.js `>=24.9.0` and DSH `0.2.3-alpha.2` with Node.js `^24.22.3 || >=26.13.1`. DSH `0.2.3-alpha.1` requires the [isolated host setup](scripts/alpha1-host/README.md) to correct its published startup dependencies before installing the plugin.
 
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.22
+dsh plugin --profile web add dsh-gpt-adapter@0.2.23
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -42,7 +42,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.22.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.23.tgz
 ```
 
 ## Using GPT models

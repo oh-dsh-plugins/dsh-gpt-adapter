@@ -1,9 +1,19 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { once } from 'node:events'
+import { createServer } from 'node:http'
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright-core'
 import { supportedDshVersions } from './compat.mjs'
@@ -21,6 +31,7 @@ const env = {
   DSH_HOME: join(fixture, 'profile'),
   DSH_AGENTS_HOME: join(fixture, 'agents'),
   npm_config_cache: process.env.npm_config_cache ?? join(fixture, 'npm-cache'),
+  DSH_GPT_GATEWAY_TEST_KEY: 'fixture-only-not-a-real-credential',
 }
 const run = (command, args, cwd = fixture) => {
   const result = spawnSync(command, args, {
@@ -46,13 +57,11 @@ async function verifyModels(url) {
       `Browser navigation returned ${response?.status()}`,
     )
     const preview = page.getByRole('dialog', { name: 'Preview Notice' })
-    const welcome = page.getByRole('dialog', { name: 'Get started' })
     const account = page.getByRole('button', { name: 'Account menu' })
-    // A fresh profile displays the two onboarding steps in order. The
-    // launcher can render before the preview acknowledgement finishes loading.
+    // The fixture already has a usable provider, so credential onboarding is
+    // skipped. A fresh browser still needs to acknowledge the preview notice.
     await preview.getByRole('button', { name: 'Continue' }).click()
-    await welcome.getByRole('button', { name: 'Close' }).click()
-    await welcome.waitFor({ state: 'hidden' })
+    await preview.waitFor({ state: 'hidden' })
     await account.press('Enter')
     const settingsItem = page.getByRole('menuitem', {
       name: 'Settings',
@@ -80,6 +89,53 @@ async function verifyModels(url) {
     }
     const settings = page.getByRole('dialog', { name: 'Settings' })
     await settings.getByRole('button', { name: 'Models', exact: true }).click()
+    const gatewayProvider = settings
+      .getByRole('button', { name: /^Edit gateway-fixture$/i })
+      .locator('xpath=ancestor::li[1]')
+    const adaptation = gatewayProvider.getByRole('region', {
+      name: 'GPT model adaptation',
+      exact: true,
+    })
+    const confirmedAction = async (method, control, confirm) => {
+      if (confirm)
+        page.once('dialog', async (dialog) => {
+          assert.equal(dialog.type(), 'confirm')
+          assert.match(
+            dialog.message(),
+            /custom reasoning settings may be overwritten/,
+          )
+          await dialog.accept()
+        })
+      const reply = page.waitForResponse(
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname === `/api/gptModels/${method}`,
+      )
+      await control.click()
+      const response = await reply
+      const envelope = await response.json()
+      assert.equal(response.ok(), true)
+      assert.equal(envelope.result?.ok, true, JSON.stringify(envelope.result))
+    }
+    await confirmedAction(
+      'refresh',
+      adaptation.getByRole('button', { name: 'Sync now', exact: true }),
+      true,
+    )
+    const automatic = adaptation.getByRole('switch', {
+      name: 'Automatic GPT adaptation',
+      exact: true,
+    })
+    await confirmedAction('configure', automatic, false)
+    await adaptation
+      .getByRole('button', { name: 'Sync now', exact: true })
+      .waitFor({ state: 'hidden' })
+    assert.equal(await automatic.getAttribute('aria-checked'), 'false')
+    await confirmedAction('configure', automatic, true)
+    await adaptation
+      .getByRole('button', { name: 'Sync now', exact: true })
+      .waitFor({ state: 'visible' })
+    assert.equal(await automatic.getAttribute('aria-checked'), 'true')
     await settings.getByRole('button', { name: 'Add model provider' }).click()
     const picker = settings.getByRole('combobox', {
       name: 'Provider',
@@ -215,7 +271,20 @@ async function verifyModels(url) {
 let host
 let exited
 let output = ''
+let modelRequests = 0
+const upstream = createServer((request, response) => {
+  if (request.url !== '/v1/models') {
+    response.writeHead(404).end()
+    return
+  }
+  modelRequests++
+  response.setHeader('content-type', 'application/json')
+  response.end(JSON.stringify({ data: [{ id: 'gpt-5.4' }] }))
+})
 try {
+  upstream.listen(0, '127.0.0.1')
+  await once(upstream, 'listening')
+  const upstreamUrl = `http://127.0.0.1:${upstream.address().port}/v1`
   const hostRoot = version === '0.2.3-alpha.1' ? join(fixture, 'host') : fixture
   if (version === '0.2.3-alpha.1') {
     await mkdir(hostRoot)
@@ -265,43 +334,75 @@ try {
     join(fixture, 'store'),
   ])
   const codexHome = join(fixture, 'codex')
-  const patch = join(fixture, 'codex.patch.json')
+  const patch = join(env.DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')
+  const { parse, stringify } = createRequire(
+    join(hostRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+  )('yaml')
+  const source = await readFile(patch, 'utf8').catch((error) => {
+    if (error.code === 'ENOENT') return '[]'
+    throw error
+  })
+  const persisted = parse(source) ?? []
+  assert.ok(Array.isArray(persisted))
   await mkdir(codexHome)
-  await writeFile(
-    patch,
-    JSON.stringify([
-      {
-        id: 'gpt-adapter',
-        config: {
-          routes: {},
-          codexCompatibility: { enabled: true, codexHome },
+  const updates = [
+    {
+      id: 'gpt-adapter',
+      config: {
+        routes: { 'gateway-fixture': { enabled: false } },
+        codexCompatibility: { enabled: true, codexHome },
+      },
+    },
+    {
+      id: 'llm-pi-ai',
+      config: {
+        providers: {
+          'gateway-fixture': {
+            api: 'openai-responses',
+            baseURL: upstreamUrl,
+            apiKeyEnv: 'DSH_GPT_GATEWAY_TEST_KEY',
+            models: [
+              {
+                id: 'gpt-5.4',
+                name: 'Gateway reasoning fixture',
+                reasoningEfforts: {
+                  low: 'low',
+                  medium: 'medium',
+                  high: 'high',
+                },
+              },
+            ],
+          },
         },
       },
-      // The isolated Alpha.2 browser test needs a real conversation. Linux CI
-      // need not have an XDG Documents directory for the first-use Workspace.
-      ...(version === '0.2.3-alpha.2'
-        ? [
-            {
-              id: 'workspace-controller',
-              config: { documentsDirectory: fixture },
-            },
-          ]
-        : []),
-    ]),
-  )
+    },
+    // The isolated Alpha.2 browser test needs a real conversation. Linux CI
+    // need not have an XDG Documents directory for the first-use Workspace.
+    ...(version === '0.2.3-alpha.2'
+      ? [
+          {
+            id: 'workspace-controller',
+            config: { documentsDirectory: fixture },
+          },
+        ]
+      : []),
+  ]
+  // Writable profile settings are required here: command-line --patch overlays
+  // deliberately prohibit the same configuration writes the UI exercises.
+  for (const update of updates) {
+    const index = persisted.findIndex((entry) => entry.id === update.id)
+    if (index < 0) persisted.push(update)
+    else
+      persisted[index] = {
+        ...persisted[index],
+        ...update,
+        config: { ...persisted[index].config, ...update.config },
+      }
+  }
+  await writeFile(patch, stringify(persisted))
   host = spawn(
     dsh,
-    [
-      '--profile',
-      'web',
-      '--patch',
-      patch,
-      '--no-open',
-      '--host',
-      '127.0.0.1',
-      '--port',
-      '0',
-    ],
+    ['--profile', 'web', '--no-open', '--host', '127.0.0.1', '--port', '0'],
     { cwd: fixture, env, stdio: ['ignore', 'pipe', 'pipe'] },
   )
   exited = once(host, 'exit')
@@ -344,29 +445,71 @@ try {
   })
   if (!page.ok || !(await page.text()).includes('dsh-gpt-adapter'))
     throw new Error('DSH did not include the plugin in the web boot graph')
-  const method = 'gptModels/codexStatus'
-  const rpcId = randomUUID()
-  const rpc = await fetch(new URL(`/api/${method}`, url), {
-    method: 'POST',
-    headers: { cookie, origin: url.origin, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      type: 'client-request',
-      rpcId,
-      method,
-      payload: { args: {} },
-    }),
-    signal: AbortSignal.timeout(10000),
+  const invoke = async (name, args = {}) => {
+    const method = `gptModels/${name}`
+    const rpcId = randomUUID()
+    const rpc = await fetch(new URL(`/api/${method}`, url), {
+      method: 'POST',
+      headers: {
+        cookie,
+        origin: url.origin,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId,
+        method,
+        payload: { args },
+      }),
+      signal: AbortSignal.timeout(20000),
+    })
+    assert.equal(rpc.ok, true, `${method}: HTTP ${rpc.status}`)
+    const response = await rpc.json()
+    assert.equal(response.rpcId, rpcId)
+    assert.equal(response.result?.ok, true, JSON.stringify(response.result))
+    return response.result.value
+  }
+  assert.equal((await invoke('codexStatus')).enabled, true)
+  const provider = 'gateway-fixture'
+  // Exercise SRC dispatch, including the optional parameter omitted by older
+  // callers. Direct Service calls do not check the JavaScript Remote signature.
+  await invoke('configure', { provider, enabled: false })
+  await invoke('configure', {
+    provider,
+    enabled: true,
+    overwriteReasoning: false,
   })
-  const response = rpc.ok ? await rpc.json() : undefined
-  if (
-    response?.rpcId !== rpcId ||
-    response.result?.ok !== true ||
-    response.result.value?.enabled !== true
+  await invoke('refresh', { provider })
+  assert.deepEqual(
+    JSON.parse((await invoke('status', { provider })).options.overridesJSON),
+    {},
   )
-    throw new Error(`Installed plugin was not active (RPC HTTP ${rpc.status})`)
+  const requestsBeforeRefresh = modelRequests
+  await invoke('refresh', { provider, overwriteReasoning: true })
+  assert.ok(modelRequests > requestsBeforeRefresh)
+  let status = await invoke('status', { provider })
+  assert.equal(status.enabled, true)
+  assert.ok(
+    JSON.parse(status.options.overridesJSON)['gpt-5.4'].reasoningChoices.some(
+      (choice) => choice.id === 'ultra',
+    ),
+  )
+  await invoke('configure', {
+    provider,
+    enabled: false,
+    overwriteReasoning: false,
+  })
+  await invoke('configure', {
+    provider,
+    enabled: true,
+    overwriteReasoning: true,
+  })
+  status = await invoke('status', { provider })
+  assert.equal(status.enabled, true)
+  assert.ok(status.models.some((model) => model.id === 'gpt-5.4'))
   const browserResult = await verifyModels(url)
   console.log(
-    `DSH ${version}: installed candidate, verified plugin RPC, ${browserResult}`,
+    `DSH ${version}: verified SRC refresh/configure, optional arguments, confirmed browser sync/enable, ${browserResult}`,
   )
 } catch (error) {
   if (output) console.error(output.replace(/https?:\/\/[^\s]+/g, '<url>'))
@@ -375,5 +518,10 @@ try {
   if (host && host.exitCode === null && host.signalCode === null)
     host.kill('SIGKILL')
   if (exited) await exited
+  upstream.closeAllConnections()
+  if (upstream.listening)
+    await new Promise((resolve, reject) =>
+      upstream.close((error) => (error ? reject(error) : resolve())),
+    )
   await rm(fixture, { recursive: true, force: true })
 }
