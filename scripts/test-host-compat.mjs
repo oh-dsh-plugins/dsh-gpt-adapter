@@ -57,13 +57,11 @@ async function verifyModels(url) {
       `Browser navigation returned ${response?.status()}`,
     )
     const preview = page.getByRole('dialog', { name: 'Preview Notice' })
-    const welcome = page.getByRole('dialog', { name: 'Get started' })
     const account = page.getByRole('button', { name: 'Account menu' })
-    // A fresh profile displays the two onboarding steps in order. The
-    // launcher can render before the preview acknowledgement finishes loading.
+    // The fixture already has a usable provider, so credential onboarding is
+    // skipped. A fresh browser still needs to acknowledge the preview notice.
     await preview.getByRole('button', { name: 'Continue' }).click()
-    await welcome.getByRole('button', { name: 'Close' }).click()
-    await welcome.waitFor({ state: 'hidden' })
+    await preview.waitFor({ state: 'hidden' })
     await account.press('Enter')
     const settingsItem = page.getByRole('menuitem', {
       name: 'Settings',
