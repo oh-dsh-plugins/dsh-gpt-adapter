@@ -1006,7 +1006,7 @@ export class GptModels extends Service {
   async configure(
     provider: string,
     enabled: boolean,
-    overwriteReasoning = false,
+    overwriteReasoning?: boolean,
   ): Promise<void> {
     const read = this.readSettings()
     this.profile(provider, read)
@@ -1218,7 +1218,7 @@ export class GptModels extends Service {
   }
 
   @Remote
-  async refresh(provider: string, overwriteReasoning = false): Promise<void> {
+  async refresh(provider: string, overwriteReasoning?: boolean): Promise<void> {
     const runner = this.runners.get(provider)
     if (!runner) throw new Error('Enable GPT adaptation first')
     const snapshot = await runner.refresh()

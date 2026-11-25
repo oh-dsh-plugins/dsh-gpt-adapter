@@ -24,12 +24,12 @@
 
 **最低版本 `DSH >=0.2.2-rc.1`。** 已验证的版本如下。
 
-`0.2.22` 支持 DSH `0.2.2-rc.1` 至 `0.2.2-rc.5`（Node.js `>=24.9.0`），以及 DSH `0.2.3-alpha.2`（Node.js `^24.22.3 || >=26.13.1`）。使用 DSH `0.2.3-alpha.1` 时，请先按 [Alpha.1 隔离安装说明](scripts/alpha1-host/README.md) 修正宿主依赖，再安装插件。
+`0.2.23` 支持 DSH `0.2.2-rc.1` 至 `0.2.2-rc.5`（Node.js `>=24.9.0`），以及 DSH `0.2.3-alpha.2`（Node.js `^24.22.3 || >=26.13.1`）。使用 DSH `0.2.3-alpha.1` 时，请先按 [Alpha.1 隔离安装说明](scripts/alpha1-host/README.md) 修正宿主依赖，再安装插件。
 
 在 DSH 的 `web` 配置档（profile）中安装 npm 包：
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.22
+dsh plugin --profile web add dsh-gpt-adapter@0.2.23
 ```
 
 安装或升级后重启 DSH。使用其他配置档时，将 `web` 替换为对应名称。
@@ -42,7 +42,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.22.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.23.tgz
 ```
 
 ## 使用 GPT 模型
