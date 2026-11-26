@@ -654,6 +654,61 @@ export class GptModels extends Service {
     return this.builtinIndex(read, provider).get(modelId)
   }
 
+  /** Limit only an undeclared preset, never an explicit reasoning decision. */
+  private resolveRouteCapabilities(
+    provider: string,
+    model: UpstreamModel,
+    revision: string,
+    profile: { api?: string; baseURL?: string; apiKeyEnv?: string },
+    read: SettingsRead,
+    override?: ModelOverride,
+    hasNativeReasoning = false,
+    includeReasoningAliases = false,
+  ): ModelCapabilities {
+    const result = resolveCapabilities(
+      model,
+      revision,
+      override,
+      hasNativeReasoning,
+      includeReasoningAliases,
+    )
+    if (
+      !result.reasoning.fallback ||
+      model.capabilities?.supportsReasoning !== undefined ||
+      model.capabilities?.defaultReasoningId !== undefined ||
+      override?.supportsReasoning !== undefined ||
+      override?.defaultReasoningId !== undefined ||
+      // Without an explicit key reference, native OAuth/ambient auth may repoint
+      // the endpoint at dispatch. A configured URL alone is not evidence then.
+      profile.apiKeyEnv === undefined
+    )
+      return result
+    const builtin = this.builtinModel(read, provider, model.id)
+    if (builtin?.reasoning !== false) return result
+    const api = profile.api ?? builtin.api
+    if (
+      !['openai-responses', 'openai-completions'].includes(api) ||
+      !['openai-responses', 'openai-completions'].includes(builtin.api)
+    )
+      return result
+    // Native model materialization inherits reasoning independently of the API
+    // override. Compare the endpoint using that API's actual SDK URL joining:
+    // /v1 and /v1/ agree, while /v1// is a different endpoint.
+    const path = api === 'openai-responses' ? '/responses' : '/chat/completions'
+    const endpoint = (base: string) =>
+      new URL(base + (base.endsWith('/') ? path.slice(1) : path)).href
+    try {
+      if (
+        endpoint(profile.baseURL ?? builtin.baseUrl) !==
+        endpoint(builtin.baseUrl)
+      )
+        return result
+    } catch {
+      return result
+    }
+    return { ...result, reasoning: { status: 'unsupported', choices: [] } }
+  }
+
   private upstreamModel(read: SettingsRead, provider: string, modelId: string) {
     let index = read.upstream.get(provider)
     if (!index) {
@@ -924,7 +979,10 @@ export class GptModels extends Service {
     const options = this.routeOptions(provider, profile, read)
     const contextWindows: Record<string, ContextWindowResolution> = {}
     if (options?.enabled && profile) {
-      for (const model of profile.models ?? []) {
+      const models = profile.models?.length
+        ? profile.models
+        : (snapshot?.models ?? [])
+      for (const model of models) {
         const value = this.capability(
           provider,
           model.id,
@@ -1259,7 +1317,8 @@ export class GptModels extends Service {
       // Rebuild from automatic sources, excluding both native and plugin manual
       // reasoning overrides. Keep every unrelated override and native field.
       const raw = upstream.get(model.id) ?? { id: model.id }
-      const { reasoning } = resolveCapabilities(
+      const { reasoning } = this.resolveRouteCapabilities(
+        provider,
         {
           ...raw,
           capabilities: {
@@ -1268,6 +1327,8 @@ export class GptModels extends Service {
           },
         },
         snapshot.capabilities[model.id]?.capabilityRevision ?? 'gpt-preset',
+        profile,
+        read,
       )
       if (reasoning.status === 'unknown') continue
       const override = (overrides[model.id] ??= {})
@@ -1646,6 +1707,8 @@ export class GptModels extends Service {
     displayName?: string,
     profileOverride?: {
       api?: string
+      baseURL?: string
+      apiKeyEnv?: string
       reasoning?: string
       models?: Array<{ id: string; reasoningEfforts?: unknown }>
       modelOverrides?: Record<string, { reasoningEfforts?: unknown }>
@@ -1681,7 +1744,8 @@ export class GptModels extends Service {
       : profile.modelOverrides?.[modelId]
     // Cached capabilities already contain old local overrides. Rebuild from
     // raw metadata so removing an override takes effect without a network refresh.
-    const result = resolveCapabilities(
+    const result = this.resolveRouteCapabilities(
+      provider,
       {
         ...(raw ?? { id: modelId, ...(displayName ? { displayName } : {}) }),
         capabilities: {
@@ -1698,6 +1762,8 @@ export class GptModels extends Service {
         },
       },
       snapshot?.capabilities[modelId]?.capabilityRevision ?? 'gpt-preset',
+      profile,
+      read,
       override,
       nativeModel?.reasoningEfforts !== undefined,
       includeReasoningAliases,

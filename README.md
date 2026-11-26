@@ -24,12 +24,12 @@ Plugin UI text, context presets, configuration descriptions, and plugin-owned va
 
 **Minimum version `DSH >=0.2.2-rc.1`.** The verified versions are listed below.
 
-Version `0.2.23` supports DSH `0.2.2-rc.1` through `0.2.2-rc.5` with Node.js `>=24.9.0` and DSH `0.2.3-alpha.2` with Node.js `^24.22.3 || >=26.13.1`. DSH `0.2.3-alpha.1` requires the [isolated host setup](scripts/alpha1-host/README.md) to correct its published startup dependencies before installing the plugin.
+Version `0.2.24` supports DSH `0.2.2-rc.1` through `0.2.2-rc.5` with Node.js `>=24.9.0` and DSH `0.2.3-alpha.2` with Node.js `^24.22.3 || >=26.13.1`. DSH `0.2.3-alpha.1` requires the [isolated host setup](scripts/alpha1-host/README.md) to correct its published startup dependencies before installing the plugin.
 
 Install the npm package in your DSH web profile:
 
 ```sh
-dsh plugin --profile web add dsh-gpt-adapter@0.2.23
+dsh plugin --profile web add dsh-gpt-adapter@0.2.24
 ```
 
 Restart DSH after installing or upgrading. Replace `web` with your profile name when using a different profile.
@@ -42,7 +42,7 @@ cd dsh-gpt-adapter
 pnpm install --frozen-lockfile
 mkdir -p artifacts
 pnpm pack --pack-destination artifacts
-dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.23.tgz
+dsh plugin --profile web add ./artifacts/dsh-gpt-adapter-0.2.24.tgz
 ```
 
 ## Using GPT models
@@ -58,6 +58,8 @@ Fast requests the upstream priority tier. Upstream model metadata controls autom
 Turning on **GPT auto-adaptation** or clicking **Sync now** asks for confirmation that refreshing models and reasoning levels may overwrite conflicting custom reasoning settings. After confirmation, effective reasoning levels are refreshed from upstream metadata, the capability catalog, or the GPT preset; background sync preserves custom settings. Only the plugin's reasoning overrides are replaced, and other settings are retained. Disabling adaptation restores native reasoning settings. Models no longer listed upstream are retained until you choose to remove them. You can also configure the sync interval, an optional capability catalog URL, and model capability overrides on that card. Explicit capability overrides take precedence over upstream metadata, external catalogs, and presets, except that an upstream Ultrafast denial is retained for automatic capability resolution. The separate manual-selection switch does not assert upstream support.
 
 The conversation picker offers `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` for adapted GPT models with usable reasoning mappings. When a gateway accepts fewer levels, the picker shows the mapped level, for example `ultra → Xhigh`, and the request uses that supported value. Explicit model settings, upstream metadata, the capability catalog, and per-model `reasoningChoices` overrides determine the available mappings. Gateways without effort metadata keep the existing GPT preset and a fallback default of `medium`.
+
+If the native catalog explicitly marks a model as non-reasoning, the undeclared preset is suppressed only when the route uses an explicit API-key reference and the matching native endpoint. Custom endpoints and routes whose authentication may redirect requests keep their existing fallback. Explicit reasoning mappings, support/default declarations, and saved overrides are not automatically removed; confirmed sync recomputes reasoning overrides from current automatic sources.
 
 The most recent reasoning choice follows the conversation when switching to an adapted model that can use it. The browser remembers that choice through a reload, including when the current model has no reasoning controls. Models that explicitly disable reasoning keep their native behavior.
 
