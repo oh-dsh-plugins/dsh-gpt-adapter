@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import * as native from '@deepseek-ai/dsh-llm-pi-ai'
 import type { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { credentialKey, credentialRef } from '@deepseek-ai/dsh-credentials'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -191,7 +192,12 @@ async function fixture(
   )
   ctx.provide('llm', {
     adapters,
-    listConfigurableProviders: () => [],
+    listConfigurableProviders: () => [
+      {
+        provider: 'openai',
+        defaultBaseURL: getBuiltinModels('openai')[0]!.baseUrl,
+      },
+    ],
     registerAdapter: (providers: string[], value: LlmAdapter) => {
       adapter = value
       for (const provider of providers)
@@ -226,6 +232,7 @@ async function fixture(
     )
   }
   const requests: any[] = []
+  const requestURLs: string[] = []
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init?: RequestInit) => {
@@ -234,6 +241,7 @@ async function fixture(
         return new Response(JSON.stringify({ data: models }))
       }
       requests.push(JSON.parse(String(init!.body)))
+      requestURLs.push(String(url))
       const message = {
         id: 'msg_1',
         type: 'message',
@@ -311,6 +319,7 @@ async function fixture(
     credentials: credentialService,
     service,
     requests,
+    requestURLs,
     revisions,
     reads: () => descriptionReads,
     resetReads: () => {
@@ -2010,6 +2019,315 @@ describe('context settings and live model integration', () => {
       await expect(
         f.native().prepareCall('fixture', 'gpt-5.4'),
       ).resolves.toBeDefined()
+    },
+  )
+
+  it.each(
+    ['openai-responses', 'openai-completions'].flatMap((protocol) =>
+      ['default', 'explicit', 'trailing-slash'].map((endpoint) => ({
+        protocol,
+        endpoint,
+      })),
+    ),
+  )(
+    'does not invent reasoning for a non-reasoning builtin on its own endpoint ($protocol, $endpoint)',
+    async ({ protocol, endpoint }) => {
+      const f = await fixture(protocol, true)
+      const builtin = getBuiltinModels('openai').find(
+        ({ id }) => id === 'gpt-4o',
+      )!
+      expect(builtin.reasoning).toBe(false)
+      f.models([{ id: 'gpt-4o' }])
+      await f.settings.write('llm-pi-ai', (current) => {
+        if (endpoint === 'default') delete current.providers.openai.baseURL
+        else
+          current.providers.openai.baseURL =
+            builtin.baseUrl + (endpoint === 'trailing-slash' ? '/' : '')
+        return current
+      })
+      await f.service.refresh('openai')
+      const before = structuredClone({ raw: f.raw(), options: f.options() })
+      const adapter = f.native()
+      const call = await adapter.prepareCall('openai', 'gpt-4o')
+      const options: any = {
+        provider: 'openai',
+        model: 'gpt-4o',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      }
+      for await (const _ of call.stream(options)) {
+      }
+      for await (const _ of adapter.stream(options)) {
+      }
+      expect(f.requests.slice(-2)).toHaveLength(2)
+      const path =
+        protocol === 'openai-responses' ? '/responses' : '/chat/completions'
+      expect(f.requestURLs.slice(-2)).toEqual([
+        builtin.baseUrl + path,
+        builtin.baseUrl + path,
+      ])
+      expect(
+        (adapter as any).current().models.getModel('openai', 'gpt-4o'),
+      ).toMatchObject({
+        api: protocol,
+        reasoning: false,
+      })
+      for (const payload of f.requests.slice(-2)) {
+        expect(payload.model).toBe('gpt-4o')
+        expect(payload).not.toHaveProperty('reasoning')
+        expect(payload).not.toHaveProperty('reasoning_effort')
+        expect(payload.service_tier).toBe('default')
+      }
+      expect(call.model).not.toHaveProperty('reasoning')
+      expect(f.service.capability('openai', 'gpt-4o')!.reasoning).toEqual({
+        status: 'unsupported',
+        choices: [],
+      })
+      expect(
+        f.service.status('openai').capabilities['gpt-4o']!.reasoning.status,
+      ).toBe('unsupported')
+      const sent = f.requests.length
+      for (const stream of [call.stream, adapter.stream.bind(adapter)])
+        await expect(async () => {
+          for await (const _ of stream({
+            ...options,
+            reasoningEffort: 'high',
+          })) {
+          }
+        }).rejects.toThrow(/unsupported reasoning level/)
+      expect(f.requests).toHaveLength(sent)
+      f.fail()
+      await expect(f.service.refresh('openai')).rejects.toThrow('offline')
+      expect(f.service.capability('openai', 'gpt-4o')!.reasoning.status).toBe(
+        'unsupported',
+      )
+      expect({ raw: f.raw(), options: f.options() }).toEqual(before)
+    },
+  )
+
+  it.each(['openai-responses', 'openai-completions'])(
+    'keeps six-level fallback on a custom endpoint even when the provider is named openai (%s)',
+    async (protocol) => {
+      const f = await fixture(protocol, true)
+      f.models([{ id: 'gpt-4o' }])
+      await f.service.refresh('openai')
+      const call = await f.native().prepareCall('openai', 'gpt-4o')
+      expect(call.model.reasoning?.efforts.map(({ id }) => id)).toEqual([
+        'low',
+        'medium',
+        'high',
+        'xhigh',
+        'max',
+        'ultra',
+      ])
+      for await (const _ of call.stream({
+        provider: 'openai',
+        model: 'gpt-4o',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      } as any)) {
+      }
+      const payload = f.requests.at(-1)
+      if (protocol === 'openai-responses')
+        expect(payload.reasoning).toMatchObject({ effort: 'medium' })
+      else expect(payload.reasoning_effort).toBe('medium')
+    },
+  )
+
+  it.each(['openai-responses', 'openai-completions'])(
+    'replaces ambiguous saved reasoning only on confirmed sync of the builtin route (%s)',
+    async (protocol) => {
+      const f = await fixture(protocol, true)
+      const builtin = getBuiltinModels('openai').find(
+        ({ id }) => id === 'gpt-4o',
+      )!
+      f.models([{ id: 'gpt-4o' }])
+      await f.settings.write('llm-pi-ai', (current) => {
+        current.providers.openai.baseURL = builtin.baseUrl
+        return current
+      })
+      const manual = {
+        'gpt-4o': {
+          displayName: 'Saved model',
+          contextWindow: 900000,
+          supportsReasoning: true,
+          reasoningChoices: [
+            { id: 'ultra', label: 'Saved', wireValue: 'ultra', source: 'user' },
+          ],
+          defaultReasoningId: 'ultra',
+          defaultServiceTier: 'fast',
+        },
+        'gpt-retired': { supportsReasoning: false },
+      }
+      await f.settings.mutate('gpt-adapter', [
+        {
+          op: 'set',
+          path: ['routes', 'openai', 'overridesJSON'],
+          value: JSON.stringify(manual),
+        },
+      ])
+      const raw = structuredClone(f.raw())
+      await f.service.refresh('openai')
+      expect(JSON.parse(f.options().routes.openai.overridesJSON)).toEqual(
+        manual,
+      )
+      const adapter = f.native()
+      const call = await adapter.prepareCall('openai', 'gpt-4o')
+      for await (const _ of call.stream({
+        provider: 'openai',
+        model: 'gpt-4o',
+        reasoningEffort: 'ultra',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      } as any)) {
+      }
+      const manualPayload = f.requests.at(-1)
+      if (protocol === 'openai-responses')
+        expect(manualPayload.reasoning).toMatchObject({ effort: 'ultra' })
+      else expect(manualPayload.reasoning_effort).toBe('ultra')
+
+      await f.service.refresh('openai', true)
+      const saved = JSON.parse(f.options().routes.openai.overridesJSON)
+      expect(saved['gpt-4o']).toEqual({
+        displayName: 'Saved model',
+        contextWindow: 900000,
+        supportsReasoning: false,
+        reasoningChoices: [],
+        defaultServiceTier: 'fast',
+      })
+      expect(saved['gpt-retired']).toEqual(manual['gpt-retired'])
+      expect(f.raw()).toEqual(raw)
+      const next = await adapter.prepareCall('openai', 'gpt-4o')
+      expect(next.model).not.toHaveProperty('reasoning')
+      expect(call.model.reasoning?.efforts.map(({ id }) => id)).toContain(
+        'ultra',
+      )
+      for await (const _ of next.stream({
+        provider: 'openai',
+        model: 'gpt-4o',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      } as any)) {
+      }
+      expect(f.requests.at(-1)).not.toHaveProperty('reasoning')
+      expect(f.requests.at(-1)).not.toHaveProperty('reasoning_effort')
+      expect(f.requests.at(-1).service_tier).toBe('priority')
+      await f.service.configure('openai', false)
+      expect(f.raw()).toEqual(raw)
+    },
+  )
+
+  it.each(['openai-responses', 'openai-completions'])(
+    'preserves declared upstream efforts and native mappings on a builtin endpoint (%s)',
+    async (protocol) => {
+      const f = await fixture(protocol, true)
+      const builtin = getBuiltinModels('openai').find(
+        ({ id }) => id === 'gpt-4o',
+      )!
+      f.models([{ id: 'gpt-4o' }])
+      await f.settings.write('llm-pi-ai', (current) => {
+        current.providers.openai.baseURL = builtin.baseUrl
+        current.providers.openai.modelOverrides['gpt-4o'] = {
+          reasoningEfforts: { high: 'low' },
+        }
+        return current
+      })
+      await f.service.refresh('openai')
+      const adapter = f.native()
+      const options: any = {
+        provider: 'openai',
+        model: 'gpt-4o',
+        reasoningEffort: 'high',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        ],
+      }
+      for await (const _ of (
+        await adapter.prepareCall('openai', 'gpt-4o')
+      ).stream(options)) {
+      }
+      const nativePayload = f.requests.at(-1)
+      if (protocol === 'openai-responses')
+        expect(nativePayload.reasoning).toMatchObject({ effort: 'low' })
+      else expect(nativePayload.reasoning_effort).toBe('low')
+      f.models([
+        {
+          id: 'gpt-4o',
+          supported_reasoning_efforts: ['max', 'ultra'],
+          reasoning_default_effort: 'ultra',
+        },
+      ])
+      await f.service.refresh('openai')
+      const next = await adapter.prepareCall('openai', 'gpt-4o')
+      for await (const _ of next.stream({
+        ...options,
+        reasoningEffort: 'ultra',
+      })) {
+      }
+      const upstreamPayload = f.requests.at(-1)
+      if (protocol === 'openai-responses')
+        expect(upstreamPayload.reasoning).toMatchObject({ effort: 'ultra' })
+      else expect(upstreamPayload.reasoning_effort).toBe('ultra')
+      expect(
+        f.raw().providers.openai.modelOverrides['gpt-4o'].reasoningEfforts,
+      ).toEqual({ high: 'low' })
+    },
+  )
+
+  it.each(['double-slash', 'keyless', 'declared-support', 'declared-default'])(
+    'does not infer a negative capability outside the proven fallback boundary (%s)',
+    async (boundary) => {
+      const f = await fixture('openai-responses', true)
+      const builtin = getBuiltinModels('openai').find(
+        ({ id }) => id === 'gpt-4o',
+      )!
+      f.models([
+        {
+          id: 'gpt-4o',
+          ...(boundary === 'declared-support'
+            ? { supports_reasoning: true }
+            : {}),
+          ...(boundary === 'declared-default'
+            ? { reasoning_default_effort: 'high' }
+            : {}),
+        },
+      ])
+      await f.settings.write('llm-pi-ai', (current) => {
+        current.providers.openai.baseURL =
+          builtin.baseUrl + (boundary === 'double-slash' ? '//' : '')
+        if (boundary === 'keyless') delete current.providers.openai.apiKeyEnv
+        return current
+      })
+      if (boundary === 'keyless')
+        await expect(f.service.refresh('openai')).rejects.toThrow(
+          'Provider API key is unavailable',
+        )
+      else await f.service.refresh('openai')
+      expect(f.service.capability('openai', 'gpt-4o')!.reasoning).toMatchObject(
+        {
+          status: 'known',
+          ...(boundary !== 'declared-default'
+            ? { fallback: true }
+            : { defaultId: 'high' }),
+        },
+      )
+      if (boundary === 'double-slash') {
+        const options: any = {
+          provider: 'openai',
+          model: 'gpt-4o',
+          messages: [
+            { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+          ],
+        }
+        for await (const _ of f.native().stream(options)) {
+        }
+        expect(f.requestURLs.at(-1)).toBe(builtin.baseUrl + '//responses')
+        expect(f.requests.at(-1).reasoning).toMatchObject({ effort: 'medium' })
+      }
     },
   )
 
